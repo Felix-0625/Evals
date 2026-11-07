@@ -9,3 +9,4 @@
 *.ttf binary
 *.zip binary
 *.eval binary
+docs/licenses/THIRD_PARTY_LICENSES.txt -whitespace

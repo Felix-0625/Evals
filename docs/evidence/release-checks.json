@@ -1,0 +1,18 @@
+{
+  "date": "2026-11-07",
+  "product_tests": 105,
+  "frontend_tests": 6226,
+  "frontend_check_tasks": 36,
+  "installed_runtime_dependencies": 103,
+  "installed_native_rounds": 8,
+  "known_python_vulnerabilities": 0,
+  "known_frontend_vulnerabilities": 0,
+  "artifact_sha256": {
+    "release-final-tests-serial.txt": "acc76fb493b220450a03eb4ffadf6602ed29baf2ed466c239f95a70d32c9ad46",
+    "frontend-release-check.txt": "5bf249999324779f6aad802ff2fa74d58000a5d1c8ab53e1b21c61673a63b2bd",
+    "frontend-release-tests-final.txt": "7163ef1318866ffacbb6560d4b24bd69caa20531a83651218b3f083ed1359bd9",
+    "python-audit-final.json": "9506e077e3891657816b0df2e630b640396f4991f93f183f003eb1dca08c97eb",
+    "frontend-audit-final.json": "d6bbe67d3f77887fc3f647795f45bee3e565bce53fe0202c04bbfb6b03287b95",
+    "release-installed-check.txt": "b7089348dbd4fbd1e9e57a1f649a9527950e420b8c5d1bfde25d9d75004011ca"
+  }
+}

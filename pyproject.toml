@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "evals-app"
+version = "0.1.0"
+description = "Inspect-based application evaluation and controlled improvement"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "inspect-ai==0.3.287+evals.1",
+  "inspect-scout==0.5.5+evals.1",
+  "gepa==0.1.4",
+  "filelock>=3.20",
+  "httpx>=0.28",
+  "numpy>=2.0",
+  "pydantic>=2.13",
+  "uvicorn>=0.35",
+  "cloudpickle>=3.0",
+  "openai>=3.4",
+]
+
+[project.urls]
+Repository = "https://github.com/Felix-0625/Evals"
+Issues = "https://github.com/Felix-0625/Evals/issues"
+
+[project.scripts]
+evals = "evals_app.cli:main"
+
+[tool.uv.sources]
+inspect-ai = { path = "engine/inspect_ai", editable = true }
+inspect-scout = { path = "components/inspect_scout", editable = true }
+gepa = { path = "components/gepa", editable = true }
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-timeout",
+    "pytest-mock",
+    "pytest-xdist",
+    "pytest-dotenv",
+    "trio",
+    "ruff",
+    "mypy",
+    "build",
+    "setuptools",
+    "wheel",
+    "types-psutil>=7.2.2.20260906",
+    "moto[server]>=5.1.5",
+    "trustme>=1.2.1",
+    "pytest-cov>=7.1.0",
+    "flask>=3.1.3",
+    "flask-cors>=6.0.5",
+    "anthropic>=2",
+    "adlfs>=2026.8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/evals_app"]

@@ -1,0 +1,128 @@
+{
+  "date": "2026-11-07",
+  "runs": [
+    {
+      "experiment_id": "experiment_221ef779b3554c00",
+      "status": "completed",
+      "reason": null,
+      "rounds": 4,
+      "business_checks_passed": true,
+      "ledger": {
+        "application": {
+          "spent": 0.0011261639999999998,
+          "reserved": 0.0,
+          "unknown": 0
+        },
+        "grading": {
+          "spent": 0,
+          "reserved": 0,
+          "unknown": 0
+        },
+        "analysis": {
+          "spent": 0,
+          "reserved": 0,
+          "unknown": 0
+        },
+        "reflection": {
+          "spent": 0,
+          "reserved": 0,
+          "unknown": 0
+        }
+      },
+      "preflight_cost": 0.000285966,
+      "source_commit": "376beb0845b31d23c07f90ccf0ac95306480b126",
+      "source_tree_sha256": "1a45d80a4b3f2add86a8bf3f88f252d3aaa94d7b313fb366ddb316e54e26f5f4",
+      "model": "deepseek-flash",
+      "scope": "Actual provider and application code; isolated generated task data; baseline only",
+      "evidence_sha256": {
+        "manifest.json": "e51c551e9a3d61827e57510c15cf63dd4bb2f4abccb7ee7bb1c8e847f324aed7",
+        "preflight.json": "a3ab6b499c9ff6bd8ddf173228400d3baca039b6bc8cb3f8aa56a42bfdef0c8f",
+        "result.json": "b454b574e36c8c9523dacd74cbb048657cf5026429633e908fef0737b124648b"
+      }
+    },
+    {
+      "experiment_id": "experiment_04fba5c170114f15",
+      "status": "completed",
+      "reason": null,
+      "rounds": 4,
+      "business_checks_passed": true,
+      "ledger": {
+        "application": {
+          "spent": 0.005056499999999999,
+          "reserved": 0.0,
+          "unknown": 0
+        },
+        "grading": {
+          "spent": 0,
+          "reserved": 0,
+          "unknown": 0
+        },
+        "analysis": {
+          "spent": 0,
+          "reserved": 0,
+          "unknown": 0
+        },
+        "reflection": {
+          "spent": 0,
+          "reserved": 0,
+          "unknown": 0
+        }
+      },
+      "preflight_cost": 0.0012609,
+      "source_commit": "31979eda55dbb9664437dcc2f5bb752be94bf9c0",
+      "source_tree_sha256": "427aa2d787af205adb5a28f5c2c9f68c32e4c58542396d7421c95d981bd8da67",
+      "model": "deepseek-flash",
+      "scope": "Actual provider and application code; isolated generated task data; baseline only",
+      "evidence_sha256": {
+        "manifest.json": "acb0f366d2ff427fdf9985ad71c518031016a08bde0f54438338ec1d9ff9cd68",
+        "preflight.json": "cb89fb375a8ba7e48f55f53a64ff6a470fc43d6f07ea07be594aee94733d0493",
+        "result.json": "bd2760cb06126f5e450d611e710fdb99c07fb8ff58d66ccd5fd0bb3541ca0447"
+      }
+    },
+    {
+      "experiment_id": "experiment_9e84da401f0c4974",
+      "status": "completed",
+      "reason": null,
+      "rounds": 4,
+      "business_checks_passed": false,
+      "ledger": {
+        "application": {
+          "spent": 0.001522638,
+          "reserved": 0.0,
+          "unknown": 0
+        },
+        "grading": {
+          "spent": 0,
+          "reserved": 0,
+          "unknown": 0
+        },
+        "analysis": {
+          "spent": 0,
+          "reserved": 0,
+          "unknown": 0
+        },
+        "reflection": {
+          "spent": 0,
+          "reserved": 0,
+          "unknown": 0
+        }
+      },
+      "preflight_cost": 0.00040510799999999994,
+      "source_commit": "376beb0845b31d23c07f90ccf0ac95306480b126",
+      "source_tree_sha256": "1a45d80a4b3f2add86a8bf3f88f252d3aaa94d7b313fb366ddb316e54e26f5f4",
+      "model": "deepseek-flash",
+      "scope": "Actual provider and application code; isolated generated task data; baseline only",
+      "evidence_sha256": {
+        "manifest.json": "1a1eb0f844aa7f3456481f4770066225fc16c97742b507275b56fa6240edfefa",
+        "preflight.json": "2f24ec6c8c05ec644017d2c490b75791da0c332237cc23e0dd0f10322bd4a6a0",
+        "result.json": "0f0eb7f0fcdef6a664dab104561bc8416c2c8c5975f8defc0e909781298c16ba"
+      }
+    }
+  ],
+  "limitations": [
+    "No real-model candidate improvement or long-term RSI claim.",
+    "NexRAG corpus is generated, not a production vector-store integration.",
+    "Costs use the documented frozen tariff; NexRAG does not subtract cache discounts.",
+    "Original failed VeraAgent run retained separately."
+  ]
+}

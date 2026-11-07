@@ -7,5 +7,6 @@ prune tests
 prune src/inspect_sandbox_tools/tests
 prune docs
 prune src/inspect_ai/_view/ts-mono
+recursive-exclude src/inspect_ai/_view/dist *.map
 exclude uv.lock
 exclude src/inspect_ai/model/_model_data/sync_models.py.lock
