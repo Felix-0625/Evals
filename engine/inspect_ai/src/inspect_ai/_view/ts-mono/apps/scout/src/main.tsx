@@ -1,0 +1,91 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { ReactQueryDevtools } from "@tanstack/react-query-devtools";
+import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+
+import { defaultRetry } from "@tsmono/react";
+import { getVscodeApi } from "@tsmono/util";
+
+import "./api/jsonParseWorker";
+
+import { ScoutApiV2 } from "./api/api";
+import { apiScoutServer } from "./api/api-scout-server";
+import { apiVscode } from "./api/api-vscode";
+import { App } from "./App";
+import {
+  applyHostDisplayState,
+  getEmbeddedAppMessage,
+} from "./app/hooks/useWindowMessaging";
+import { ApiProvider, createStore, StoreProvider } from "./state/store";
+
+declare global {
+  interface Window {
+    __SCOUT_BASE_PATH__?: string;
+    __SCOUT_DISABLE_SSE__?: boolean;
+  }
+}
+
+// Find the root element and render into it
+const containerId = "app";
+const container = document.getElementById(containerId);
+if (!container) {
+  console.error("Root container not found");
+  throw new Error(
+    `Expected a container element with Id '${containerId}' but no such container element was present.`
+  );
+}
+
+// Render into the root
+const root = createRoot(container);
+
+const selectApi = (): ScoutApiV2 => {
+  const vscodeApi = getVscodeApi();
+  if (!vscodeApi) {
+    const basePath = window.__SCOUT_BASE_PATH__ ?? "";
+    return apiScoutServer({
+      apiBaseUrl: `${basePath}/api/v2`,
+      disableSSE: window.__SCOUT_DISABLE_SSE__,
+    });
+  }
+
+  const protocolVersion =
+    getEmbeddedAppMessage()?.extensionProtocolVersion ?? 1;
+  if (protocolVersion < 2) {
+    throw new Error(
+      `VSCode extension protocol version ${protocolVersion} is no longer supported. ` +
+        "Please update your Inspect Scout VSCode extension to the latest version."
+    );
+  }
+
+  return apiVscode(vscodeApi);
+};
+
+// Create the API, store, and query client
+const api = selectApi();
+const store = createStore(api);
+const embedded = getEmbeddedAppMessage();
+if (embedded) {
+  applyHostDisplayState(embedded, store.getState());
+}
+const queryClient = new QueryClient({
+  defaultOptions: { queries: { retry: defaultRetry } },
+});
+
+// Read showActivityBar from query parameters
+const urlParams = new URLSearchParams(window.location.search);
+const scansMode =
+  urlParams.get("mode") === "scans" || api.capability === "scans";
+
+// Render the app
+root.render(
+  <StrictMode>
+    <QueryClientProvider client={queryClient}>
+      <ApiProvider value={api}>
+        <StoreProvider value={store}>
+          <App mode={scansMode ? "scans" : "workbench"} />
+        </StoreProvider>
+      </ApiProvider>
+      <ReactQueryDevtools initialIsOpen={false} />
+    </QueryClientProvider>
+  </StrictMode>
+);

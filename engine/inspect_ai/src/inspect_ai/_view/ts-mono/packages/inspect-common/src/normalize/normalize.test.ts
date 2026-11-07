@@ -1,0 +1,856 @@
+import { describe, expect, it } from "vitest";
+
+import {
+  expectEvent,
+  testEvalMetric,
+  testEvalScore,
+  testUserMessage,
+} from "../testing";
+import type { ModelEvent } from "../types";
+import { inputString } from "../utils";
+
+import legacyHeader from "./fixtures/legacy-header-2024-11.json";
+import legacySample from "./fixtures/legacy-sample-2024-11.json";
+import {
+  normalizeConfigUpdates,
+  normalizeEvalPlan,
+  normalizeEvalResults,
+  normalizeEvalSample,
+  normalizeEvalSpec,
+  normalizeEvent,
+  normalizeEvents,
+  normalizeTimelines,
+  type WireTimeline,
+} from "./index";
+
+describe("normalizeEvalSample on a real Nov-2024 log", () => {
+  const sample = normalizeEvalSample(legacySample);
+
+  it("fills working_start on every event", () => {
+    expect(sample.events.length).toBeGreaterThan(0);
+    for (const event of sample.events) {
+      expect(event.working_start).toBe(0);
+    }
+  });
+
+  it("fills read-time defaults the 2024 writer didn't emit", () => {
+    expect(sample.role_usage).toEqual({});
+    expect(sample.output.completion).toBe("");
+  });
+
+  it("fills model-event output completion while preserving content", () => {
+    const modelEvent = sample.events.find(
+      (event): event is ModelEvent => event.event === "model"
+    );
+    expect(modelEvent).toBeDefined();
+    expect(modelEvent!.output.completion).toBe("");
+    expect(modelEvent!.output.model).toBeTruthy();
+    expect(modelEvent!.output.choices.length).toBeGreaterThan(0);
+    expect(modelEvent!.config).toBeDefined();
+  });
+
+  it("preserves fields that were present", () => {
+    expect(sample.id).toEqual((legacySample as { id: unknown }).id);
+    expect(sample.messages.length).toBe(legacySample.messages.length);
+    expect(sample.events.length).toBe(legacySample.events.length);
+  });
+});
+
+describe("normalize header pieces on a real Nov-2024 log", () => {
+  it("fills EvalSpec migrations and defaults", () => {
+    const spec = normalizeEvalSpec(legacyHeader.eval);
+    expect(spec.task_args_passed).toEqual(legacyHeader.eval.task_args);
+    // eval_id predates this log; synthesized from run_id + task_id + created
+    expect(spec.eval_id).toContain(legacyHeader.eval.run_id);
+    expect(spec.model_generate_config).toEqual({});
+    expect(spec.task).toBe(legacyHeader.eval.task);
+  });
+
+  it("passes through the already-complete results and plan", () => {
+    const results = normalizeEvalResults(legacyHeader.results);
+    expect(results?.scores.length).toBe(legacyHeader.results.scores.length);
+    const plan = normalizeEvalPlan(legacyHeader.plan);
+    expect(plan.name).toBe(legacyHeader.plan.name);
+  });
+
+  it("drops malformed results.scores entries and fills score defaults", () => {
+    const results = normalizeEvalResults({
+      total_samples: 1,
+      completed_samples: 1,
+      scores: [
+        null,
+        1,
+        { scorer: "nameless" },
+        { name: "legacy" },
+        {
+          name: "match",
+          scorer: "match",
+          params: {},
+          metrics: {
+            gone: null,
+            text: { name: "text", value: "1" },
+            accuracy: { name: "accuracy", value: 1, params: {} },
+          },
+        },
+      ],
+    })!;
+    expect(results.scores).toEqual([
+      testEvalScore({ name: "legacy", scorer: "legacy" }),
+      testEvalScore({
+        name: "match",
+        scorer: "match",
+        metrics: { accuracy: testEvalMetric({ value: 1 }) },
+      }),
+    ]);
+  });
+
+  it("keeps a metric named __proto__ as an ordinary entry", () => {
+    const raw: unknown = JSON.parse(
+      '[{"name": "s", "metrics": {"__proto__": {"name": "m", "value": 1}}}]'
+    );
+    const results = normalizeEvalResults({ scores: raw })!;
+    expect(Object.entries(results.scores[0]!.metrics)).toEqual([
+      ["__proto__", testEvalMetric({ name: "m", value: 1 })],
+    ]);
+  });
+
+  it("returns null results for in-progress logs", () => {
+    expect(normalizeEvalResults(undefined)).toBeNull();
+    expect(normalizeEvalResults(null)).toBeNull();
+  });
+});
+
+describe("legacy shape migrations", () => {
+  it("lifts transcript into events + attachments", () => {
+    const sample = normalizeEvalSample({
+      id: 1,
+      epoch: 1,
+      input: "q",
+      target: "a",
+      transcript: {
+        events: [{ event: "step", action: "begin", name: "solve" }],
+        content: { att1: "value" },
+      },
+    });
+    expect(sample.events.map((event) => event.event)).toEqual(["step"]);
+    expect(sample.attachments).toEqual({ att1: "value" });
+    expect("transcript" in sample).toBe(false);
+  });
+
+  it("lifts a single score into the scores map", () => {
+    const sample = normalizeEvalSample({
+      id: 1,
+      epoch: 1,
+      input: "q",
+      target: "a",
+      score: { value: "C" },
+    });
+    expect(sample.scores).toEqual({ scorer: { value: "C" } });
+  });
+
+  it("drops a null legacy score instead of lifting it", () => {
+    const sample = normalizeEvalSample({
+      id: 1,
+      epoch: 1,
+      input: "q",
+      score: null,
+    });
+    expect(sample.scores).toEqual({});
+  });
+
+  it("migrates a sandbox tuple to a spec object", () => {
+    const spec = normalizeEvalSpec({
+      task: "t",
+      sandbox: ["docker", "compose.yaml"],
+    });
+    expect(spec.sandbox).toEqual({ type: "docker", config: "compose.yaml" });
+  });
+});
+
+describe("normalizeEvents", () => {
+  it("drops non-event entries and keeps unknown event kinds", () => {
+    const events = normalizeEvents([
+      null,
+      "garbage",
+      { no_event_tag: true },
+      { event: "from_the_future", timestamp: "t", working_start: 1 },
+      { event: "step", action: "begin", name: "solve" },
+    ]);
+    expect(events.map((event) => event.event)).toEqual([
+      "from_the_future",
+      "step",
+    ]);
+  });
+
+  it("returns [] for a non-array", () => {
+    expect(normalizeEvents(undefined)).toEqual([]);
+    expect(normalizeEvents({ events: [] })).toEqual([]);
+  });
+
+  it("returns the same object when nothing needs filling", () => {
+    const event = {
+      event: "state",
+      timestamp: "2025-01-01T00:00:00Z",
+      working_start: 1.5,
+      changes: [],
+    };
+    expect(normalizeEvent(event)).toBe(event);
+  });
+
+  it("fills model-event structure crafted logs omit", () => {
+    const event = expectEvent(
+      normalizeEvent({
+        event: "model",
+        timestamp: "t",
+        model: "m",
+      }),
+      "model"
+    );
+    expect(event.working_start).toBe(0);
+    expect(event.config).toEqual({});
+    expect(event.output).toEqual({ model: "", choices: [], completion: "" });
+    expect(event.input).toEqual([]);
+    expect(event.tools).toEqual([]);
+  });
+
+  it("model: fills stop_reason on choices and drops non-record choices", () => {
+    const message = { role: "assistant", content: "hi", source: "generate" };
+    const event = expectEvent(
+      normalizeEvent({
+        event: "model",
+        timestamp: "t",
+        model: "m",
+        output: {
+          model: "m",
+          choices: [{ message }, "bogus", { message, stop_reason: "stop" }],
+          completion: "hi",
+        },
+      }),
+      "model"
+    );
+    expect(event.output.choices).toEqual([
+      { message, stop_reason: "unknown" },
+      { message, stop_reason: "stop" },
+    ]);
+  });
+
+  it("model: keeps output identity when every choice is complete", () => {
+    const output = {
+      model: "m",
+      choices: [
+        {
+          message: { role: "assistant", content: "hi", source: "generate" },
+          stop_reason: "stop",
+        },
+      ],
+      completion: "hi",
+    };
+    const event = expectEvent(
+      normalizeEvent({ event: "model", timestamp: "t", model: "m", output }),
+      "model"
+    );
+    expect(event.output).toBe(output);
+  });
+
+  it("fills usage token counts when usage is present but partial", () => {
+    const event = expectEvent(
+      normalizeEvent({
+        event: "model",
+        timestamp: "t",
+        working_start: 0,
+        model: "m",
+        config: {},
+        input: [],
+        tools: [],
+        tool_choice: "auto",
+        output: { model: "m", choices: [], completion: "", usage: {} },
+      }),
+      "model"
+    );
+    expect(event.output.usage).toEqual({
+      input_tokens: 0,
+      output_tokens: 0,
+      total_tokens: 0,
+    });
+  });
+
+  it("fills malformed state-event changes with an empty array", () => {
+    const event = expectEvent(
+      normalizeEvent({
+        event: "state",
+        timestamp: "t",
+        working_start: 0,
+        changes: "not-an-array",
+      }),
+      "state"
+    );
+    expect(event.changes).toEqual([]);
+  });
+
+  it("fills value/replaced on change rows and drops non-record rows", () => {
+    const event = expectEvent(
+      normalizeEvent({
+        event: "store",
+        timestamp: "t",
+        working_start: 0,
+        changes: [{ op: "add", path: "/k" }, "junk"],
+      }),
+      "store"
+    );
+    expect(event.changes).toEqual([
+      { op: "add", path: "/k", value: null, replaced: null },
+    ]);
+  });
+
+  it("keeps the changes array identity when every row is complete", () => {
+    const changes = [{ op: "add", path: "/k", value: 1, replaced: null }];
+    const event = expectEvent(
+      normalizeEvent({
+        event: "state",
+        timestamp: "t",
+        working_start: 0,
+        changes,
+      }),
+      "state"
+    );
+    expect(event.changes).toBe(changes);
+  });
+});
+
+describe("normalizeConfigUpdates", () => {
+  const provenance = {
+    timestamp: "2025-01-01T00:00:00Z",
+    author: "someone",
+    metadata: {},
+  };
+
+  it("drops entries whose changes isn't an array", () => {
+    const updates = normalizeConfigUpdates([
+      { scope: "task", provenance, changes: "bad" },
+      null,
+      { scope: "task", provenance, changes: [] },
+    ]);
+    expect(updates.length).toBe(1);
+  });
+
+  it("drops non-object change rows and fills per-change defaults", () => {
+    const updates = normalizeConfigUpdates([
+      {
+        scope: "task",
+        provenance,
+        changes: [
+          null,
+          "bad",
+          { name: "max_samples", config: "eval", value: 5 },
+        ],
+      },
+    ]);
+    expect(updates[0]?.changes).toEqual([
+      {
+        name: "max_samples",
+        config: "eval",
+        value: 5,
+        cleared: false,
+        previous: null,
+      },
+    ]);
+  });
+
+  it("fills missing provenance so downstream reads are unguarded", () => {
+    const updates = normalizeConfigUpdates([{ scope: "process", changes: [] }]);
+    expect(updates[0]?.provenance).toEqual({
+      timestamp: "",
+      author: "",
+      metadata: {},
+    });
+  });
+
+  it("returns [] for non-arrays", () => {
+    expect(normalizeConfigUpdates(undefined)).toEqual([]);
+    expect(normalizeConfigUpdates("bad")).toEqual([]);
+  });
+});
+
+describe("normalizeEvalSample input validation", () => {
+  it("throws on non-object sample data", () => {
+    expect(() => normalizeEvalSample("bad")).toThrow();
+    expect(() => normalizeEvalSample(null)).toThrow();
+  });
+
+  it("fills structural defaults on a minimal sample", () => {
+    const sample = normalizeEvalSample({ id: 1, epoch: 1, input: "q" });
+    expect(sample.target).toBe("");
+    expect(sample.messages).toEqual([]);
+    expect(sample.events).toEqual([]);
+    expect(sample.output).toEqual({ model: "", choices: [], completion: "" });
+    expect(sample.scores).toBeNull();
+    expect(sample.metadata).toEqual({});
+    expect(sample.store).toEqual({});
+    expect(sample.model_usage).toEqual({});
+    expect(sample.attachments).toEqual({});
+  });
+
+  it("fills fallback counts and retry-error tracebacks", () => {
+    const sample = normalizeEvalSample({
+      id: 1,
+      epoch: 1,
+      input: "q",
+      model_fallbacks: [{ model: "a", fallback_model: "b" }],
+      error_retries: [{ message: "boom" }],
+    });
+    expect(sample.model_fallbacks).toEqual([
+      { model: "a", fallback_model: "b", count: 1 },
+    ]);
+    expect(sample.error_retries).toEqual([
+      { message: "boom", traceback: "", traceback_ansi: "" },
+    ]);
+  });
+
+  it("drops malformed input messages so inputString stays unguarded", () => {
+    const sample = normalizeEvalSample({
+      id: 1,
+      epoch: 1,
+      input: [1, null, { role: "user" }, { role: "user", content: "q" }],
+    });
+    expect(sample.input).toEqual([testUserMessage({ content: "q" })]);
+    expect(inputString(sample.input)).toEqual(["q"]);
+  });
+
+  it("drops malformed model_fallbacks elements", () => {
+    const sample = normalizeEvalSample({
+      id: 1,
+      epoch: 1,
+      input: "q",
+      model_fallbacks: [null, 1, { model: "a", fallback_model: "b" }],
+    });
+    expect(sample.model_fallbacks).toEqual([
+      { model: "a", fallback_model: "b", count: 1 },
+    ]);
+  });
+
+  it("normalizes retry-error events recursively", () => {
+    const sample = normalizeEvalSample({
+      id: 1,
+      epoch: 1,
+      input: "q",
+      error_retries: [
+        {
+          message: "boom",
+          traceback: "tb",
+          traceback_ansi: "tb",
+          events: [{ event: "model", timestamp: "t", model: "m" }],
+        },
+      ],
+    });
+    expect(sample.error_retries?.[0]?.events?.[0]).toMatchObject({
+      event: "model",
+      working_start: 0,
+      config: {},
+      output: { model: "", choices: [], completion: "" },
+    });
+  });
+});
+
+describe("per-event-type read-time defaults", () => {
+  // Each case mirrors a pydantic default (field default / default_factory)
+  // that old or crafted logs omit; the base fields are always exercised too.
+  const base = { timestamp: "t", working_start: 0 };
+
+  it("error: fills the error payload", () => {
+    const event = normalizeEvent({ ...base, event: "error" });
+    expect(event).toMatchObject({
+      error: { message: "", traceback: "", traceback_ansi: "" },
+    });
+  });
+
+  it("logger: fills a complete LoggingMessage", () => {
+    const event = normalizeEvent({ ...base, event: "logger" });
+    expect(event).toMatchObject({
+      message: {
+        level: "info",
+        message: "",
+        created: 0,
+        filename: "unknown",
+        module: "unknown",
+        lineno: 0,
+      },
+    });
+  });
+
+  it("score: fills score, history, and intermediate", () => {
+    const event = normalizeEvent({ ...base, event: "score" });
+    expect(event).toMatchObject({
+      score: { value: "", history: [] },
+      intermediate: false,
+    });
+  });
+
+  it("score_edit: fills score_name and the UNCHANGED edit sentinels", () => {
+    const event = normalizeEvent({
+      ...base,
+      event: "score_edit",
+      edit: { answer: "b", metadata: null },
+    });
+    expect(event).toMatchObject({
+      score_name: "",
+      edit: { answer: "b", value: "UNCHANGED", metadata: "UNCHANGED" },
+    });
+  });
+
+  it("score_edit: keeps a complete edit's identity", () => {
+    const edit = { value: 1, metadata: { by: "reviewer" } };
+    const event = expectEvent(
+      normalizeEvent({ ...base, event: "score_edit", score_name: "s", edit }),
+      "score_edit"
+    );
+    expect(event.edit).toBe(edit);
+  });
+
+  it("score: fills value and history on a score that omits them", () => {
+    const event = normalizeEvent({
+      ...base,
+      event: "score",
+      score: { answer: "A" },
+    });
+    expect(event).toMatchObject({
+      score: { answer: "A", value: "", history: [] },
+    });
+  });
+
+  it("tool: fills call structure and child events", () => {
+    const event = normalizeEvent({ ...base, event: "tool" });
+    expect(event).toMatchObject({
+      id: "",
+      function: "",
+      arguments: {},
+      result: "",
+      events: [],
+      type: "function",
+    });
+  });
+
+  it("subtask: fills name, input, result, and child events", () => {
+    const event = normalizeEvent({ ...base, event: "subtask" });
+    expect(event).toMatchObject({
+      name: "",
+      input: {},
+      result: null,
+      events: [],
+    });
+  });
+
+  it("input: fills input and input_ansi", () => {
+    const event = normalizeEvent({ ...base, event: "input" });
+    expect(event).toMatchObject({ input: "", input_ansi: "" });
+  });
+
+  it("sample_init: fills sample and state", () => {
+    const event = normalizeEvent({ ...base, event: "sample_init" });
+    expect(event).toMatchObject({ sample: {}, state: null });
+  });
+
+  it("info: fills data; compaction: fills type", () => {
+    expect(normalizeEvent({ ...base, event: "info" })).toMatchObject({
+      data: null,
+    });
+    expect(normalizeEvent({ ...base, event: "compaction" })).toMatchObject({
+      type: "summary",
+    });
+  });
+
+  const pathless = {
+    ...base,
+    event: "sentinel",
+    kind: "decision",
+    step_id: "call_1",
+    conversation: "agent",
+  };
+  const sentinel = { ...pathless, factory: "guard", path: "guard/rules" };
+
+  it("sentinel: reads an old log's continue action as proceed", () => {
+    expect(normalizeEvent({ ...sentinel, action: "continue" })).toMatchObject({
+      action: "proceed",
+    });
+    const current = { ...sentinel, action: "proceed" };
+    expect(normalizeEvent(current)).toBe(current);
+  });
+
+  it("sentinel: fills the required strings a crafted record omits", () => {
+    expect(normalizeEvent({ ...pathless, action: "reject" })).toMatchObject({
+      path: "",
+      factory: "",
+      step_id: "call_1",
+      conversation: "agent",
+    });
+  });
+
+  // Current inspect_ai accepts each of these with the defaulted fields omitted.
+  const communication = {
+    ...base,
+    event: "communication",
+    source: "test",
+    agent: "a",
+  };
+
+  it("communication: fills the defaults of each kind", () => {
+    expect(
+      normalizeEvent({ ...communication, kind: "read", channel: "c" })
+    ).toMatchObject({ nested: false, record_ids: [], data: {} });
+    expect(
+      normalizeEvent({
+        ...communication,
+        kind: "sent",
+        channel: "c",
+        send: { record: { kind: "message", sender: "a" } },
+      })
+    ).toMatchObject({
+      record_ids: [],
+      send: { record: { kind: "message", to: [], recipients: [] } },
+    });
+    expect(
+      normalizeEvent({
+        ...communication,
+        kind: "delivered",
+        channel: "c",
+        delivery: { seq: 1 },
+      })
+    ).toMatchObject({ delivery: { seq: 1, recipients: [] } });
+    expect(
+      normalizeEvent({
+        ...communication,
+        kind: "waited",
+        wait: { outcome: "news", duration: 1 },
+      })
+    ).toMatchObject({
+      data: {},
+      wait: { outcome: "news", duration: 1, channels: [] },
+    });
+  });
+
+  it("communication: keeps a complete event's identity", () => {
+    const complete = {
+      ...communication,
+      kind: "waited",
+      nested: false,
+      record_ids: [],
+      data: {},
+      wait: { outcome: "news", duration: 1, channels: ["c"] },
+    };
+    expect(normalizeEvent(complete)).toBe(complete);
+  });
+
+  it("communication: fills defaults on events nested in tool and subtask events", () => {
+    const nested = { ...communication, kind: "read", channel: "c" };
+    const filled = { event: "communication", record_ids: [], data: {} };
+    expect(
+      normalizeEvent({
+        ...base,
+        event: "tool",
+        id: "call1",
+        function: "agent",
+        arguments: {},
+        result: "",
+        events: [nested],
+      })
+    ).toMatchObject({ events: [filled] });
+    expect(
+      normalizeEvent({
+        ...base,
+        event: "subtask",
+        name: "calc",
+        input: {},
+        result: null,
+        events: [nested],
+      })
+    ).toMatchObject({ events: [filled] });
+  });
+
+  it("span_begin / span_end: fill ids and names", () => {
+    expect(normalizeEvent({ ...base, event: "span_begin" })).toMatchObject({
+      id: "",
+      name: "",
+    });
+    expect(normalizeEvent({ ...base, event: "span_end" })).toMatchObject({
+      id: "",
+    });
+  });
+
+  it("model: fills tool_choice, treating explicit null like absence", () => {
+    expect(
+      normalizeEvent({ ...base, event: "model", model: "m" })
+    ).toMatchObject({ tool_choice: "none" });
+    // tool_choice's type doesn't admit null, so a wire null must fill too —
+    // toolChoiceEqual reads `.name` on non-string values unguarded.
+    expect(
+      normalizeEvent({ ...base, event: "model", model: "m", tool_choice: null })
+    ).toMatchObject({ tool_choice: "none" });
+    expect(
+      normalizeEvent({ ...base, event: "tool", result: null, type: null })
+    ).toMatchObject({ result: "", type: "function" });
+  });
+
+  it("tool/subtask: normalizes nested events recursively", () => {
+    const legacyNested = { event: "model", timestamp: "t", model: "m" };
+    const tool = normalizeEvent({
+      ...base,
+      event: "tool",
+      id: "call1",
+      function: "agent",
+      arguments: {},
+      result: "",
+      events: [legacyNested],
+    });
+    expect(tool).toMatchObject({
+      events: [
+        {
+          event: "model",
+          working_start: 0,
+          config: {},
+          output: { model: "", choices: [], completion: "" },
+        },
+      ],
+    });
+
+    const subtask = normalizeEvent({
+      ...base,
+      event: "subtask",
+      name: "calc",
+      input: {},
+      result: null,
+      events: [legacyNested],
+    });
+    expect(subtask).toMatchObject({
+      events: [{ event: "model", working_start: 0, config: {} }],
+    });
+  });
+
+  it("tool: preserves identity when nested events are already clean", () => {
+    const clean = {
+      ...base,
+      event: "tool",
+      id: "call1",
+      function: "bash",
+      arguments: {},
+      result: "",
+      type: "function",
+      events: [{ ...base, event: "state", changes: [] }],
+    };
+    expect(normalizeEvent(clean)).toBe(clean);
+  });
+
+  it("normalizeEvents preserves array identity when every event is clean", () => {
+    const events = [
+      { event: "step", action: "begin", name: "solve", ...base },
+      { event: "step", action: "end", name: "solve", ...base },
+    ];
+    expect(normalizeEvents(events)).toBe(events);
+  });
+});
+
+describe("normalizeEvalSpec remaining defaults", () => {
+  it("backfills solver_args_passed from solver_args", () => {
+    const spec = normalizeEvalSpec({ task: "t", solver_args: { turns: 3 } });
+    expect(spec.solver_args_passed).toEqual({ turns: 3 });
+  });
+
+  it("nulls solver_args_passed when solver_args is absent", () => {
+    const spec = normalizeEvalSpec({ task: "t" });
+    expect(spec.solver_args_passed).toBeNull();
+    expect(spec.task_version).toBe(0);
+  });
+});
+
+describe("normalizeEvalPlan on garbage input", () => {
+  it("produces a complete default plan", () => {
+    expect(normalizeEvalPlan(undefined)).toEqual({
+      name: "plan",
+      steps: [],
+      config: {},
+    });
+    expect(normalizeEvalPlan("bad")).toEqual({
+      name: "plan",
+      steps: [],
+      config: {},
+    });
+  });
+});
+
+describe("normalizeTimelines", () => {
+  // A span as an early writer serialized it: no type tags, no flags, and the
+  // list fields dropped when empty.
+  const legacyTimeline: WireTimeline = {
+    name: "main",
+    description: "",
+    root: {
+      id: "root",
+      name: "root",
+      content: [
+        { event: "e1" },
+        { id: "child", name: "child", branches: [{ id: "b", name: "b" }] },
+      ],
+    },
+  };
+
+  it("fills type tags, flags, and empty lists recursively", () => {
+    const [timeline] = normalizeTimelines([legacyTimeline]);
+    expect(timeline?.root).toEqual({
+      id: "root",
+      name: "root",
+      type: "span",
+      tool_invoked: false,
+      utility: false,
+      branches: [],
+      content: [
+        { event: "e1", type: "event" },
+        {
+          id: "child",
+          name: "child",
+          type: "span",
+          tool_invoked: false,
+          utility: false,
+          content: [],
+          branches: [
+            {
+              id: "b",
+              name: "b",
+              type: "span",
+              tool_invoked: false,
+              utility: false,
+              branches: [],
+              content: [],
+            },
+          ],
+        },
+      ],
+    });
+  });
+
+  it("preserves a current-format timeline", () => {
+    const current: WireTimeline = {
+      name: "main",
+      description: "d",
+      root: {
+        id: "root",
+        name: "root",
+        type: "span",
+        tool_invoked: true,
+        utility: false,
+        span_type: "agent",
+        branches: [],
+        content: [{ event: "e1", type: "event" }],
+      },
+    };
+    expect(normalizeTimelines([current])).toEqual([current]);
+  });
+
+  it("normalizeEvalSample normalizes timelines when present and drops junk", () => {
+    const sample = normalizeEvalSample({
+      id: 1,
+      epoch: 1,
+      timelines: [legacyTimeline, "junk", { name: "no-root" }],
+    });
+    expect(sample.timelines).toHaveLength(1);
+    expect(sample.timelines?.[0]?.root.tool_invoked).toBe(false);
+    expect(normalizeEvalSample({ id: 1, epoch: 1 }).timelines).toBeUndefined();
+  });
+});

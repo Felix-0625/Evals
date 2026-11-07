@@ -1,0 +1,184 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "inspect_scout"
+version = "0.5.5+evals.1"
+description = "Transcript Analysis for AI Agents"
+authors = [{ name = "Meridian Labs" }]
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT License" }
+dependencies = [
+    "anyio>=4.8.0",
+    "mmh3>=5.0.0",
+    "tenacity>=8.0.0",
+    "click>=8.1.3,!=8.2.0,!=8.2.2,!=8.3.0,!=8.3.1",
+    "cloudpickle>=3.0.0",
+    "duckdb>=1.4.0,<2",
+    "fastapi>=0.128.1",
+    "ijson>=3.2.0",
+    "importlib-metadata",
+    "inspect-ai>=0.3.286",
+    "inspect-swe>=0.2.56",
+    "jinja2>=3.0.0",
+    "jsonlines>=3.0.0",
+    "jsonschema>3.1.1",
+    "libcst>=1.0.0",
+    "pandas>=2.0.0",
+    "psutil>=6.0.0",
+    "pyarrow>=10.0.1",
+    "pydantic>=2.13.0",
+    "python-dotenv>=0.16.0",
+    "rich>=13.3.3,!=14.0.0",
+    "ruamel.yaml>=0.18.0",
+    "shortuuid",
+    "sse-starlette>=2.0.0",
+    "send2trash>=1.8.0",
+    "typing_extensions>=4.9.0",
+    "universal-pathlib>=0.2.6",
+    "uvicorn",
+    "wrapt>=1.16.0",
+    "zstandard>=0.20.0",
+]
+
+[project.urls]
+"Source Code" = "https://github.com/meridianlabs-ai/inspect_scout"
+"Issue Tracker" = "https://github.com/meridianlabs-ai/inspect_scout/issues"
+
+[project.scripts]
+scout = "inspect_scout._cli.main:main"
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "pytest",
+    # zipfile-zstd patches zipfile to support zstd compression (for creating test fixtures)
+    "zipfile-zstd>=0.0.4; python_version < '3.14'",
+    "pytest-xdist",
+    # >=1.0.0: anthropic 1.x types its exceptions against httpx2, which the
+    # tests construct directly (httpx2 arrives transitively via anthropic)
+    "anthropic>=1.0.0",
+    "arize-phoenix-client",
+    "google-genai>=1.69.0",
+    # harbor (for the atif source tests): >=0.6.0 is the first release with the
+    # ATIF v1.7 schema the source parses; harbor itself requires Python >=3.12
+    "harbor>=0.6.0; python_version >= '3.12'",
+    "huggingface_hub",
+    "langsmith",
+    # >=3.23.0: first release with logfire.query_client, which the logfire
+    # source imports (earlier releases only have logfire.experimental.query_client)
+    "logfire>=3.23.0",
+    # >=3.0.0: openai 3.x types its exceptions against httpx2, which the
+    # tests construct directly (httpx2 arrives transitively via openai)
+    "openai>=3.0.0",
+    "pytest-dotenv",
+    "pytest-asyncio",
+    "mypy",
+    "pandas-stubs>=2.3.2.250926",
+    "pyarrow-stubs>=20.0.0.20250928",
+    "types-jsonschema",
+    "types-psutil",
+    "types-PyYAML",
+    "types-Send2Trash"
+]
+doc = [
+    "jupyter",
+    "panflute",
+    "markdown",
+    "griffe",
+    "pyyaml",
+    "types-Markdown",
+    "rich",
+    "quarto-cli>=1.7"
+]
+
+[tool.hatch.build]
+only-packages = true
+exclude = ["docs/", "tests/"]
+artifacts = ["src/inspect_scout/_view/dist"]
+
+
+
+[tool.hatch.version.raw-options]
+local_scheme = "no-local-version" # Important for PyPI compatibility
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.uv]
+# 0.11.8 is the first uv that keeps uv.lock stable with a relative exclude-newer,
+# and 0.13.4 the first that no longer trusts the compromised emSign root
+# (GHSA-hq85-5cpj-mr62).
+required-version = ">=0.13.4"
+# Only resolve releases at least 7 days old (see CONTRIBUTING.md).
+exclude-newer = "7 days"
+
+# 6 hours only for direct dependencies that are a model provider SDK or an
+# Inspect package; see CONTRIBUTING.md.
+[tool.uv.exclude-newer-package]
+anthropic = "6 hours"
+google-genai = "6 hours"
+inspect-ai = "6 hours"
+inspect-swe = "6 hours"
+openai = "6 hours"
+
+# Development and CI track inspect_ai main. uv.lock records a commit, and CI
+# moves it to main's latest before installing (.github/actions/uv-sync). Only uv
+# reads this; the published package requires the inspect-ai floor above, and
+# the release PR's CI installs the newest release instead.
+[tool.uv.sources]
+inspect-ai = { path = "../../engine/inspect_ai", editable = true }
+
+[tool.ruff]
+extend-exclude = ["docs"]
+src = ["."]
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # flake8
+    "D",      # pydocstyle
+    "I",      # isort
+    "B",      # flake8-bugbear
+    "SIM101", # duplicate isinstance
+    "PLE",    # pylint errors
+    "PLW",    # pylint warnings
+    # "RET", # flake8-return
+    # "RUF", # ruff rules
+]
+ignore = ["E203", "E501", "D10", "D212", "D415", "PLW0127", "PLW0603", "PLW2901"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+# -n logical, not auto: auto means physical cores when psutil is importable
+# (it always is — an inspect_ai runtime dependency), which uses only 2 of the
+# 4 vCPUs on ubuntu-latest CI runners. --dist worksteal lets an idle worker
+# take pending tests off a straggler (xdist's default load hands out large
+# contiguous slices, so slow e2e files can strand one worker). Both measured
+# in inspect_ai (design/ci-perf/report.md there).
+addopts = "-n logical --dist worksteal"
+
+[tool.mypy]
+strict = true
+mypy_path = "src"
+files = ["src", "examples"]
+namespace_packages = true
+explicit_package_bases = true
+
+# harbor (used by the optional atif source) requires Python >=3.12, so it may
+# not be installed in the type-checking environment. Don't fail when missing.
+[[tool.mypy.overrides]]
+module = ["harbor.*"]
+ignore_missing_imports = true
+
+# ijson ships no stubs or py.typed marker.
+[[tool.mypy.overrides]]
+module = ["ijson", "ijson.*"]
+ignore_missing_imports = true

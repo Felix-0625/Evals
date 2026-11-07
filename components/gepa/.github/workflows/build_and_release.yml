@@ -1,0 +1,216 @@
+---
+# Versioning Strategy:
+# - TestPyPI: Auto-increments versions if conflicts exist (e.g., 1.0.0 -> 1.0.0a1 -> 1.0.0a2)
+# - PyPI: Always uses exact tag version (e.g., v1.0.0 -> 1.0.0), fails if version exists
+# - Git operations: Use original tag version for branch names and merge messages
+name: Publish Python 🐍 distributions 📦 to PyPI
+on:
+  push:
+    tags:
+      - "v*"
+jobs:
+  extract-tag:
+    runs-on: ubuntu-latest
+    if: github.repository_owner == 'gepa-ai' && startsWith(github.ref, 'refs/tags/v') && github.event.base_ref == 'refs/heads/main'
+    outputs:
+      version: ${{ steps.extract_tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: extract_tag
+        name: Extract tag name
+        run: |
+          # Extract tag and remove 'v' prefix to get semver
+          TAG=$(echo $GITHUB_REF | cut -d / -f 3)
+          VERSION=${TAG#v}
+          echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
+
+  verify-ci:
+    name: Run CI for release
+    if: github.repository_owner == 'gepa-ai' && startsWith(github.ref, 'refs/tags/v') && github.event.base_ref == 'refs/heads/main'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/run_tests.yml
+
+  verify-dspy:
+    name: Run DSPy contract tests against the latest DSPy release
+    if: github.repository_owner == 'gepa-ai' && startsWith(github.ref, 'refs/tags/v') && github.event.base_ref == 'refs/heads/main'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/dspy_contract.yml
+    with:
+      dspy-versions: '["latest"]'
+
+  build-and-publish-test-pypi:
+    needs: [extract-tag, verify-ci, verify-dspy]
+    if: github.repository_owner == 'gepa-ai' && startsWith(github.ref, 'refs/tags/v') && github.event.base_ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+    permissions:
+      id-token: write # IMPORTANT: mandatory for trusted publishing
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ssh-key: ${{ secrets.PUSH_KEY }}
+      - name: Configure git
+        run: |
+          git config --global user.email "lakshyaaagrawal+gepabot@berkeley.edu"
+          git config --global user.name "gepa-bot"
+      - name: Set up Python 3.11
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Set up latest uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: latest
+      - name: Create virtual environment
+        run: uv venv
+      - name: Install build dependencies
+        run: uv pip install ".[build]"
+      - name: Get correct version for TestPyPI release (auto-increment if exists)
+        id: check_version
+        run: |
+          VERSION=${{ needs.extract-tag.outputs.version }}  
+          PACKAGE_NAME="gepa"
+          echo "Checking if $VERSION for $PACKAGE_NAME exists on TestPyPI"  
+          NEW_VERSION=$(uv run python .github/workflows/build_utils/test_version.py $PACKAGE_NAME $VERSION https://test.pypi.org)  
+          echo "Version to be used for TestPyPI release: $NEW_VERSION"  
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+      - name: Update version in pyproject.toml and refresh lockfile
+        run: |
+          sed -i '/#replace_package_version_marker/{n;s/version="[^"]*"/version="${{ steps.check_version.outputs.version }}"/;}' pyproject.toml
+          # Keep uv.lock in sync with the bumped version. A stale lock breaks
+          # `uv sync --locked` in CI, and with a plain `uv sync` it silently
+          # re-resolves against latest PyPI (which is how an unbuildable
+          # litellm 1.92.0 reached the Python 3.14 jobs after the 0.1.2 bump).
+          uv lock
+      - name: Build a binary wheel
+        run: uv run python -m build
+      - name: Validate built distributions
+        run: uv run python -m twine check --strict dist/*
+      - name: List built distributions
+        run: ls -la dist/
+      - name: Show package metadata
+        run: uv run python -c "import build; print(build.__version__)"
+      # Test the locally built wheel
+      - name: Create test environment
+        run: uv venv test_before_testpypi
+      - name: Test package installation and functionality
+        run: |
+          # Install the locally built wheel and testing dependencies
+          WHEEL_FILE=$(ls dist/*.whl | head -1)
+          uv pip install --python test_before_testpypi/bin/python "$WHEEL_FILE[dev]" pytest
+          # Use the wheel environment without syncing the source checkout into it
+          VIRTUAL_ENV="$PWD/test_before_testpypi" uv run --active --no-sync pytest -m "not llm_live and not extra" tests/
+      # Publish to test-PyPI
+      - name: Publish distribution 📦 to test-PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1 # This requires a trusted publisher to be setup in pypi/testpypi
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+      # Create and push to release-test branch (no merge to main)
+      - name: Create release-test branch and push changes
+        run: |
+          git checkout -b release-test-${{ needs.extract-tag.outputs.version }}
+          git add pyproject.toml uv.lock
+          git commit -m "Update version to ${{ steps.check_version.outputs.version }} for test PyPI (from tag ${{ needs.extract-tag.outputs.version }})"
+          git push origin release-test-${{ needs.extract-tag.outputs.version }}
+
+  # TODO: Add tests using gepa
+
+  build-and-publish-pypi:
+    needs: [extract-tag, build-and-publish-test-pypi]
+    # Only publish to PyPI if the repository owner is gepa-ai and status checks pass
+    if: github.repository_owner == 'gepa-ai' && startsWith(github.ref, 'refs/tags/v') && github.event.base_ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+    permissions:
+      id-token: write # IMPORTANT: mandatory for trusted publishing
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ssh-key: ${{ secrets.PUSH_KEY }}
+          fetch-depth: 0
+      - name: Configure git
+        run: |
+          git config --global user.email "lakshyaaagrawal+gepabot@berkeley.edu"
+          git config --global user.name "gepa-bot"
+      - name: Set up Python 3.11
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Set up latest uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: latest
+      - name: Create virtual environment
+        run: uv venv
+      - name: Install build dependencies
+        run: uv pip install ".[build]"
+      - name: Set version for PyPI release (always use tag version)
+        id: check_version
+        run: |
+          VERSION=${{ needs.extract-tag.outputs.version }}  
+          PACKAGE_NAME="gepa"
+          echo "Using exact tag version for PyPI release: $VERSION"
+          
+          # Check if this exact version already exists on PyPI
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://pypi.org/pypi/$PACKAGE_NAME/$VERSION/json")
+          if [ "$HTTP_STATUS" = "404" ]; then
+            echo "✅ Version $VERSION does not exist on PyPI, proceeding..."
+          elif [ "$HTTP_STATUS" = "200" ]; then
+            echo "❌ Version $VERSION already exists on PyPI!"
+            echo "Please create a new tag with a different version number."
+            exit 1
+          else
+            echo "⚠️ Unable to check PyPI (HTTP $HTTP_STATUS), proceeding with caution..."
+          fi
+          
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Update version in pyproject.toml and refresh lockfile
+        run: |
+          sed -i '/#replace_package_version_marker/{n;s/version="[^"]*"/version="${{ steps.check_version.outputs.version }}"/;}' pyproject.toml
+          # Keep uv.lock in sync with the bumped version. A stale lock breaks
+          # `uv sync --locked` in CI, and with a plain `uv sync` it silently
+          # re-resolves against latest PyPI (which is how an unbuildable
+          # litellm 1.92.0 reached the Python 3.14 jobs after the 0.1.2 bump).
+          uv lock
+      - name: Build a binary wheel
+        run: uv run python -m build
+      - name: Validate built distributions
+        run: uv run python -m twine check --strict dist/*
+      # Test the locally built wheel before publishing to pypi
+      - name: Create test environment
+        run: uv venv test_before_pypi
+      - name: Test package installation and functionality
+        run: |
+          # Install the locally built wheel and testing dependencies
+          WHEEL_FILE=$(ls dist/*.whl | head -1)
+          uv pip install --python test_before_pypi/bin/python "$WHEEL_FILE[dev]" pytest
+          # Use the wheel environment without syncing the source checkout into it
+          VIRTUAL_ENV="$PWD/test_before_pypi" uv run --active --no-sync pytest -m "not llm_live and not extra" tests/
+          rm -r test_before_pypi
+      - name: Publish distribution 📦 to PyPI (gepa)
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          attestations: false
+      
+      # Create and push to release branch
+      - name: Create release branch and push changes
+        run: |
+          git checkout -b release-${{ needs.extract-tag.outputs.version }}
+          git add pyproject.toml uv.lock
+          git commit -m "Update version to ${{ steps.check_version.outputs.version }} (from tag ${{ needs.extract-tag.outputs.version }})"
+          git push origin release-${{ needs.extract-tag.outputs.version }}
+
+      # Merge to main
+      - name: Merge release branch to main
+        run: |
+          git checkout main
+          git pull origin main
+          git merge --no-ff release-${{ needs.extract-tag.outputs.version }} -m "Merge release ${{ needs.extract-tag.outputs.version }}"
+          git push origin main

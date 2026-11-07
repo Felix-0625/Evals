@@ -1,0 +1,663 @@
+import inspect
+import weakref
+from dataclasses import dataclass, field
+from functools import wraps
+from pathlib import Path
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Literal,
+    Mapping,
+    ParamSpec,
+    Protocol,
+    Sequence,
+    TypeVar,
+    cast,
+    get_type_hints,
+)
+
+from inspect_ai._util._async import is_callable_coroutine
+from inspect_ai._util.decorator import parse_decorators
+from inspect_ai._util.error import PrerequisiteError
+from inspect_ai._util.module import load_module
+from inspect_ai._util.package import get_installed_package_name
+from inspect_ai._util.path import add_to_syspath, pretty_path
+from inspect_ai._util.registry import (
+    RegistryInfo,
+    registry_add,
+    registry_info,
+    registry_kwargs,
+    registry_lookup,
+    registry_name,
+    registry_tag,
+)
+from inspect_ai.event import Timeline
+from inspect_ai.event._event import Event
+from inspect_ai.model._chat_message import ChatMessage
+from inspect_ai.scorer import Metric
+from typing_extensions import overload
+
+from inspect_scout._util.decorator import fixup_wrapper_annotations, split_spec
+
+from .._concurrency._mp_common import register_plugin_directory
+from .._transcript.handle import is_transcript_handle_type
+from .._transcript.types import (
+    EventType,
+    MessageType,
+    Transcript,
+    TranscriptContent,
+)
+from ._loaders import _matches_transcript_or_handle, create_implicit_loader
+from .filter import (
+    normalize_events_filter,
+    normalize_messages_filter,
+    normalize_timeline_filter,
+)
+from .loader import Loader
+from .result import Result
+from .types import ScannerInput
+from .validate import infer_filters_from_type, validate_scanner_signature
+
+SCANNER_CONFIG = "scanner_config"
+SCANNER_METRICS = "scanner_metrics"
+SCANNER_VERSION = "scanner_version"
+
+SCANNER_FILE_ATTR = "___scanner_file___"
+SCANNER_NAME_ATTR = "___scanner_name___"
+SCANNER_CONTENT_ATTR = "___scanner_content___"
+# Scan functions that need timelines loaded (e.g. `llm_scanner(timeline=...)`)
+# but defer to any timeline filter declared or passed as a content override.
+SCANNER_TIMELINE_NEEDED_ATTR = "___scanner_timeline_needed___"
+# Scan functions whose author has vouched for (True) or against (False)
+# receiving a streaming `TranscriptHandle`. Keyed by identity rather than
+# stored on the function: `functools.wraps` copies `__dict__`, so an attribute
+# would leak onto a wrapper that adds its own transcript access.
+_STREAMING_SUPPORT: "weakref.WeakKeyDictionary[Callable[..., Any], bool]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def mark_streaming_support(fn: Callable[..., Any], supported: bool) -> None:
+    """Record whether `fn` can be handed a streaming `TranscriptHandle`.
+
+    Called by the code that constructs a scan function -- `llm_scanner` does so
+    per instance, since its safety depends on the arguments it was built with.
+    """
+    _STREAMING_SUPPORT[fn] = supported
+
+
+def streaming_support_of(fn: Callable[..., Any]) -> bool | None:
+    """The recorded verdict for `fn`, or None if nobody has vouched either way."""
+    return _STREAMING_SUPPORT.get(fn)
+
+
+# core types
+# Use bounded TypeVar (contravariant for scanner input)
+T = TypeVar("T", bound=ScannerInput, contravariant=True)
+TM = TypeVar(
+    "TM", bound=Transcript | ChatMessage | list[ChatMessage], contravariant=True
+)
+TE = TypeVar("TE", bound=Transcript | Event | list[Event], contravariant=True)
+TT = TypeVar("TT", bound=Transcript | Timeline | list[Timeline], contravariant=True)
+P = ParamSpec("P")
+# Invariant TypeVar for decorator overloads where type inference is needed
+TScan = TypeVar("TScan", bound=ScannerInput)
+
+
+class Scanner(Protocol[T]):
+    """Scanner protocol."""
+
+    def __call__(self, input: T, /) -> Awaitable[Result | list[Result]]:
+        """Scan transcript content.
+
+        Args:
+           input: Input to scan.
+
+        Returns:
+           ScanResult: Result of scan (value and related metadata).
+        """
+        ...
+
+
+@dataclass
+class ScannerConfig:
+    content: TranscriptContent = field(default_factory=TranscriptContent)
+    # TODO: I want to make loader non-optional, but this obviously isn't right
+    loader: Loader[ScannerInput] = field(default=cast(Loader[ScannerInput], None))
+    supports_streaming: bool = False
+    """Whether the scanner can operate on a streaming `TranscriptHandle`
+    without a materialized `Transcript`.
+
+    Set per-instance (rather than as a class-level capability) because
+    streaming-safety depends on runtime config - e.g. callable question
+    templates require full transcripts.
+    """
+
+
+ScannerFactory = Callable[P, Scanner[T]]
+
+
+# overloads for both messages and events present: scanner takes Transcript
+# mypy: disable-error-code="overload-overlap"
+@overload
+def scanner(
+    *,
+    messages: Literal["all"],
+    events: list[EventType],
+    loader: Loader[Transcript] | None = ...,
+    metadata: bool | None = ...,
+    name: str | None = ...,
+    version: int = 0,
+    supports_streaming: bool | None = ...,
+    metrics: Sequence[Metric | Mapping[str, Sequence[Metric]]]
+    | Mapping[str, Sequence[Metric]]
+    | None = ...,
+) -> Callable[[ScannerFactory[P, Transcript]], ScannerFactory[P, Transcript]]: ...
+@overload
+def scanner(
+    *,
+    messages: list[MessageType],
+    events: Literal["all"],
+    loader: Loader[Transcript] | None = ...,
+    metadata: bool | None = ...,
+    name: str | None = ...,
+    version: int = 0,
+    supports_streaming: bool | None = ...,
+    metrics: Sequence[Metric | Mapping[str, Sequence[Metric]]]
+    | Mapping[str, Sequence[Metric]]
+    | None = ...,
+) -> Callable[[ScannerFactory[P, Transcript]], ScannerFactory[P, Transcript]]: ...
+@overload
+def scanner(
+    *,
+    messages: list[MessageType],
+    events: list[EventType],
+    loader: Loader[Transcript] | None = ...,
+    metadata: bool | None = ...,
+    name: str | None = ...,
+    version: int = 0,
+    supports_streaming: bool | None = ...,
+    metrics: Sequence[Metric | Mapping[str, Sequence[Metric]]]
+    | Mapping[str, Sequence[Metric]]
+    | None = ...,
+) -> Callable[[ScannerFactory[P, Transcript]], ScannerFactory[P, Transcript]]: ...
+@overload
+def scanner(
+    *,
+    messages: Literal["all"],
+    events: Literal["all"],
+    loader: Loader[Transcript] | None = ...,
+    metadata: bool | None = ...,
+    name: str | None = ...,
+    version: int = 0,
+    supports_streaming: bool | None = ...,
+    metrics: Sequence[Metric | Mapping[str, Sequence[Metric]]]
+    | Mapping[str, Sequence[Metric]]
+    | None = ...,
+) -> Callable[[ScannerFactory[P, Transcript]], ScannerFactory[P, Transcript]]: ...
+
+
+# overloads for type lists: scanner can take T or list[T] or Transcript
+@overload
+def scanner(
+    *,
+    messages: list[MessageType],
+    events: None = ...,
+    loader: Loader[list[ChatMessage]] | None = ...,
+    metadata: bool | None = ...,
+    name: str | None = ...,
+    version: int = 0,
+    supports_streaming: bool | None = ...,
+    metrics: Sequence[Metric | Mapping[str, Sequence[Metric]]]
+    | Mapping[str, Sequence[Metric]]
+    | None = ...,
+) -> Callable[[ScannerFactory[P, TM]], ScannerFactory[P, ScannerInput]]: ...
+@overload
+def scanner(
+    *,
+    events: list[EventType],
+    messages: None = ...,
+    loader: Loader[list[Event]] | None = ...,
+    metadata: bool | None = ...,
+    name: str | None = ...,
+    version: int = 0,
+    supports_streaming: bool | None = ...,
+    metrics: Sequence[Metric | Mapping[str, Sequence[Metric]]]
+    | Mapping[str, Sequence[Metric]]
+    | None = ...,
+) -> Callable[[ScannerFactory[P, TE]], ScannerFactory[P, ScannerInput]]: ...
+
+
+# overloads for "all": scanner can take T or list[T] or Transcript
+@overload
+def scanner(
+    *,
+    messages: Literal["all"],
+    events: None = ...,
+    loader: Loader[ChatMessage] | None = ...,
+    metadata: bool | None = ...,
+    name: str | None = ...,
+    version: int = 0,
+    supports_streaming: bool | None = ...,
+    metrics: Sequence[Metric | Mapping[str, Sequence[Metric]]]
+    | Mapping[str, Sequence[Metric]]
+    | None = ...,
+) -> Callable[[ScannerFactory[P, TM]], ScannerFactory[P, ScannerInput]]: ...
+@overload
+def scanner(
+    *,
+    events: Literal["all"],
+    messages: None = ...,
+    loader: Loader[Event] | None = ...,
+    metadata: bool | None = ...,
+    name: str | None = ...,
+    version: int = 0,
+    supports_streaming: bool | None = ...,
+    metrics: Sequence[Metric | Mapping[str, Sequence[Metric]]]
+    | Mapping[str, Sequence[Metric]]
+    | None = ...,
+) -> Callable[[ScannerFactory[P, TE]], ScannerFactory[P, ScannerInput]]: ...
+
+
+@overload
+def scanner(
+    *,
+    timeline: Literal[True] | list[EventType] | Literal["all"],
+    loader: Loader[Transcript] | None = ...,
+    messages: list[MessageType] | Literal["all"] | None = ...,
+    events: list[EventType] | Literal["all"] | None = ...,
+    metadata: bool | None = ...,
+    name: str | None = ...,
+    version: int = 0,
+    supports_streaming: bool | None = ...,
+    metrics: Sequence[Metric | Mapping[str, Sequence[Metric]]]
+    | Mapping[str, Sequence[Metric]]
+    | None = ...,
+) -> Callable[[ScannerFactory[P, TT]], ScannerFactory[P, ScannerInput]]: ...
+
+
+# overload for direct decoration without parentheses (will infer from types)
+# This needs to be last as it's the most general
+@overload
+def scanner(factory: ScannerFactory[P, T], /) -> ScannerFactory[P, T]: ...
+
+
+@overload
+def scanner(
+    *,
+    loader: Loader[TScan] | None = None,
+    messages: list[MessageType] | Literal["all"] | None = None,
+    events: list[EventType] | Literal["all"] | None = None,
+    timeline: Literal[True] | list[EventType] | Literal["all"] | None = None,
+    metadata: bool | None = None,
+    name: str | None = None,
+    version: int = 0,
+    supports_streaming: bool | None = ...,
+    metrics: Sequence[Metric | Mapping[str, Sequence[Metric]]]
+    | Mapping[str, Sequence[Metric]]
+    | None = ...,
+) -> Callable[[ScannerFactory[P, TScan]], ScannerFactory[P, TScan]]: ...
+
+
+def scanner(
+    factory: ScannerFactory[P, T] | None = None,
+    *,
+    loader: Loader[TScan] | None = None,
+    messages: list[MessageType] | Literal["all"] | None = None,
+    events: list[EventType] | Literal["all"] | None = None,
+    timeline: Literal[True] | list[EventType] | Literal["all"] | None = None,
+    metadata: bool | None = None,
+    name: str | None = None,
+    version: int = 0,
+    supports_streaming: bool | None = None,
+    metrics: Sequence[Metric | Mapping[str, Sequence[Metric]]]
+    | Mapping[str, Sequence[Metric]]
+    | None = None,
+) -> (
+    ScannerFactory[P, T]
+    | Callable[[ScannerFactory[P, T]], ScannerFactory[P, T]]
+    | Callable[[ScannerFactory[P, TScan]], ScannerFactory[P, TScan]]
+    | Callable[[ScannerFactory[P, TM]], ScannerFactory[P, ScannerInput]]
+    | Callable[[ScannerFactory[P, TE]], ScannerFactory[P, ScannerInput]]
+    | Callable[[ScannerFactory[P, TT]], ScannerFactory[P, ScannerInput]]
+):
+    """Decorator for registering scanners.
+
+    Args:
+       factory: Decorated scanner function.
+       loader: Custom data loader for scanner.
+       messages: Message types to scan.
+       events: Event types to scan.
+       timeline: Event types to include in timelines.
+       metadata: Whether to read the sample's metadata, target and scores from
+           the log body (default). Pass False if the scanner never reads
+           `transcript.metadata["sample_metadata"]`, `["target"]` or
+           `["scores"]`; the summary values are kept instead. Ignored with a
+           custom `loader=` -- set `metadata=` on the `@loader` instead.
+       name: Scanner name (defaults to function name).
+       version: Scanner version (defaults to 0).
+       supports_streaming: Whether the scanner can read its input through a
+          streaming `TranscriptHandle` instead of a materialized `Transcript`.
+          Leave unset to defer to the scan function's own verdict (`llm_scanner`
+          records one per instance, so wrapping it needs no declaration). `True`
+          grants permission -- the scan function must accept
+          `Transcript | TranscriptHandle` -- and a verdict against streaming
+          still revokes it; `False` forbids it. A scan streams only when every
+          scanner sharing the transcript is permitted.
+       metrics: One or more metrics to calculate over the values
+           (only used if scanner is converted to a scorer via `as_scorer()`).
+
+    Returns:
+        Scanner with registry info.
+    """
+    # Handle direct decoration without parentheses
+    if factory is not None:
+        # Called as @scanner (without parentheses)
+        return scanner()(factory)  # type: ignore[return-value]
+
+    # Don't raise error here anymore - we'll check after attempting inference
+    messages = normalize_messages_filter(messages) if messages is not None else None
+    events = normalize_events_filter(events) if events is not None else None
+    timeline = normalize_timeline_filter(timeline) if timeline is not None else None
+
+    # Timeline implies events (needed for UUID resolution and timeline_build fallback)
+    if timeline is not None:
+        if events is None:
+            if timeline == "all":
+                events = "all"
+            else:
+                # Timeline event types + structural events needed for tree building
+                events = normalize_events_filter(
+                    list(set(timeline) | {"span_begin", "span_end"})
+                )
+        elif events != "all":
+            # Ensure span events are included (needed for tree building)
+            events = normalize_events_filter(
+                list(set(events) | {"span_begin", "span_end"})
+            )
+
+    def decorate(factory_fn: ScannerFactory[P, T]) -> ScannerFactory[P, T]:
+        @wraps(factory_fn)
+        def factory_wrapper(*args: P.args, **kwargs: P.kwargs) -> Scanner[T]:
+            scanner_fn = factory_fn(*args, **kwargs)
+
+            # determine scanner name
+            if name is not None:
+                scanner_name = name
+            elif hasattr(scanner_fn, SCANNER_NAME_ATTR):
+                scanner_name = getattr(scanner_fn, SCANNER_NAME_ATTR)
+            else:
+                scanner_name = str(getattr(factory_fn, "__name__", "scanner"))
+
+            scanner_name = registry_name(factory_fn, scanner_name)
+
+            if not is_callable_coroutine(scanner_fn):
+                raise TypeError(
+                    f"'{scanner_name}' is not declared as an async callable."
+                )
+
+            # Infer filters from type annotations if not provided
+            # Use explicit filters if provided, otherwise try to infer
+            inferred_messages = messages
+            inferred_events = events
+            inferred_timeline = timeline
+            inferred_metadata = metadata
+
+            # Only infer if no loader and no explicit filters
+            if (
+                loader is None
+                and messages is None
+                and events is None
+                and timeline is None
+            ):
+                temp_messages, temp_events, temp_timeline = infer_filters_from_type(
+                    scanner_fn, factory_fn.__globals__
+                )
+                # Cast to proper types (mypy can't infer the string literals)
+                inferred_messages = (
+                    cast(list[MessageType] | None, temp_messages)
+                    if temp_messages
+                    else None
+                )
+                inferred_events = (
+                    cast(list[EventType] | None, temp_events) if temp_events else None
+                )
+                if temp_timeline:
+                    inferred_timeline = "all"
+                    # Timeline implies events="all"
+                    if inferred_events is None:
+                        inferred_events = "all"
+
+                # If we couldn't infer anything, raise an error
+                if (
+                    inferred_messages is None
+                    and inferred_events is None
+                    and inferred_timeline is None
+                ):
+                    raise ValueError(
+                        f"scanner '{scanner_name}' requires at least one of: "
+                        "messages=..., events=..., timeline=..., loader=..., "
+                        "or specific type annotations"
+                    )
+
+            # Allow scan functions to override content filters at runtime
+            # (e.g. llm_scanner sets this when content= is passed)
+            if hasattr(scanner_fn, SCANNER_CONTENT_ATTR):
+                override = getattr(scanner_fn, SCANNER_CONTENT_ATTR)
+                if override.messages is not None:
+                    inferred_messages = override.messages
+                if override.events is not None:
+                    inferred_events = override.events
+                if override.timeline is not None:
+                    inferred_timeline = override.timeline
+                if override.metadata is not None:
+                    inferred_metadata = override.metadata
+            if inferred_timeline is None and getattr(
+                scanner_fn, SCANNER_TIMELINE_NEEDED_ATTR, False
+            ):
+                inferred_timeline = normalize_timeline_filter(True)
+
+            # Validate scanner signature matches filters
+            # Only validate if we have filters (not just a custom loader)
+            if (
+                inferred_messages is not None
+                or inferred_events is not None
+                or inferred_timeline is not None
+            ):
+                validate_scanner_signature(
+                    scanner_fn,
+                    inferred_messages,
+                    inferred_events,
+                    factory_fn.__globals__,
+                    timeline=inferred_timeline,
+                )
+
+            # compute scanner config
+            scanner_config = ScannerConfig()
+            if inferred_messages is not None:
+                scanner_config.content.messages = inferred_messages
+            if inferred_events is not None:
+                scanner_config.content.events = inferred_events
+            if inferred_timeline is not None:
+                scanner_config.content.timeline = inferred_timeline
+            if inferred_metadata is not None:
+                scanner_config.content.metadata = inferred_metadata
+            if loader is not None:
+                # TODO: how are we ensuring that the writer of a custom loader sets
+                # the proper content filter? We could do it for them, but I'm not
+                # sure how - syntactically
+                scanner_config.loader = cast(Loader[ScannerInput], loader)
+            else:
+                scanner_config.loader = create_implicit_loader(
+                    scanner_fn, scanner_config.content
+                )
+
+            vouched = streaming_support_of(scanner_fn)
+            if supports_streaming is None:
+                # Undeclared: defer to the scan function's author. Every
+                # documented `return llm_scanner(...)` wrapper streams this way.
+                scanner_config.supports_streaming = bool(vouched)
+            else:
+                # Declared: the declaration grants permission and the author's
+                # verdict can only revoke it. Neither False is ever overridden.
+                if supports_streaming:
+                    _validate_streaming_declaration(scanner_fn)
+                scanner_config.supports_streaming = (
+                    supports_streaming and vouched is not False
+                )
+
+            registry_tag(
+                factory_fn,
+                scanner_fn,
+                RegistryInfo(
+                    type="scanner",
+                    name=scanner_name,
+                    metadata={
+                        SCANNER_CONFIG: scanner_config,
+                        SCANNER_METRICS: metrics,
+                        SCANNER_VERSION: version,
+                    },
+                ),
+                *args,
+                **kwargs,
+            )
+
+            # if its not from an installed package then it is a "local"
+            # module import, so set its scanner file
+            if get_installed_package_name(factory_fn) is None:
+                file = inspect.getfile(factory_fn)
+                if file:
+                    setattr(scanner_fn, SCANNER_FILE_ATTR, Path(file).as_posix())
+
+            return scanner_fn
+
+        scanner_name = registry_name(
+            factory_fn, name or str(getattr(factory_fn, "__name__", "scanner"))
+        )
+
+        # fixup type annotations (for 'from __future__ import annotations')
+        fixup_wrapper_annotations(factory_wrapper, factory_fn, Scanner[T])
+
+        scanner_factory_wrapper = cast(ScannerFactory[P, T], factory_wrapper)
+        registry_add(
+            scanner_factory_wrapper,
+            RegistryInfo(
+                type="scanner",
+                name=scanner_name,
+                metadata={SCANNER_METRICS: metrics, SCANNER_VERSION: version},
+            ),
+        )
+        return scanner_factory_wrapper
+
+    return decorate
+
+
+def scanner_version(scanner: Scanner[Any]) -> int:
+    return int(registry_info(scanner).metadata.get(SCANNER_VERSION, 0))
+
+
+def config_for_scanner(scanner: Scanner[Any]) -> ScannerConfig:
+    return cast(ScannerConfig, registry_info(scanner).metadata[SCANNER_CONFIG])
+
+
+def _validate_streaming_declaration(scanner_fn: Callable[..., Any]) -> None:
+    """`supports_streaming=True` requires a scan function that can accept a handle.
+
+    A `Transcript`-only scan function handed a handle fails silently in the
+    worst case (`transcript.messages` is a bound method there, always truthy),
+    so the declared first-parameter annotation is verified when the factory
+    runs, and the declaration is refused whenever that annotation cannot be
+    trusted -- it does not resolve, or `functools.wraps` copied it from some
+    other function.
+    """
+    if getattr(scanner_fn, "__wrapped__", None) is not None:
+        raise TypeError(
+            f"@scanner(supports_streaming=True): {scanner_fn.__qualname__} carries "
+            "__wrapped__ (functools.wraps copies the wrapped function's "
+            "annotations), so its declaration cannot be verified; drop @wraps and "
+            "annotate the wrapper's transcript parameter yourself."
+        )
+    params = list(inspect.signature(scanner_fn).parameters)
+    try:
+        hints = get_type_hints(scanner_fn)
+    except Exception as ex:
+        raise TypeError(
+            f"@scanner(supports_streaming=True): could not resolve "
+            f"{scanner_fn.__qualname__}'s type hints: {ex}"
+        ) from ex
+    annotation = hints.get(params[0]) if params else None
+    if annotation is None or not (
+        is_transcript_handle_type(annotation)
+        or _matches_transcript_or_handle(annotation)
+    ):
+        description = (
+            "has no type annotation"
+            if annotation is None
+            else f"is annotated {annotation!r}"
+        )
+        raise TypeError(
+            f"@scanner(supports_streaming=True): {scanner_fn.__qualname__}'s first "
+            f"parameter {description}; a streaming scanner must accept "
+            "`Transcript | TranscriptHandle`."
+        )
+
+
+def scanner_supports_streaming(scanner: Scanner[Any]) -> bool:
+    """Whether a scanner can operate on a streaming `TranscriptHandle`.
+
+    Prefers the registered `ScannerConfig`, falling back to the vouch registry
+    for direct-call cases with no registered config.
+    """
+    try:
+        return config_for_scanner(scanner).supports_streaming
+    except (ValueError, KeyError):
+        return streaming_support_of(scanner) or False
+
+
+def scanners_from_file(file: str, scanner_args: dict[str, Any]) -> list[Scanner[Any]]:
+    file, job = split_spec(file)
+
+    # compute path
+    scanner_path = Path(file).resolve()
+
+    # check for existence
+    if not scanner_path.exists():
+        raise PrerequisiteError(f"The file '{pretty_path(file)}' does not exist.")
+
+    # add file directory to sys.path for imports
+    scanner_dir = scanner_path.parent.as_posix()
+
+    with add_to_syspath(scanner_dir):
+        # create scanners
+        load_module(scanner_path)
+        scanners: list[Scanner[Any]] = []
+        for decorator, _ in parse_decorators(scanner_path, "scanner"):
+            # filter by job
+            if job is not None and decorator != job:
+                continue
+
+            scanner_fn = registry_lookup("scanner", decorator)
+            if scanner_fn is None:
+                raise PrerequisiteError(f"{scanner_fn} was not found in the registry")
+            assert callable(scanner_fn)
+            scanner_param_names = list(inspect.signature(scanner_fn).parameters.keys())
+            scanner_params = {
+                k: v for k, v in scanner_args.items() if k in scanner_param_names
+            }
+            scanner = scanner_create(decorator, scanner_params)
+            scanners.append(scanner)
+
+        if scanners:
+            register_plugin_directory(scanner_dir)
+        return scanners
+
+
+def scanner_create(name: str, params: dict[str, Any]) -> Scanner[Any]:
+    obj = registry_lookup("scanner", name)
+    if not callable(obj):
+        raise ValueError(
+            f"Scanner '{name}' not found. Ensure the scanner module is imported or registered as an entry point."
+        )
+    kwargs = registry_kwargs(**params)
+    return cast(Scanner[Any], obj(**kwargs))

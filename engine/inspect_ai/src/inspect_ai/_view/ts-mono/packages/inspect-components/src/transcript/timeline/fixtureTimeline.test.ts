@@ -1,0 +1,711 @@
+/**
+ * Fixture-driven tests for buildTimeline().
+ *
+ * Uses the same JSON fixtures as the Python tests to ensure cross-language
+ * consistency between the Python and TypeScript timeline implementations.
+ * Fixtures live in the embedding parent repo: inspect_scout keeps them in
+ * tests/transcript/nodes/fixtures/events/, inspect_ai in
+ * tests/timeline/fixtures/events/.
+ *
+ * These tests only run when ts-mono is embedded inside a parent repo that
+ * provides fixtures; when used standalone the suite is skipped. A parent repo
+ * that owns a corpus sets TSMONO_REQUIRE_FIXTURES=1 in the job that runs this
+ * suite, which turns "found nothing" from a skip into a failure.
+ */
+
+/// <reference types="node" />
+
+import { existsSync, readdirSync, readFileSync } from "fs";
+import { join } from "path";
+
+import { describe, expect, it } from "vitest";
+
+import {
+  testAssistantMessage,
+  testBranchEvent,
+  testChatCompletionChoice,
+  testCompactionEvent,
+  testInfoEvent,
+  testModelEvent,
+  testModelOutput,
+  testModelUsage,
+  testSpanBeginEvent,
+  testSpanEndEvent,
+  testToolCall,
+  testToolEvent,
+} from "@tsmono/inspect-common/testing";
+import type {
+  ChatCompletionChoice,
+  ChatMessage,
+  CompactionEvent,
+  Event,
+  GenerateConfig,
+  ToolCall,
+} from "@tsmono/inspect-common/types";
+
+import {
+  asTimelineEvent,
+  asTimelineSpan,
+  buildTimeline,
+  TimelineEvent,
+  TimelineSpan,
+  type Timeline,
+} from "./core";
+
+// =============================================================================
+// Fixture Types
+// =============================================================================
+
+interface JsonEvent {
+  event: string;
+  uuid?: string;
+  id?: string;
+  name?: string;
+  type?: string;
+  parent_id?: string | null;
+  span_id?: string | null;
+  timestamp?: string;
+  completed?: string;
+  model?: string;
+  origin?: string | null;
+  function?: string;
+  agent?: string;
+  agent_span_id?: string;
+  result?: string;
+  source?: string;
+  message_id?: string;
+  from_anchor?: string;
+  input?: ChatMessage[];
+  output?: {
+    usage?: {
+      input_tokens?: number;
+      output_tokens?: number;
+    };
+    choices?: Array<{
+      message: {
+        content: string;
+        tool_calls?: Pick<ToolCall, "id" | "function" | "arguments">[];
+      };
+      stop_reason?: ChatCompletionChoice["stop_reason"];
+    }>;
+  };
+  events?: JsonEvent[];
+  config?: GenerateConfig;
+}
+
+interface ExpectedAgentSource {
+  source: "span" | "tool";
+  span_id?: string;
+}
+
+interface ExpectedBranch {
+  branched_from: string;
+  event_uuids?: string[];
+  branches?: ExpectedBranch[];
+  children?: ExpectedAgent[];
+}
+
+interface ExpectedAgent {
+  id: string;
+  name: string;
+  source?: ExpectedAgentSource;
+  event_uuids?: string[];
+  nested_uuids?: string[];
+  branches?: ExpectedBranch[];
+  children?: ExpectedAgent[];
+  content_structure?: Array<{
+    type: "event" | "agent";
+    uuid?: string;
+    id?: string;
+    name?: string;
+    source?: ExpectedAgentSource;
+    nested_uuids?: string[];
+    total_tokens?: number;
+  }>;
+  total_tokens?: number;
+  utility?: boolean;
+  agent_result?: string;
+}
+
+interface ExpectedSection {
+  section: "init" | "scoring";
+  event_uuids: string[];
+  total_tokens?: number;
+}
+
+interface ExpectedNodes {
+  init: ExpectedSection | null;
+  agent: ExpectedAgent | null;
+  scoring: ExpectedSection | null;
+}
+
+interface FixtureData {
+  description: string;
+  events: JsonEvent[];
+  expected: ExpectedNodes;
+}
+
+// =============================================================================
+// Fixture Loading
+// =============================================================================
+
+// Candidate fixture locations in the embedding parent repo (relative to
+// this file, nine levels up to the parent repo root): inspect_scout keeps
+// fixtures in tests/transcript/nodes/, inspect_ai in tests/timeline/.
+const PARENT_REPO_ROOT = join(__dirname, "../../../../../../../../..");
+const FIXTURE_DIR_CANDIDATES = [
+  join(PARENT_REPO_ROOT, "tests/transcript/nodes/fixtures/events"),
+  join(PARENT_REPO_ROOT, "tests/timeline/fixtures/events"),
+];
+
+const FIXTURE_DIRS = FIXTURE_DIR_CANDIDATES.filter((dir) => existsSync(dir));
+
+const kCompactionTypes: readonly CompactionEvent["type"][] = [
+  "summary",
+  "edit",
+  "trim",
+];
+
+const compactionType = (value: unknown): CompactionEvent["type"] =>
+  kCompactionTypes.find((type) => type === value) ?? "summary";
+
+function loadFixture(name: string): FixtureData {
+  for (const dir of FIXTURE_DIRS) {
+    const filePath = join(dir, `${name}.json`);
+    if (existsSync(filePath)) {
+      const content = readFileSync(filePath, "utf-8");
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- the fixture files on disk are the contract this suite is written against
+      return JSON.parse(content) as FixtureData;
+    }
+  }
+  throw new Error(`Fixture not found: ${name}`);
+}
+
+// Names are deduped across candidate dirs; loadFixture resolves a name from
+// the first dir that has it. Gate on names (not dir existence) so an
+// existing-but-empty fixtures dir skips the suite instead of failing it.
+const FIXTURE_NAMES = [
+  ...new Set(
+    FIXTURE_DIRS.flatMap((dir) =>
+      readdirSync(dir)
+        .filter((f) => f.endsWith(".json"))
+        .map((f) => f.replace(".json", ""))
+    )
+  ),
+];
+const FIXTURES_AVAILABLE = FIXTURE_NAMES.length > 0;
+
+// Skipping is right for a bare clone and wrong for a parent repo that has a
+// corpus: on its own this file cannot tell the two apart, so a broken path
+// climb or a moved fixtures directory would report green over zero tests. The
+// parent's job supplies the missing half by setting TSMONO_REQUIRE_FIXTURES=1.
+if (!FIXTURES_AVAILABLE && process.env.TSMONO_REQUIRE_FIXTURES === "1") {
+  throw new Error(
+    "TSMONO_REQUIRE_FIXTURES is set but no fixtures were found. Looked in:\n" +
+      FIXTURE_DIR_CANDIDATES.map((dir) => `  ${dir}`).join("\n")
+  );
+}
+
+// =============================================================================
+// Event Deserialization
+// =============================================================================
+
+function createEvent(data: JsonEvent): Event | null {
+  const baseFields = {
+    uuid: data.uuid ?? null,
+    timestamp: data.timestamp ?? "",
+    working_start: 0,
+    pending: false,
+    metadata: null,
+  };
+
+  switch (data.event) {
+    case "model": {
+      const model = data.model ?? "unknown";
+      const usage = data.output?.usage;
+      const inputTokens = usage?.input_tokens ?? 0;
+      const outputTokens = usage?.output_tokens ?? 0;
+      return testModelEvent({
+        ...baseFields,
+        model,
+        origin: data.origin ?? null,
+        completed: data.completed ?? null,
+        span_id: data.span_id ?? null,
+        config: data.config ?? {},
+        input: data.input ?? [],
+        output: testModelOutput({
+          model,
+          choices: (data.output?.choices ?? []).map((c) =>
+            testChatCompletionChoice({
+              message: testAssistantMessage({
+                content: c.message.content,
+                tool_calls:
+                  c.message.tool_calls?.map((tc) => testToolCall(tc)) ?? null,
+              }),
+              ...(c.stop_reason !== undefined
+                ? { stop_reason: c.stop_reason }
+                : {}),
+            })
+          ),
+          usage: usage
+            ? testModelUsage({
+                input_tokens: inputTokens,
+                output_tokens: outputTokens,
+                total_tokens: inputTokens + outputTokens,
+              })
+            : null,
+        }),
+      });
+    }
+
+    case "tool": {
+      const nestedEvents = data.events
+        ?.map((e) => createEvent(e))
+        .filter((e): e is Event => e !== null);
+      return testToolEvent({
+        ...baseFields,
+        id: data.id ?? "",
+        function: data.function ?? "",
+        arguments: {},
+        completed: data.completed ?? null,
+        span_id: data.span_id ?? null,
+        agent: data.agent ?? null,
+        events: nestedEvents ?? [],
+        result: data.result ?? "",
+        agent_span_id: data.agent_span_id ?? null,
+        message_id: data.message_id ?? null,
+      });
+    }
+
+    case "info": {
+      return testInfoEvent({
+        ...baseFields,
+        source: data.source ?? "unknown",
+        data: {},
+        span_id: data.span_id ?? null,
+      });
+    }
+
+    case "span_begin": {
+      return testSpanBeginEvent({
+        ...baseFields,
+        id: data.id ?? "",
+        name: data.name ?? "",
+        type: data.type ?? null,
+        parent_id: data.parent_id ?? null,
+        span_id: data.span_id ?? null,
+      });
+    }
+
+    case "span_end": {
+      return testSpanEndEvent({
+        ...baseFields,
+        id: data.id ?? "",
+        span_id: data.span_id ?? null,
+      });
+    }
+
+    case "compaction": {
+      return testCompactionEvent({
+        ...baseFields,
+        type: compactionType(data.type),
+        span_id: data.span_id ?? null,
+        source: null,
+        tokens_before: null,
+        tokens_after: null,
+      });
+    }
+
+    case "branch": {
+      return testBranchEvent({
+        ...baseFields,
+        span_id: data.span_id ?? null,
+        from_anchor: data.from_anchor ?? "",
+      });
+    }
+
+    default:
+      return null;
+  }
+}
+
+function withoutOrigin(events: JsonEvent[]): boolean {
+  return events.every(
+    (event) => event.origin === undefined && withoutOrigin(event.events ?? [])
+  );
+}
+
+function recordedAsAgent(events: JsonEvent[]): JsonEvent[] {
+  return events.map((event) => ({
+    ...event,
+    ...(event.event === "model" ? { origin: "agent" } : {}),
+    ...(event.events ? { events: recordedAsAgent(event.events) } : {}),
+  }));
+}
+
+function eventsFromJson(data: FixtureData): Event[] {
+  return data.events
+    .map((e) => createEvent(e))
+    .filter((e): e is Event => e !== null);
+}
+
+// =============================================================================
+// Assertion Helpers
+// =============================================================================
+
+function getDirectEventUuids(node: TimelineSpan): string[] {
+  return node.content
+    .filter((c): c is TimelineEvent => c.type === "event")
+    .map((c) => c.event.uuid)
+    .filter((uuid): uuid is string => uuid !== null && uuid !== undefined);
+}
+
+function getChildSpans(node: TimelineSpan): TimelineSpan[] {
+  return node.content.filter((c): c is TimelineSpan => c.type === "span");
+}
+
+function getAllEventUuids(node: TimelineSpan): string[] {
+  const uuids: string[] = [];
+  for (const item of node.content) {
+    if (item.type === "event") {
+      if (item.event.uuid) {
+        uuids.push(item.event.uuid);
+      }
+    } else {
+      uuids.push(...getAllEventUuids(item));
+    }
+  }
+  return uuids;
+}
+
+function assertBranchMatches(
+  actual: TimelineSpan,
+  expected: ExpectedBranch
+): void {
+  expect(actual.branchedFrom).toBe(expected.branched_from);
+  if (expected.event_uuids !== undefined) {
+    const uuids = actual.content
+      .filter((c): c is TimelineEvent => c.type === "event")
+      .map((c) => c.event.uuid)
+      .filter((uuid): uuid is string => uuid !== null && uuid !== undefined);
+    expect(uuids).toEqual(expected.event_uuids);
+  }
+  if (expected.children !== undefined) {
+    const childSpans = getChildSpans(actual);
+    expect(childSpans.length).toBe(expected.children.length);
+    for (let i = 0; i < expected.children.length; i++) {
+      assertSpanMatches(childSpans[i] ?? null, expected.children[i] ?? null);
+    }
+  }
+
+  if (expected.branches !== undefined) {
+    expect(actual.branches.length).toBe(expected.branches.length);
+    for (let i = 0; i < expected.branches.length; i++) {
+      const actualBranch = actual.branches[i];
+      const expectedBranch = expected.branches[i];
+      if (actualBranch && expectedBranch) {
+        assertBranchMatches(actualBranch, expectedBranch);
+      }
+    }
+  }
+}
+
+function assertScoringSpanMatches(
+  root: TimelineSpan,
+  expected: ExpectedSection | null
+): void {
+  const scorerSpans = root.content.filter(
+    (c): c is TimelineSpan => c.type === "span" && c.spanType === "scorers"
+  );
+
+  if (expected === null) {
+    expect(scorerSpans.length).toBe(0);
+    return;
+  }
+
+  expect(scorerSpans.length).toBe(1);
+  const scoring = scorerSpans[0]!;
+
+  const actualUuids = getDirectEventUuids(scoring);
+  expect(actualUuids).toEqual(expected.event_uuids);
+}
+
+function assertSpanMatches(
+  actual: TimelineSpan | null,
+  expected: ExpectedAgent | null
+): void {
+  if (expected === null) {
+    expect(actual).toBeNull();
+    return;
+  }
+  expect(actual).not.toBeNull();
+  expect(actual!.id).toBe(expected.id);
+  expect(actual!.name).toBe(expected.name);
+
+  if (expected.source) {
+    expect(actual!.spanType).toBe("agent");
+  }
+
+  if (expected.event_uuids !== undefined) {
+    const directUuids = getDirectEventUuids(actual!);
+    expect(directUuids).toEqual(expected.event_uuids);
+  }
+
+  if (expected.total_tokens !== undefined) {
+    expect(actual!.totalTokens()).toBe(expected.total_tokens);
+  }
+
+  if (expected.utility !== undefined) {
+    expect(actual!.utility).toBe(expected.utility);
+  }
+
+  if (expected.agent_result !== undefined) {
+    expect(actual!.agentResult).toBe(expected.agent_result);
+  }
+
+  if (expected.branches !== undefined) {
+    expect(actual!.branches.length).toBe(expected.branches.length);
+    for (let i = 0; i < expected.branches.length; i++) {
+      const actualBranch = actual!.branches[i];
+      const expectedBranch = expected.branches[i];
+      if (actualBranch && expectedBranch) {
+        assertBranchMatches(actualBranch, expectedBranch);
+      }
+    }
+  }
+
+  if (expected.children !== undefined) {
+    const childSpans = getChildSpans(actual!);
+    expect(childSpans.length).toBe(expected.children.length);
+    for (let i = 0; i < expected.children.length; i++) {
+      const childSpan = childSpans[i];
+      const expectedChild = expected.children[i];
+      assertSpanMatches(childSpan ?? null, expectedChild ?? null);
+    }
+  }
+
+  if (expected.content_structure !== undefined) {
+    const contentToCheck = actual!.content.filter(
+      (item) =>
+        !(
+          item.type === "span" &&
+          (item.spanType === "scorers" || item.spanType === "init")
+        )
+    );
+
+    expect(contentToCheck.length).toBe(expected.content_structure.length);
+    for (let i = 0; i < expected.content_structure.length; i++) {
+      const actualItem = contentToCheck[i];
+      const expectedItem = expected.content_structure[i];
+
+      if (!actualItem || !expectedItem) {
+        continue;
+      }
+
+      const expectedType =
+        expectedItem.type === "agent" ? "span" : expectedItem.type;
+      expect(actualItem.type).toBe(expectedType);
+
+      if (expectedItem.type === "event" && expectedItem.uuid) {
+        expect(asTimelineEvent(actualItem).event.uuid).toBe(expectedItem.uuid);
+      }
+
+      if (expectedItem.type === "agent") {
+        const spanItem = asTimelineSpan(actualItem);
+        if (expectedItem.id) {
+          expect(spanItem.id).toBe(expectedItem.id);
+        }
+        if (expectedItem.name) {
+          expect(spanItem.name).toBe(expectedItem.name);
+        }
+        if (expectedItem.source) {
+          expect(spanItem.spanType).toBe("agent");
+        }
+        if (expectedItem.nested_uuids) {
+          const allUuids = getAllEventUuids(spanItem);
+          expect(allUuids).toEqual(expectedItem.nested_uuids);
+        }
+        if (expectedItem.total_tokens !== undefined) {
+          expect(spanItem.totalTokens()).toBe(expectedItem.total_tokens);
+        }
+      }
+    }
+  }
+}
+
+function assertTimelineMatches(
+  actual: Timeline,
+  expected: ExpectedNodes
+): void {
+  const root = actual.root;
+
+  // Check init: init events are in a TimelineSpan with spanType="init"
+  if (expected.init !== null) {
+    const expectedUuids = expected.init.event_uuids;
+    if (expectedUuids.length > 0) {
+      const firstItem = root.content[0];
+      if (firstItem?.type !== "span") {
+        throw new Error("Expected first item to be a span");
+      }
+      expect(firstItem.spanType).toBe("init");
+      expect(firstItem.name).toBe("init");
+      const actualUuids = getDirectEventUuids(firstItem);
+      expect(actualUuids).toEqual(expectedUuids);
+    }
+  }
+
+  // Check agent (now root)
+  if (expected.agent !== null) {
+    expect(root.id).toBe(expected.agent.id);
+    expect(root.name).toBe("main");
+
+    if (expected.agent.event_uuids !== undefined) {
+      const actualUuids = getDirectEventUuids(root);
+      expect(actualUuids).toEqual(expected.agent.event_uuids);
+    }
+
+    if (expected.agent.total_tokens !== undefined) {
+      let expectedTokens = expected.agent.total_tokens;
+      if (expected.init?.total_tokens) {
+        expectedTokens += expected.init.total_tokens;
+      }
+      if (expected.scoring?.total_tokens) {
+        expectedTokens += expected.scoring.total_tokens;
+      }
+      expect(root.totalTokens()).toBe(expectedTokens);
+    }
+
+    if (expected.agent.utility !== undefined) {
+      expect(root.utility).toBe(expected.agent.utility);
+    }
+
+    if (expected.agent.branches !== undefined) {
+      expect(root.branches.length).toBe(expected.agent.branches.length);
+      for (let i = 0; i < expected.agent.branches.length; i++) {
+        const actualBranch = root.branches[i];
+        const expectedBranch = expected.agent.branches[i];
+        if (actualBranch && expectedBranch) {
+          assertBranchMatches(actualBranch, expectedBranch);
+        }
+      }
+    }
+
+    if (expected.agent.children !== undefined) {
+      const childSpans = root.content.filter(
+        (c): c is TimelineSpan =>
+          c.type === "span" && c.spanType !== "scorers" && c.spanType !== "init"
+      );
+      expect(childSpans.length).toBe(expected.agent.children.length);
+      for (let i = 0; i < expected.agent.children.length; i++) {
+        const childSpan = childSpans[i];
+        const expectedChild = expected.agent.children[i];
+        assertSpanMatches(childSpan ?? null, expectedChild ?? null);
+      }
+    }
+
+    if (expected.agent.content_structure !== undefined) {
+      const contentToCheck = root.content.filter(
+        (item) =>
+          !(
+            item.type === "span" &&
+            (item.spanType === "scorers" || item.spanType === "init")
+          )
+      );
+
+      expect(contentToCheck.length).toBe(
+        expected.agent.content_structure.length
+      );
+      for (let i = 0; i < expected.agent.content_structure.length; i++) {
+        const actualItem = contentToCheck[i];
+        const expectedItem = expected.agent.content_structure[i];
+
+        if (!actualItem || !expectedItem) {
+          continue;
+        }
+
+        const expectedType =
+          expectedItem.type === "agent" ? "span" : expectedItem.type;
+        expect(actualItem.type).toBe(expectedType);
+
+        if (expectedItem.type === "event" && expectedItem.uuid) {
+          expect(asTimelineEvent(actualItem).event.uuid).toBe(
+            expectedItem.uuid
+          );
+        }
+
+        if (expectedItem.type === "agent") {
+          const spanItem = asTimelineSpan(actualItem);
+          if (expectedItem.id) {
+            expect(spanItem.id).toBe(expectedItem.id);
+          }
+          if (expectedItem.name) {
+            expect(spanItem.name).toBe(expectedItem.name);
+          }
+          if (expectedItem.source) {
+            expect(spanItem.spanType).toBe("agent");
+          }
+          if (expectedItem.nested_uuids) {
+            const allUuids = getAllEventUuids(spanItem);
+            expect(allUuids).toEqual(expectedItem.nested_uuids);
+          }
+          if (expectedItem.total_tokens !== undefined) {
+            expect(spanItem.totalTokens()).toBe(expectedItem.total_tokens);
+          }
+        }
+      }
+    }
+  }
+
+  // Check scoring
+  assertScoringSpanMatches(root, expected.scoring);
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+describe.runIf(FIXTURES_AVAILABLE)("buildTimeline (JSON fixtures)", () => {
+  const fixtures = FIXTURE_NAMES;
+
+  it.each(fixtures)("fixture: %s", (fixtureName) => {
+    const fixture = loadFixture(fixtureName);
+    const events = eventsFromJson(fixture);
+    const result = buildTimeline(events);
+    assertTimelineMatches(result, fixture.expected);
+  });
+
+  // a call recorded as "agent" goes through the same rules as one with no
+  // origin, so a log written with origins keeps its tree
+  it.each(fixtures.filter((name) => withoutOrigin(loadFixture(name).events)))(
+    "fixture with every call recorded as agent: %s",
+    (fixtureName) => {
+      const fixture = loadFixture(fixtureName);
+      const events = eventsFromJson({
+        ...fixture,
+        events: recordedAsAgent(fixture.events),
+      });
+      const result = buildTimeline(events);
+      assertTimelineMatches(result, fixture.expected);
+    }
+  );
+
+  it("returns empty structure for empty events array", () => {
+    const result = buildTimeline([]);
+    expect(result.root).not.toBeNull();
+    expect(result.root.content.length).toBe(0);
+    expect(result.root.totalTokens()).toBe(0);
+  });
+
+  it("computes startTime and endTime correctly", () => {
+    // Any fixture works here — which ones exist depends on the parent repo.
+    const fixture = loadFixture(fixtures[0]!);
+    const events = eventsFromJson(fixture);
+    const result = buildTimeline(events);
+
+    expect(result.root.startTime()).toBeDefined();
+    expect(result.root.endTime()).toBeDefined();
+    expect(result.root.startTime().getTime()).toBeLessThanOrEqual(
+      result.root.endTime().getTime()
+    );
+  });
+});

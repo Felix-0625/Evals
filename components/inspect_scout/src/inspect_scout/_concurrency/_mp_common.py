@@ -1,0 +1,397 @@
+"""Shared context for multiprocessing communication.
+
+This module contains types and globals shared between the main process and worker
+subprocesses. State is serialized and passed to spawned workers via IPCContext.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from logging import LogRecord, getLogger
+from multiprocessing.managers import DictProxy
+from multiprocessing.queues import Queue
+from threading import Condition, Event
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    TypeAlias,
+    TypeVar,
+)
+
+import anyio
+import cloudpickle  # type:ignore
+from inspect_ai._util.logger import warn_once
+from inspect_ai.model import GenerateConfig, ModelConfig
+from typing_extensions import TypeVarTuple, Unpack
+
+if TYPE_CHECKING:
+    from .._scanner.result import ResultReport
+    from .._transcript.transcripts import TranscriptsReader
+    from .._transcript.types import TranscriptInfo
+    from ._mp_semaphore import PicklableMPSemaphore
+
+    # TODO: This import from .common needs to be within a TYPE_CHECKING check since
+    # it creates a circular dependency. We should fix this.
+    from .common import (
+        ParseFunctionResult,
+        ParseJob,
+        ReaderCMFactory,
+        ScanMetrics,
+        ScannerJob,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pickler-scoped reducer: make inspect_ai Model picklable via cloudpickle
+# ---------------------------------------------------------------------------
+# ModelAPI subclasses contain unpicklable state (anyio.Lock, httpx.AsyncClient,
+# SDK async clients).  When a scanner closure captures a Model instance,
+# cloudpickle fails with "cannot pickle '_thread.RLock' object".
+#
+# We reduce Model → ModelConfig for serialization, then reconstruct via
+# get_model() on unpickle.  get_model() uses memoize=True by default, so
+# repeated unpickles in the same worker reuse the cached instance rather than
+# creating duplicate HTTP clients.
+#
+# The reducer is scoped to a dedicated `ScoutPickler` (via reducer_override)
+# rather than registered globally with `copyreg.pickle(Model, ...)`.  A global
+# registration pollutes `copyreg.dispatch_table`, which `copy.copy()` and
+# `copy.deepcopy()` also consult — so merely importing scout would change what
+# `copy(model)` means process-wide, aliasing the memoized instance instead of
+# producing a distinct copy (see issue #537).  reducer_override is consulted
+# only by our pickler and is invisible to the copy module.  The unpickle side
+# needs no registration: the pickled data embeds `_reconstruct_model` directly.
+# ---------------------------------------------------------------------------
+
+import io
+
+from inspect_ai.model import get_model
+from inspect_ai.model._model import Model
+from inspect_ai.model._model_config import model_to_model_config
+
+
+def _reconstruct_model(config: ModelConfig) -> Model:
+    """Reconstruct a Model from its picklable ModelConfig."""
+    return get_model(
+        model=config.model,
+        config=config.config,
+        base_url=config.base_url,
+        **config.args,
+    )
+
+
+def _reduce_model(model: Model) -> tuple[Callable[..., Any], tuple[ModelConfig]]:
+    """Reduce a Model to picklable ModelConfig for cloudpickle serialization."""
+    return (_reconstruct_model, (model_to_model_config(model),))
+
+
+class ScoutPickler(cloudpickle.Pickler):  # type: ignore[misc]
+    """cloudpickle Pickler that can serialize inspect_ai Model instances.
+
+    The Model reducer is applied via `reducer_override` (consulted per-pickler,
+    before any dispatch table) so it stays scoped to serialization and never
+    leaks into `copy.copy()` / `copy.deepcopy()` semantics (issue #537).
+    """
+
+    def reducer_override(self, obj: Any) -> Any:
+        if isinstance(obj, Model):
+            return _reduce_model(obj)
+        return super().reducer_override(obj)
+
+
+def scout_dumps(obj: Any) -> bytes:
+    """Serialize an object with cloudpickle, adding Model support.
+
+    Mirrors `cloudpickle.dumps` but uses `ScoutPickler`, so scanner closures
+    that capture inspect_ai `Model` instances survive the roundtrip without
+    globally overriding pickle/copy behavior for `Model`.
+    """
+    with io.BytesIO() as file:
+        ScoutPickler(file).dump(obj)
+        return file.getvalue()
+
+
+class DillCallable:
+    """Wrapper for callables that uses cloudpickle for pickling.
+
+    This allows closures and other complex callables to be serialized
+    for use with spawn multiprocessing context.
+    """
+
+    def __init__(self, func: Callable[..., Any]) -> None:
+        """Initialize with a callable.
+
+        Args:
+            func: The callable to wrap (can be closure, lambda, etc)
+        """
+        self._pickled_func: bytes = scout_dumps(func)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Call the wrapped function.
+
+        Args:
+            *args: Positional arguments
+            **kwargs: Keyword arguments
+
+        Returns:
+            Result from calling the wrapped function
+        """
+        func = cloudpickle.loads(self._pickled_func)
+        return func(*args, **kwargs)
+
+    def __getstate__(self) -> bytes:
+        """Get state for pickling.
+
+        Returns:
+            Pickled function bytes
+        """
+        return self._pickled_func
+
+    def __setstate__(self, state: bytes) -> None:
+        """Set state from unpickling.
+
+        Args:
+            state: Pickled function bytes
+        """
+        self._pickled_func = state
+
+
+@dataclass(frozen=True)
+class ResultItem:
+    """Scan results from a worker process."""
+
+    transcript_info: TranscriptInfo
+    scanner_name: str
+    results: list[ResultReport]
+
+
+@dataclass(frozen=True)
+class MetricsItem:
+    """Metrics update from a worker process."""
+
+    worker_id: int
+    metrics: ScanMetrics
+
+
+@dataclass(frozen=True)
+class LoggingItem:
+    """Logging call from a worker process."""
+
+    record: LogRecord
+
+
+@dataclass(frozen=True)
+class SemaphoreRequest:
+    """Request to create a cross-process semaphore."""
+
+    name: str
+    concurrency: int
+    visible: bool
+
+
+@dataclass(frozen=True)
+class WorkerReady:
+    """Signal from worker that it's initialized and ready to consume parse jobs."""
+
+    worker_id: int
+
+
+@dataclass(frozen=True)
+class WorkerComplete:
+    """Sentinel indicating a worker has finished all work."""
+
+    pass
+
+
+@dataclass(frozen=True)
+class WorkerError:
+    """Detached diagnostics for a fatal worker exception."""
+
+    worker_id: int
+    type_name: str
+    message: str
+    traceback: str
+    status_code: int | None = None
+    request_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ShutdownSentinel:
+    """Emergency shutdown signal injected by parent during forced termination."""
+
+    pass
+
+
+UpstreamQueueItem: TypeAlias = (
+    ResultItem
+    | MetricsItem
+    | LoggingItem
+    | SemaphoreRequest
+    | WorkerReady
+    | WorkerComplete
+    | ShutdownSentinel
+    | WorkerError
+)
+
+
+@dataclass
+class IPCContext:
+    """
+    Shared state for IPC between main process and spawned workers.
+
+    For consistency, it should contain ALL data used by subprocesses that is invariant
+    across subprocesses. The `executor.submit` should only pass subprocess specific
+    arguments.
+
+    The upstream_queue is a multiplexed channel carrying both results and metrics
+    from workers to the main process.
+    """
+
+    parse_function: Callable[
+        [ParseJob, TranscriptsReader], Awaitable[ParseFunctionResult]
+    ]
+    """Function that executes a parse job yielding scanner jobs."""
+
+    scan_function: Callable[[ScannerJob], Awaitable[list[ResultReport]]]
+    """Function that executes a scanner job and returns results."""
+
+    reader_cm_factory: ReaderCMFactory
+    """Factory that yields a context-managed `TranscriptsReader` for this worker."""
+
+    prefetch_multiple: float | None
+    """Multiplier for scanner job queue size (base=task_count)."""
+
+    diagnostics: bool
+    """Whether to enable diagnostic output during execution."""
+
+    overall_start_time: float
+    """Timestamp when the overall scan started, for timing metrics."""
+
+    parse_job_queue: Queue[ParseJob | None]
+    """Queue of parse jobs sent from main process to workers; None signals completion."""
+
+    upstream_queue: Queue[UpstreamQueueItem]
+    """Multiplexed queue carrying results, metrics, and control messages from workers to main."""
+
+    shutdown_condition: Condition
+    """
+    Cross-process condition variable for coordinating shutdown.
+
+    Despite the threading.Condition type, this is actually a proxy object created
+    via SyncManager.Condition() that enables cross-process coordination. The main
+    process notifies this condition during shutdown to wake up all worker shutdown
+    monitors, allowing them to cancel their work tasks and exit cleanly.
+
+    Note: Don't be confused by the threading.Condition type - it works across processes
+    because it's a manager proxy, not a raw threading primitive.
+    """
+
+    workers_ready_event: Event
+    """
+    Cross-process event for coordinating worker startup.
+
+    Created via SyncManager.Event(). Workers signal ready via upstream queue, then
+    block waiting on this event. Once the parent receives ready signals from all
+    workers, it sets this event, releasing all workers simultaneously to ensure
+    even distribution of parse jobs from the queue.
+    """
+
+    semaphore_registry: DictProxy[str, PicklableMPSemaphore]
+    """
+    Cross-process registry mapping semaphore names to their manager proxies.
+
+    When a worker needs a concurrency-limited semaphore, it first checks this registry.
+    If found, the worker uses it directly; if not found, the worker requests creation
+    via the upstream queue. The main process populates this registry as semaphore
+    requests arrive from workers.
+    """
+
+    semaphore_condition: Condition
+    """
+    Cross-process condition variable for synchronizing semaphore registry access.
+
+    Despite the threading.Condition type, this is actually a proxy object created
+    via SyncManager.Condition() that enables cross-process coordination. Workers
+    wait on this condition when a requested semaphore hasn't been created yet. The
+    main process notifies this condition after creating new semaphores in the registry,
+    waking up any waiting workers.
+
+    Note: Like shutdown_condition, this is created via SyncManager for consistency
+    and works across processes despite the threading.Condition type.
+    """
+
+    plugin_dir: str | None
+    """Plugin directory to add to sys.path in subprocesses."""
+
+    log_level: str | None
+    """Log level for subprocess initialization."""
+
+    model_config: ModelConfig
+    """Configuration specifying which model provider and settings to use."""
+
+    model_roles: dict[str, ModelConfig | list[ModelConfig]] | None
+    """Optional mapping of role names to serializable ModelConfig instances."""
+
+    generate_config: GenerateConfig
+    """Generation parameters (temperature, max_tokens, etc.) for model calls."""
+
+
+T_Retval = TypeVar("T_Retval")
+PosArgsT = TypeVarTuple("PosArgsT")
+
+
+async def run_sync_on_thread(
+    func: Callable[[Unpack[PosArgsT]], T_Retval],
+    *args: Unpack[PosArgsT],
+) -> T_Retval:
+    """Run a blocking callable in a thread, preserving its return type.
+
+    This is a type-safe wrapper around `anyio.to_thread.run_sync` that preserves
+    the return type of the callable, enabling proper downstream type checking.
+
+    Note: `anyio.to_thread.run_sync` is correctly annotated, but some type
+    checkers/configurations may widen its return type to ``Any``. This wrapper
+    keeps the return type precise (via the TypeVar/Unpack typing) so callers
+    and downstream type checkers retain the specific return type of ``func``.
+
+    Args:
+        func: A blocking callable
+        *args: Arguments to pass to the callable
+
+    Returns:
+        The return value of ``func``, with type information preserved for
+        static checkers.
+    """
+    return await anyio.to_thread.run_sync(func, *args, abandon_on_cancel=True)
+
+
+# Deferred config for spawn-based subprocess initialization.
+# Set early during scan setup, retrieved later if multi-process.
+_plugin_directory: str | None = None
+_log_level: str | None = None
+
+
+def register_plugin_directory(directory: str) -> None:
+    global _plugin_directory
+    if _plugin_directory is not None:
+        warn_once(
+            getLogger(__name__),
+            "WARNING: Plugin directory has already been registered",
+        )
+    else:
+        _plugin_directory = directory
+
+
+def get_plugin_directory() -> str | None:
+    return _plugin_directory
+
+
+def set_log_level(level: str | None) -> None:
+    global _log_level
+    _log_level = level
+
+
+def get_log_level() -> str | None:
+    return _log_level

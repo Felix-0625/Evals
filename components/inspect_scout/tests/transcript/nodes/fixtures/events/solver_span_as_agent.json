@@ -1,0 +1,82 @@
+{
+  "description": "A primitive solver span (type=solver wrapping no agent) unrolls into its parent solvers container rather than becoming its own agent span",
+  "events": [
+    {
+      "event": "span_begin",
+      "uuid": "sb-solvers",
+      "id": "solvers",
+      "name": "solvers",
+      "timestamp": "2024-01-01T00:00:00Z"
+    },
+    {
+      "event": "span_begin",
+      "uuid": "sb-solver-1",
+      "id": "solver-1",
+      "name": "chain_of_thought",
+      "type": "solver",
+      "parent_id": "solvers",
+      "timestamp": "2024-01-01T00:00:01Z"
+    },
+    {
+      "event": "model",
+      "uuid": "e-001",
+      "span_id": "solver-1",
+      "model": "test-model",
+      "timestamp": "2024-01-01T00:00:02Z",
+      "completed": "2024-01-01T00:00:03Z",
+      "output": {
+        "usage": { "input_tokens": 100, "output_tokens": 50 }
+      }
+    },
+    {
+      "event": "tool",
+      "uuid": "e-002",
+      "id": "tc-1",
+      "function": "think",
+      "span_id": "solver-1",
+      "timestamp": "2024-01-01T00:00:04Z",
+      "completed": "2024-01-01T00:00:05Z"
+    },
+    {
+      "event": "model",
+      "uuid": "e-003",
+      "span_id": "solver-1",
+      "model": "test-model",
+      "timestamp": "2024-01-01T00:00:06Z",
+      "completed": "2024-01-01T00:00:07Z",
+      "output": {
+        "usage": { "input_tokens": 200, "output_tokens": 100 }
+      }
+    },
+    {
+      "event": "span_end",
+      "uuid": "se-solver-1",
+      "id": "solver-1",
+      "span_id": "solver-1",
+      "timestamp": "2024-01-01T00:00:08Z"
+    },
+    {
+      "event": "span_end",
+      "uuid": "se-solvers",
+      "id": "solvers",
+      "span_id": "solvers",
+      "timestamp": "2024-01-01T00:00:09Z"
+    }
+  ],
+  "expected": {
+    "init": null,
+    "agent": {
+      "id": "solvers",
+      "name": "main",
+      "event_uuids": [
+        "sb-solver-1",
+        "e-001",
+        "e-002",
+        "e-003",
+        "se-solver-1"
+      ],
+      "total_tokens": 450
+    },
+    "scoring": null
+  }
+}

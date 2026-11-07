@@ -1,0 +1,61 @@
+:global(.nav).tabs {
+  border-bottom: solid 1px var(--bs-border-color);
+  padding-bottom: 0.25rem;
+  padding-top: 0.5rem;
+  padding-left: 0.5rem;
+  padding-right: 0.5rem;
+  position: sticky;
+  z-index: 999;
+  top: 0;
+  background-color: var(--bs-body-bg);
+}
+
+:global(.nav).tabs :global(.nav-link) {
+  padding: 0.3rem 0.5rem;
+  font-size: var(--inspect-font-size-smallest) !important;
+}
+
+.chatList {
+  flex: 1;
+  min-width: 0;
+  padding: 0.5rem;
+}
+
+.metadata {
+  padding-bottom: 50px;
+}
+
+.scrollable {
+  overflow-y: auto;
+  min-height: 0;
+  height: 100%;
+}
+
+.eventsTab {
+  display: flex;
+  /* Override TabSet's overflow-y: clip so position: sticky works for
+     turn-label headers inside the transcript virtual list. */
+  overflow-y: visible;
+}
+
+.tabTool {
+  font-size: var(--inspect-font-size-smallestest) !important;
+  padding: 0.1rem 0.4rem !important;
+}
+
+.railHost {
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  min-height: 0;
+}
+
+.railContent {
+  flex: 1;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+}

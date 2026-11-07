@@ -1,0 +1,128 @@
+import { CompressionType, setCompressionCodec } from "@uwdata/flechette";
+import type { Codec } from "@uwdata/flechette";
+import { table as arqueroTable, fromArrow } from "arquero";
+import * as lz4js from "lz4js";
+
+export const decodeArrowBase64 = (base64: string) => {
+  // Decode base64 string to Uint8Array
+  const binaryString = atob(base64);
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+
+  // Delegate to decodeArrowBytes
+  return decodeArrowBytes(bytes);
+};
+
+export const decodeArrowBytes = (bytes: ArrayBuffer | Uint8Array) => {
+  // Register LZ4 codec before first use. Arquero's `fromArrow` calls
+  // flechette's `tableFromIPC` internally, which honors this registry —
+  // so LZ4-compressed IPC bytes decode directly without a re-encode hop.
+  ensureLZ4CodecRegistered();
+
+  const input = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const table = fromArrow(input);
+
+  // Eagerly materialize the table to prevent Safari from
+  // detaching the underlying ArrayBuffer during navigation.
+  // The Arquero table holds lazy references to the Arrow buffers,
+  // and Safari's aggressive memory management can detach these buffers
+  // when navigating, causing "Bad value" errors in LZ4 decompression.
+  const columns: Record<string, unknown[]> = {};
+  const columnNames = table.columnNames();
+
+  // Convert to column-oriented format (arrays) which forces
+  // immediate materialization and doesn't hold references to Arrow buffers.
+  for (const colName of columnNames) {
+    // Get the column as an array - this forces materialization
+    // Convert TypedArray to regular array to ensure no buffer references
+    const colData = table.array(colName);
+    columns[colName] = Array.isArray(colData)
+      ? colData
+      : Array.from(colData as Iterable<unknown>);
+  }
+
+  // Mixed-type columns get converted to strings by Arrow/Pandas
+  castColumns(columns);
+
+  // Recreate the table from the materialized column arrays
+  // This ensures the table no longer has any references to detachable buffers
+  return arqueroTable(columns);
+};
+
+// Register LZ4 codec (only needs to be done once)
+let codecRegistered = false;
+function ensureLZ4CodecRegistered(): void {
+  if (!codecRegistered) {
+    const lz4Codec: Codec = {
+      encode(data: Uint8Array): Uint8Array {
+        return lz4js.compress(data);
+      },
+      decode(data: Uint8Array): Uint8Array {
+        return lz4js.decompress(data);
+      },
+    };
+    setCompressionCodec(CompressionType.LZ4_FRAME, lz4Codec);
+    codecRegistered = true;
+  }
+}
+
+/**
+ * Cast one scan `value` cell to its `value_type`. Mixed-type value columns
+ * arrive as text; boolean/number text decodes, anything it can't decode is
+ * null, and other types pass through. Also used for resultset rows, which
+ * are expanded after the table-level cast.
+ */
+export const castScanValue = (value: unknown, valueType: string): unknown => {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  if (valueType === "boolean") {
+    if (typeof value === "boolean") {
+      return value;
+    }
+    const strVal = String(value).toLowerCase();
+    if (strVal === "true") {
+      return true;
+    }
+    if (strVal === "false") {
+      return false;
+    }
+    return null;
+  } else if (valueType === "number") {
+    if (typeof value === "number") {
+      return value;
+    }
+    const strVal = String(value).trim();
+    if (strVal === "") {
+      return null;
+    }
+    const num = Number(strVal);
+    return isNaN(num) ? null : num;
+  } else {
+    return value;
+  }
+};
+
+// When Arrow/Pandas encounters mixed-type columns (e.g., numbers and nulls),
+// it converts everything to strings for safety. This function restores the
+// original types based on the value_type column (or a known type). Plain
+// loops, since arquero's derive() needs 'unsafe-eval'.
+function castColumns(columns: Record<string, unknown[]>): void {
+  const { value, value_type: valueType, scan_error_refusal } = columns;
+
+  if (value && valueType) {
+    columns.value = value.map((cell, row) => {
+      const type = valueType[row];
+      return castScanValue(cell, typeof type === "string" ? type : "");
+    });
+  }
+
+  if (scan_error_refusal) {
+    columns.scan_error_refusal = scan_error_refusal.map((cell) =>
+      typeof cell === "string" ? cell.toLowerCase() === "true" : !!cell
+    );
+  }
+}

@@ -1,0 +1,282 @@
+// @vitest-environment jsdom
+import { cleanup, render as renderUi, waitFor } from "@testing-library/react";
+import { ComponentProps } from "react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import type {
+  ContentData,
+  ContentReasoning,
+  ContentText,
+  ContentToolUse,
+} from "@tsmono/inspect-common/types";
+import { ComponentNavigationProvider } from "@tsmono/react/components";
+import { ComponentStateProvider } from "@tsmono/react/state";
+import {
+  makeStateHooks,
+  ResizeObserverStub,
+  TrustedContentWrapper,
+} from "@tsmono/react/testing";
+
+import { DisplayModeContext } from "../content/DisplayModeContext";
+
+import { MessageContent } from "./MessageContent";
+
+// These tests exercise the rich rendering path, which needs trusted content.
+const render = (ui: Parameters<typeof renderUi>[0]) =>
+  renderUi(ui, { wrapper: TrustedContentWrapper });
+
+vi.stubGlobal("ResizeObserver", ResizeObserverStub);
+
+type Contents = ComponentProps<typeof MessageContent>["contents"];
+
+const renderMessage = (
+  contents: Contents,
+  displayMode: "rendered" | "raw" = "rendered"
+) =>
+  render(
+    <ComponentStateProvider hooks={makeStateHooks()}>
+      <ComponentNavigationProvider navigation={{ navigate: () => {} }}>
+        <DisplayModeContext.Provider value={{ displayMode }}>
+          <MessageContent contents={contents} />
+        </DisplayModeContext.Provider>
+      </ComponentNavigationProvider>
+    </ComponentStateProvider>
+  );
+
+afterEach(() => {
+  cleanup();
+});
+
+describe("MessageContent evidence fidelity", () => {
+  it("renders reasoning-like tags and their contents as literal text", async () => {
+    const text =
+      'before <think signature="sig">reasoning</think> ' +
+      "<internal>legacy</internal> " +
+      "<content-internal>metadata</content-internal> after";
+    const { container } = renderMessage(text);
+
+    await waitFor(() => {
+      expect(container.textContent).toContain(text);
+    });
+    expect(container.querySelector("think")).toBeNull();
+    expect(container.querySelector("internal")).toBeNull();
+    expect(container.querySelector("content-internal")).toBeNull();
+  });
+
+  it("preserves raw JSON text, whitespace, and tag delimiters", () => {
+    const text = ' \n{"value":"<think>literal</think>"}\n ';
+    const { container } = renderMessage(text, "raw");
+
+    expect(container.querySelector("pre")?.textContent).toBe(text);
+  });
+
+  it("marks the last rendered block as last after text blocks merge", async () => {
+    // Rendered mode collapses consecutive text blocks, so "last" must be
+    // judged against the merged list, not the original contents length.
+    const text = (t: string): ContentText => ({
+      type: "text",
+      text: t,
+      citations: null,
+    });
+    const { container } = renderMessage([text("first"), text("second")]);
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("second");
+    });
+    expect(container.querySelector(".no-last-para-padding")).not.toBeNull();
+  });
+
+  it("does not inject citation markers into raw text", () => {
+    const content: ContentText = {
+      type: "text",
+      text: "cited text",
+      citations: [
+        {
+          type: "url",
+          url: "https://example.test/source",
+          title: "Source",
+          cited_text: [0, 5],
+        },
+      ],
+    };
+    const { container } = renderMessage([content], "raw");
+
+    expect(container.querySelector("pre")?.textContent).toBe(content.text);
+    expect(container.querySelector("sup")).toBeNull();
+  });
+});
+
+// Every href a log author can place in a chat message must be an absolute
+// http(s) URL; anything else renders as inert text rather than handing the
+// reviewer a link to a local file or a custom protocol handler.
+describe("MessageContent log-supplied link hrefs", () => {
+  const rejectedUrls = [
+    "javascript:alert(1)",
+    "data:text/html,<script>alert(1)</script>",
+    "file:///etc/passwd",
+    "blob:https://example.test/id",
+    "vscode://file/etc/passwd",
+    "ms-msdt:/id",
+    "custom://asset/1",
+    "/relative/path",
+    "//example.test/protocol-relative",
+  ];
+
+  const citationText = (url: string): ContentText => ({
+    type: "text",
+    text: "cited text",
+    citations: [{ type: "url", url, title: "Source" }],
+  });
+
+  const webSearchToolUse = (url: string): ContentToolUse => ({
+    type: "tool_use",
+    id: "srvtoolu_1",
+    name: "web_search",
+    tool_type: "web_search",
+    arguments: JSON.stringify({ query: "q" }),
+    result: JSON.stringify([
+      { type: "web_search_result", title: "Result", url },
+    ]),
+  });
+
+  const webSearchToolResult = (url: string): ContentData => ({
+    type: "data",
+    data: {
+      type: "web_search_tool_result",
+      content: [{ title: "Result", url, page_age: "1 day ago" }],
+    },
+  });
+
+  const sinks = [
+    ["citation", citationText, "Source"],
+    ["web_search tool result", webSearchToolUse, "Result"],
+    ["web_search_tool_result data", webSearchToolResult, "Result"],
+  ] as const;
+
+  // A rejected URL is evidence from the log; the tooltip must still show it.
+  const tooltips = (container: HTMLElement): string =>
+    Array.from(container.querySelectorAll("[title]"))
+      .map((el) => el.getAttribute("title") ?? "")
+      .join("\n");
+
+  describe.each(sinks)("%s", (_label, build, label) => {
+    it("links an absolute http(s) URL in a new tab", async () => {
+      const { container } = renderMessage([
+        build("https://example.test/source?q=1"),
+      ]);
+
+      await waitFor(() => {
+        expect(container.textContent).toContain(label);
+      });
+      const anchor = container.querySelector("a");
+      expect(anchor?.getAttribute("href")).toBe(
+        "https://example.test/source?q=1"
+      );
+      expect(anchor?.getAttribute("target")).toBe("_blank");
+      expect(anchor?.getAttribute("rel")).toBe("noopener noreferrer");
+    });
+
+    it.each(rejectedUrls)("renders %s as text, not a link", async (url) => {
+      const { container } = renderMessage([build(url)]);
+
+      await waitFor(() => {
+        expect(container.textContent).toContain(label);
+      });
+      expect(container.querySelector("a")).toBeNull();
+      expect(tooltips(container)).toContain(url);
+    });
+  });
+});
+
+describe("MessageContent server tool data", () => {
+  it("shows a web_search server_tool_use block's query", async () => {
+    const { container } = renderMessage([
+      {
+        type: "data",
+        data: {
+          type: "server_tool_use",
+          name: "web_search",
+          input: { query: "TypeScript monorepo best practices" },
+        },
+      },
+    ]);
+
+    await waitFor(() => {
+      expect(container.textContent).toContain(
+        "Web Search:TypeScript monorepo best practices"
+      );
+    });
+  });
+});
+
+// Text and reasoning blocks come from the log; a block that merely looks like
+// JSON must never throw out of render (that unmounts the whole viewer).
+describe("MessageContent JSON-looking blocks", () => {
+  const text = (t: string): ContentText => ({
+    type: "text",
+    text: t,
+    citations: null,
+  });
+
+  const reasoning = (r: string): ContentReasoning => ({
+    type: "reasoning",
+    reasoning: r,
+    redacted: false,
+  });
+
+  it("renders a JSON object text block as a record tree", async () => {
+    const { container } = renderMessage([text('{"answer": 42}')]);
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("42");
+    });
+    expect(container.querySelector(".record-tree-key")).not.toBeNull();
+  });
+
+  it.each([
+    ["NBSP", "\u00A0"],
+    ["BOM", "\uFEFF"],
+    ["LINE SEPARATOR", "\u2028"],
+  ])(
+    "renders a JSON object text block padded with %s as a record tree",
+    async (_label, pad) => {
+      const { container } = renderMessage([text(`${pad}{"answer": 42}${pad}`)]);
+
+      await waitFor(() => {
+        expect(container.textContent).toContain("42");
+      });
+      expect(container.querySelector(".record-tree-key")).not.toBeNull();
+    }
+  );
+
+  it("renders a brace-wrapped non-JSON text block as text", async () => {
+    const { container } = renderMessage([text("{not json}")]);
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("{not json}");
+    });
+    expect(container.querySelector(".record-tree-key")).toBeNull();
+  });
+
+  it("pretty-prints OpenRouter-style reasoning as JSON", async () => {
+    const { container } = renderMessage([
+      reasoning("[{'format': 'unknown', 'text': 'thinking'}]"),
+    ]);
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("thinking");
+    });
+    expect(container.querySelector("code.language-json")?.textContent).toBe(
+      JSON.stringify([{ format: "unknown", text: "thinking" }], null, 2)
+    );
+  });
+
+  it("renders reasoning with an OpenRouter prefix but invalid JSON5 as text", async () => {
+    const { container } = renderMessage([reasoning("[{'format' oops")]);
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("[{'format' oops");
+    });
+    expect(container.querySelector("code.language-json")).toBeNull();
+  });
+});

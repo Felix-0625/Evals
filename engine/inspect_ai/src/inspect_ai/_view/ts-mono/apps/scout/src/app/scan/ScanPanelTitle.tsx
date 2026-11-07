@@ -1,0 +1,112 @@
+import clsx from "clsx";
+import { FC } from "react";
+
+import { CopyButton } from "@tsmono/react/components";
+import { Icon } from "@tsmono/react/icons";
+import { formatDateTime, prettyDirUri, toRelativePath } from "@tsmono/util";
+
+import { useApi } from "../../state/store";
+import { Status } from "../../types/api-types";
+import { DownloadScanButton } from "../components/DownloadScanButton";
+
+import styles from "./ScanPanelTitle.module.css";
+
+export const ScanPanelTitle: FC<{
+  resultsDir: string | undefined;
+  selectedScan: Status;
+}> = ({ resultsDir, selectedScan }) => {
+  const api = useApi();
+
+  const scanJobName =
+    selectedScan.spec.scan_name === "job"
+      ? "scan"
+      : selectedScan.spec.scan_name;
+
+  const scannerModel = selectedScan.spec.model?.model;
+
+  // Awesome
+  const deprecatedCount = selectedScan.spec.transcripts?.count || 0;
+  const modernCorrectCount = Object.keys(
+    selectedScan.spec.transcripts?.transcript_ids || {}
+  ).length;
+  const transcriptCount = Math.max(deprecatedCount, modernCorrectCount);
+
+  return (
+    <div className={clsx(styles.scanTitleView)}>
+      <div className={clsx(styles.leftColumn)}>
+        <h1>{scanJobName}:</h1>
+        <div className={clsx(styles.secondaryRow)}>
+          <h2>
+            {toRelativePath(selectedScan.location, resultsDir)}
+            {scannerModel ? ` (${scannerModel})` : ""}
+          </h2>
+          {selectedScan.location && (
+            <>
+              <CopyButton
+                title="Copy Scan Path"
+                className={clsx("text-size-small")}
+                value={prettyDirUri(selectedScan.location)}
+              />
+              {resultsDir && api.downloadScan && (
+                <DownloadScanButton
+                  scansDir={resultsDir}
+                  scanPath={toRelativePath(selectedScan.location, resultsDir)}
+                  download={api.downloadScan}
+                  className={clsx("text-size-small")}
+                />
+              )}
+            </>
+          )}
+        </div>
+        <div></div>
+        <div className={clsx(styles.subtitle, "text-style-secondary")}>
+          <StatusDisplay status={selectedScan} />
+          <div>—</div>
+          <div>{transcriptCount} Transcripts </div>
+          <div>—</div>
+          <div>
+            {selectedScan.spec.timestamp
+              ? formatDateTime(new Date(selectedScan.spec.timestamp))
+              : ""}
+          </div>
+        </div>
+      </div>
+
+      <div className={clsx(styles.rightColumn, "text-size-smaller")}></div>
+    </div>
+  );
+};
+
+const StatusDisplay: FC<{ status?: Status }> = ({ status }) => {
+  const errorCount = status?.errors.length || 0;
+
+  if (errorCount > 0) {
+    const errorStr =
+      errorCount === 1
+        ? `${errorCount} Error`
+        : errorCount > 1
+          ? `${errorCount} Errors`
+          : "";
+
+    return (
+      <div>
+        <Icon name="error" /> {errorStr}
+      </div>
+    );
+  }
+
+  const statusStr =
+    status === undefined ? "" : status.complete ? "Complete" : "Incomplete";
+  const statusIcon =
+    status === undefined
+      ? "running"
+      : status.complete
+        ? "successSubtle"
+        : "pendingTaskSubtle";
+
+  return (
+    <div>
+      <Icon name={statusIcon} /> {statusStr}
+    </div>
+  );
+};

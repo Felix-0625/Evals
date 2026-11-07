@@ -1,0 +1,359 @@
+/**
+ * Timeline acceptance e2e tests for Inspect.
+ *
+ * These tests verify that timelines (swimlanes) render in the Inspect
+ * transcript panel when sample.timelines is populated. They are the
+ * acceptance tests for the shared TimelineTranscriptView migration.
+ *
+ * Timeline support is now wired up via TranscriptLayout.
+ */
+
+import { http, HttpResponse } from "msw";
+
+import {
+  testTimelineEvent,
+  testTimelineSpan,
+} from "@tsmono/inspect-common/testing";
+import type {
+  ChatMessage,
+  EvalSample,
+  ModelEvent,
+  ModelOutput,
+  Timeline,
+} from "@tsmono/inspect-common/types";
+
+import { expect, test } from "./fixtures/app";
+import {
+  createEvalLog,
+  createEvalSample,
+  createLogDetails,
+  createModelOutput,
+} from "./fixtures/test-data";
+
+const LOG_FILE = "test-timeline.json";
+
+type Events = EvalSample["events"];
+
+// ---------------------------------------------------------------------------
+// Event & timeline factories
+// ---------------------------------------------------------------------------
+
+function createModelEvent(overrides?: {
+  uuid?: string;
+  content?: string;
+  messageId?: string;
+  startSec?: number;
+  endSec?: number;
+  tokens?: number;
+}): ModelEvent {
+  const content = overrides?.content ?? "Model response";
+  const tokens = overrides?.tokens ?? 100;
+  const output: ModelOutput = {
+    ...createModelOutput(content),
+    usage: {
+      input_tokens: Math.floor(tokens * 0.6),
+      output_tokens: Math.floor(tokens * 0.4),
+      total_tokens: tokens,
+    },
+    time: overrides?.endSec ? overrides.endSec - (overrides.startSec ?? 0) : 3,
+  };
+  const outputMessage = output.choices[0]?.message;
+  if (outputMessage && overrides?.messageId) {
+    outputMessage.id = overrides.messageId;
+  }
+
+  return {
+    event: "model",
+    uuid: overrides?.uuid ?? "model-evt-1",
+    model: "claude-sonnet-4-5-20250929",
+    input: [],
+    output,
+    config: {},
+    tools: [],
+    tool_choice: "auto",
+    timestamp: "2025-01-15T10:00:00Z",
+    working_start: overrides?.startSec ?? 0,
+    working_time: overrides?.endSec
+      ? overrides.endSec - (overrides.startSec ?? 0)
+      : 3,
+    error: null,
+    traceback_ansi: null,
+  };
+}
+
+function createSampleTimeline(eventUuids: string[]): Timeline {
+  return {
+    name: "default",
+    description: "Agent timeline",
+    root: testTimelineSpan({
+      id: "root",
+      name: "Transcript",
+      content: [
+        testTimelineEvent({ event: eventUuids[0]! }),
+        testTimelineSpan({
+          id: "explore",
+          name: "Explore",
+          span_type: "agent",
+          content: [testTimelineEvent({ event: eventUuids[1]! })],
+        }),
+        testTimelineSpan({
+          id: "build",
+          name: "Build",
+          span_type: "agent",
+          content: [testTimelineEvent({ event: eventUuids[2]! })],
+        }),
+      ],
+    }),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+async function openTranscriptWithTimeline(
+  page: Parameters<Parameters<typeof test>[2]>[0]["page"],
+  network: Parameters<Parameters<typeof test>[2]>[0]["network"],
+  options?: {
+    messages?: ChatMessage[];
+    sampleId?: number | string;
+    events?: Events;
+    timelines?: Timeline[];
+    deepLink?: `?event=${string}` | `?message=${string}`;
+  }
+) {
+  const sampleId = options?.sampleId ?? 1;
+  const messages = options?.messages ?? [
+    { role: "user", content: "Hello", source: "input" },
+    { role: "assistant", content: "Hi there", source: "generate" },
+  ];
+
+  const events: Events = options?.events ?? [
+    createModelEvent({ uuid: "evt-root", startSec: 0, endSec: 5, tokens: 200 }),
+    createModelEvent({
+      uuid: "evt-explore",
+      startSec: 0,
+      endSec: 3,
+      tokens: 200,
+      content: "Exploring the code",
+    }),
+    createModelEvent({
+      uuid: "evt-build",
+      startSec: 6,
+      endSec: 12,
+      tokens: 400,
+      content: "Building the feature",
+    }),
+  ];
+
+  const sample = createEvalSample({
+    id: sampleId,
+    epoch: 1,
+    messages,
+    events,
+    timelines: options?.timelines ?? [
+      createSampleTimeline(["evt-root", "evt-explore", "evt-build"]),
+    ],
+  });
+
+  const evalLog = createEvalLog({ samples: [sample] });
+  const logDetails = createLogDetails(evalLog);
+
+  network.use(
+    // get_log_root — the dir-mode gate blocks on this.
+    http.get("*/api/logs", () => HttpResponse.json({ log_dir: "/logs" })),
+
+    http.get("*/api/log-files*", () => {
+      return HttpResponse.json({
+        files: [{ name: LOG_FILE, task: "chat-test", task_id: "chat-test" }],
+        response_type: "full",
+      });
+    }),
+
+    http.get("*/api/logs/:file", () => {
+      return HttpResponse.json(evalLog);
+    }),
+
+    http.get("*/api/log-headers*", () => {
+      return HttpResponse.json([
+        {
+          eval_id: logDetails.eval.eval_id,
+          run_id: logDetails.eval.run_id,
+          task: logDetails.eval.task,
+          task_id: logDetails.eval.task_id,
+          task_version: logDetails.eval.task_version,
+          model: logDetails.eval.model,
+          status: logDetails.status,
+          started_at: logDetails.stats?.started_at,
+          completed_at: logDetails.stats?.completed_at,
+        },
+      ]);
+    })
+  );
+
+  const encodedFile = encodeURIComponent(LOG_FILE);
+  await page.goto(
+    `/#/logs/${encodedFile}/samples/sample/${sampleId}/1/transcript${options?.deepLink ?? ""}`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Timeline acceptance tests
+// ---------------------------------------------------------------------------
+
+test("returning to the root via the breadcrumb restores the full event list", async ({
+  page,
+  network,
+}) => {
+  await openTranscriptWithTimeline(page, network);
+
+  const swimlane = page.getByRole("grid", { name: "Timeline swimlane" });
+  const exploreCard = page.getByText("sub-agent: explore");
+  await expect(exploreCard).toBeVisible();
+
+  await swimlane.getByRole("row").filter({ hasText: "Build" }).click();
+  await expect(exploreCard).toBeHidden();
+
+  // Selecting an agent can collapse the swimlane behind its breadcrumb.
+  await page.getByRole("button", { name: "Transcript", exact: true }).click();
+  await expect(exploreCard).toBeVisible();
+  await expect(page.getByText("sub-agent: build").first()).toBeVisible();
+});
+
+test("clicking a swimlane row updates selection", async ({ page, network }) => {
+  await openTranscriptWithTimeline(page, network);
+
+  const swimlane = page.getByRole("grid", { name: "Timeline swimlane" });
+  const exploreCard = page.getByText("sub-agent: explore");
+  await expect(exploreCard).toBeVisible();
+
+  await swimlane.getByRole("row").filter({ hasText: "Build" }).click();
+
+  // The event list now shows only the Build agent's content.
+  await expect(page.getByText("Building the feature").first()).toBeVisible();
+  await expect(exploreCard).toBeHidden();
+});
+
+for (const deepLink of [
+  { query: "?event=evt-target", selector: "#event-panel-evt-target" },
+  {
+    query: "?message=message-target",
+    selector: "[data-message-id='message-target']",
+  },
+] as const) {
+  test(`${deepLink.query.split("=")[0]} deep link selects and scrolls to a sub-agent node`, async ({
+    page,
+    network,
+  }) => {
+    const events: Events = [
+      createModelEvent({ uuid: "evt-root", content: "Root event" }),
+      ...Array.from({ length: 24 }, (_, i) =>
+        createModelEvent({
+          uuid: i === 20 ? "evt-target" : `evt-agent-${i}`,
+          content: i === 20 ? "Deep-link target" : `Agent step ${i}`,
+          messageId: i === 20 ? "message-target" : undefined,
+          startSec: i + 1,
+          endSec: i + 2,
+        })
+      ),
+    ];
+    const timeline: Timeline = {
+      name: "default",
+      description: "Sub-agent deep-link timeline",
+      root: testTimelineSpan({
+        id: "root",
+        name: "Transcript",
+        content: [
+          testTimelineEvent({ event: "evt-root" }),
+          testTimelineSpan({
+            id: "agent-a",
+            name: "Agent A",
+            span_type: "agent",
+            content: events
+              .slice(1)
+              .map((event) => testTimelineEvent({ event: event.uuid! })),
+          }),
+        ],
+      }),
+    };
+
+    await openTranscriptWithTimeline(page, network, {
+      events,
+      timelines: [timeline],
+      deepLink: deepLink.query,
+    });
+
+    const target = page.locator(deepLink.selector);
+    await expect(target).toBeVisible();
+    await expect(target).toBeInViewport();
+    await expect(page.getByText("Deep-link target").first()).toBeVisible();
+    await expect(page.getByText("Root event")).toBeHidden();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Characterization: minimap
+// ---------------------------------------------------------------------------
+
+test("scrubbing the minimap scrolls the event list", async ({
+  page,
+  network,
+}) => {
+  // Enough events that the list overflows and scrubbing has somewhere to go.
+  const events: Events = Array.from({ length: 30 }, (_, i) =>
+    createModelEvent({
+      uuid: `evt-${i}`,
+      content: `Step ${i} of the long transcript`,
+      startSec: i * 2,
+      endSec: i * 2 + 1,
+      tokens: 100,
+    })
+  );
+  // A child agent span is required for the swimlane section (and thus the
+  // minimap) to render at all.
+  const timeline: Timeline = {
+    name: "default",
+    description: "Long timeline",
+    root: testTimelineSpan({
+      id: "root",
+      name: "Transcript",
+      content: [
+        ...events
+          .slice(0, 29)
+          .map((e) => testTimelineEvent({ event: e.uuid! })),
+        testTimelineSpan({
+          id: "deep",
+          name: "Deep",
+          span_type: "agent",
+          content: [testTimelineEvent({ event: events[29]!.uuid! })],
+        }),
+      ],
+    }),
+  };
+  await openTranscriptWithTimeline(page, network, {
+    events,
+    timelines: [timeline],
+  });
+
+  const swimlane = page.getByRole("grid", { name: "Timeline swimlane" });
+  await expect(swimlane).toBeVisible();
+
+  // Early content is on screen, late content is virtualized away.
+  await expect(
+    page.getByText("Step 0 of the long transcript").first()
+  ).toBeVisible();
+  await expect(page.getByText("Step 28 of the long transcript")).toBeHidden();
+
+  // Click near the right edge of the minimap's selection region: onScrub
+  // receives ~1.0 and the main scroller jumps to the end of the list.
+  const region = swimlane.locator('[class*="selectionRegion"]');
+  await expect(region).toBeVisible();
+  const box = (await region.boundingBox())!;
+  await page.mouse.click(box.x + box.width - 2, box.y + box.height / 2);
+
+  // Step 29 lives inside the agent span (it renders as an agent card at
+  // root selection), so the last root-level event is the scroll target.
+  await expect(
+    page.getByText("Step 28 of the long transcript").first()
+  ).toBeVisible();
+});

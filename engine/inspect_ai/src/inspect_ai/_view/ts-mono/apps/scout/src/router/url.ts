@@ -1,0 +1,362 @@
+import { decodeBase64Url, encodeBase64Url } from "@tsmono/util";
+
+// Route URL patterns
+export const kScansRootRouteUrlPattern = "/scans";
+export const kScansRouteUrlPattern = "/scans/:scansDir";
+export const kScansWithPathRouteUrlPattern = "/scans/:scansDir/*";
+export const kScanRouteUrlPattern = "/scan/:scansDir/*";
+export const kScanResultRouteUrlPattern = "/scan/:scansDir/*/*";
+export const kTranscriptsRouteUrlPattern = "/transcripts";
+export const kProjectRouteUrlPattern = "/project";
+export const kValidationRouteUrlPattern = "/validation";
+export const kTranscriptDetailRoute =
+  "/transcripts/:transcriptsDir/:transcriptId";
+export const kTranscriptDetailRouteUrlPattern =
+  /\/transcripts\/[^\s/]+\/[^\s/]+$/;
+// Focus-mode page (single focused turn, entered from a transcript event).
+export const kTranscriptEventDetailRoute =
+  "/transcripts/:transcriptsDir/:transcriptId/event";
+
+// Regex pattern for valid scan IDs (22 characters: alphanumeric, underscore, dot, or dash)
+export const kScanIdPattern = /scan_id=[a-zA-Z0-9_.-]{22}$/;
+
+// Query parameter constants
+export const kScannerQueryParam = "scanner";
+export const kValidationQueryParam = "validation";
+export const kRailQueryParam = "rail";
+export const kValidationSetQueryParam = "validationSet";
+export const kDataframeColumnsQueryParam = "cols";
+const kLegacySidebarQueryParam = "sidebar";
+
+// Helper functions to generate routes
+export const scanRoute = (
+  scansDir: string,
+  relativePath: string,
+  searchParams?: URLSearchParams
+) => {
+  const encodedDir = encodeBase64Url(scansDir);
+  const route = `/scan/${encodedDir}/${relativePath}`;
+  searchParams?.delete("tab");
+
+  return searchParams?.toString()
+    ? `${route}?${searchParams.toString()}`
+    : route;
+};
+
+export const scansRoute = (
+  scansDir: string,
+  relativePath?: string,
+  searchParams?: URLSearchParams
+) => {
+  const encodedDir = encodeBase64Url(scansDir);
+  const baseRoute = `/scans/${encodedDir}`;
+  const route = relativePath ? `${baseRoute}/${relativePath}` : baseRoute;
+  return searchParams?.toString()
+    ? `${route}?${searchParams.toString()}`
+    : route;
+};
+
+export const scanResultRoute = (
+  scansDir: string,
+  scanRelativePath: string,
+  scanResultId?: string,
+  searchParams?: URLSearchParams
+) => {
+  const encodedDir = encodeBase64Url(scansDir);
+  const route = `/scan/${encodedDir}/${scanRelativePath}/${scanResultId}`;
+  return searchParams?.toString()
+    ? `${route}?${searchParams.toString()}`
+    : route;
+};
+
+export const transcriptsRoute = (searchParams?: URLSearchParams) => {
+  const route = `/transcripts`;
+  return searchParams?.toString()
+    ? `${route}?${searchParams.toString()}`
+    : route;
+};
+
+export const projectRoute = () => "/project";
+
+export const validationRoute = () => "/validation";
+
+export const transcriptRoute = (
+  transcriptsDir: string,
+  transcriptId: string,
+  searchParams?: URLSearchParams,
+  validationSetUri?: string
+) => {
+  const encodedDir = encodeBase64Url(transcriptsDir);
+  const route = `/transcripts/${encodedDir}/${transcriptId}`;
+
+  // If validationSetUri is provided, open the validation rail panel + select it
+  let params = searchParams ? new URLSearchParams(searchParams) : undefined;
+  if (validationSetUri) {
+    params = params ?? new URLSearchParams();
+    params.delete(kLegacySidebarQueryParam);
+    params.set(kRailQueryParam, "validation");
+    params.set(kValidationSetQueryParam, encodeBase64Url(validationSetUri));
+  }
+
+  return params?.toString() ? `${route}?${params.toString()}` : route;
+};
+
+/**
+ * Route for the standalone single-event (focus) page without a specific
+ * event. The focus view resolves the missing `event` param to the
+ * transcript's first turn, so prev/next-transcript navigation can stay in
+ * focus mode.
+ */
+export const transcriptFocusRoute = (
+  transcriptsDir: string,
+  transcriptId: string,
+  searchParams?: URLSearchParams
+) => {
+  const encodedDir = encodeBase64Url(transcriptsDir);
+  const route = `/transcripts/${encodedDir}/${transcriptId}/event`;
+  return searchParams?.toString()
+    ? `${route}?${searchParams.toString()}`
+    : route;
+};
+
+/**
+ * Route for the standalone single-event page. Renders only the given event and
+ * its turn's tool calls.
+ */
+export const transcriptEventDetailRoute = (
+  transcriptsDir: string,
+  transcriptId: string,
+  eventId: string
+) => {
+  const encodedDir = encodeBase64Url(transcriptsDir);
+  return `/transcripts/${encodedDir}/${transcriptId}/event?event=${encodeURIComponent(eventId)}`;
+};
+
+/**
+ * Validates if a path matches the scan_id pattern.
+ * The path must end with scan_id=[22 characters of alphanumeric, underscore, dot, or dash]
+ *
+ * @param path - The path to validate
+ * @returns true if the path is valid, false otherwise
+ */
+export const isValidScanPath = (path: string): boolean => {
+  path = path.startsWith("/") ? path : "/" + path;
+  return kScanIdPattern.test(path);
+};
+
+export const isValidTranscriptPath = (path: string): boolean => {
+  return kTranscriptDetailRouteUrlPattern.test(path);
+};
+
+/**
+ * Extracts the relative path from route params.
+ * Use this with useParams() when you're on a /scan/* route.
+ *
+ * @example
+ * const params = useParams<{ "*": string }>();
+ * const relativePath = getRelativePathFromParams(params);
+ */
+export const getRelativePathFromParams = (
+  params: Readonly<Partial<{ "*": string }>>
+): string => {
+  return params["*"] || "";
+};
+
+/**
+ * Decodes a base64url route segment, treating a malformed one (a hand-typed
+ * or truncated URL) as absent rather than letting `atob` throw mid-render.
+ */
+export const tryDecodeBase64Url = (encoded: string): string | undefined => {
+  try {
+    return decodeBase64Url(encoded);
+  } catch {
+    return undefined;
+  }
+};
+
+export const parseTranscriptParams = (
+  params: Readonly<Partial<{ transcriptsDir: string; transcriptId: string }>>
+): { transcriptsDir?: string; transcriptId?: string } => {
+  const transcriptId = params.transcriptId;
+  const transcriptsDir = params.transcriptsDir
+    ? tryDecodeBase64Url(params.transcriptsDir)
+    : undefined;
+  return transcriptsDir === undefined
+    ? { transcriptId }
+    : { transcriptsDir, transcriptId };
+};
+
+export const parseScanParams = (
+  params: Readonly<Partial<{ scansDir: string; "*": string }>>
+): {
+  scansDir?: string;
+  relativePath: string;
+  scanPath: string;
+  scanResultUuid?: string;
+} => {
+  const relativePath = getRelativePathFromParams(params);
+  const { scanPath, scanResultUuid } = parseScanResultPath(relativePath);
+  const scansDir = params.scansDir
+    ? tryDecodeBase64Url(params.scansDir)
+    : undefined;
+  return scansDir === undefined
+    ? { relativePath, scanPath, scanResultUuid }
+    : { scansDir, relativePath, scanPath, scanResultUuid };
+};
+
+// Extracts the scanPath and scanResultUuid from a full path.
+// const { scanPath, scanResultUuid } = parseScanResultPath("old_scans/scan_id=3oUGqQCpPQ9WSNPV4oy7Fe/8B90F1605892");
+//   scanPath: "old_scans/scan_id=3oUGqQCpPQ9WSNPV4oy7Fe"
+//   scanResultUuid: "8B90F1605892"
+//
+export const parseScanResultPath = (
+  fullPath: string
+): { scanPath: string; scanResultUuid?: string } => {
+  // Find the scan_id pattern in the path
+  const scanIdMatch = fullPath.match(/scan_id=[a-zA-Z0-9_.-]{22}/);
+
+  if (!scanIdMatch || scanIdMatch.index === undefined) {
+    // No valid scan_id found
+    return { scanPath: fullPath };
+  }
+
+  // Extract everything up to and including the scan_id
+  const scanIdEndIndex = scanIdMatch.index + scanIdMatch[0].length;
+  const scanPath = fullPath.slice(0, scanIdEndIndex);
+  const remainingPath = fullPath.slice(scanIdEndIndex);
+
+  // Check if there's a scan result UUID after the scan_id
+  if (remainingPath && remainingPath.length > 1) {
+    const scanResultUuid = remainingPath.startsWith("/")
+      ? remainingPath.slice(1)
+      : remainingPath;
+    return { scanPath, scanResultUuid };
+  }
+
+  return { scanPath };
+};
+
+// Updates the scanner parameter in URL search params.
+export const updateScannerParam = (
+  searchParams: URLSearchParams,
+  scanner: string
+): URLSearchParams => {
+  const newParams = new URLSearchParams(searchParams);
+  newParams.set(kScannerQueryParam, scanner);
+  return newParams;
+};
+
+// Retrieves the scanner parameter from URL search params.
+export const getScannerParam = (
+  searchParams: URLSearchParams
+): string | undefined => {
+  return searchParams.get(kScannerQueryParam) || undefined;
+};
+
+const updateBooleanParam = (
+  searchParams: URLSearchParams,
+  key: string,
+  isOpen: boolean
+): URLSearchParams => {
+  const newParams = new URLSearchParams(searchParams);
+  newParams.delete(kLegacySidebarQueryParam);
+  if (isOpen) {
+    newParams.set(key, "1");
+  } else {
+    newParams.delete(key);
+  }
+  return newParams;
+};
+
+// Updates the validation sidebar parameter in URL search params.
+export const updateValidationParam = (
+  searchParams: URLSearchParams,
+  isOpen: boolean
+): URLSearchParams => {
+  return updateBooleanParam(searchParams, kValidationQueryParam, isOpen);
+};
+
+// Retrieves the validation sidebar parameter from URL search params.
+export const getValidationParam = (searchParams: URLSearchParams): boolean => {
+  return searchParams.get(kValidationQueryParam) === "1";
+};
+
+export type RailPanelId = "search" | "validation";
+
+const isRailPanelId = (value: string | null): value is RailPanelId =>
+  value === "search" || value === "validation";
+
+// Retrieves the active rail panel id, or undefined when none/invalid.
+export const getRailParam = (
+  searchParams: URLSearchParams
+): RailPanelId | undefined => {
+  const value = searchParams.get(kRailQueryParam);
+  return isRailPanelId(value) ? value : undefined;
+};
+
+// Sets the active rail panel id, or clears it when given undefined.
+export const updateRailParam = (
+  searchParams: URLSearchParams,
+  id: RailPanelId | undefined
+): URLSearchParams => {
+  const newParams = new URLSearchParams(searchParams);
+  if (id) {
+    newParams.set(kRailQueryParam, id);
+  } else {
+    newParams.delete(kRailQueryParam);
+  }
+  return newParams;
+};
+
+// Toggle semantics: re-selecting the active id closes it; selecting another
+// switches. Panels are mutually exclusive (a single value).
+export const nextRailValue = (
+  current: RailPanelId | undefined,
+  clicked: RailPanelId
+): RailPanelId | undefined => (current === clicked ? undefined : clicked);
+
+// Retrieves the validation set URI from URL search params.
+export const getValidationSetParam = (
+  searchParams: URLSearchParams
+): string | undefined => {
+  const encoded = searchParams.get(kValidationSetQueryParam);
+  return encoded ? tryDecodeBase64Url(encoded) : undefined;
+};
+
+// Updates the validation set URI parameter in URL search params.
+export const updateValidationSetParam = (
+  searchParams: URLSearchParams,
+  uri: string | undefined
+): URLSearchParams => {
+  const newParams = new URLSearchParams(searchParams);
+  if (uri) {
+    newParams.set(kValidationSetQueryParam, encodeBase64Url(uri));
+  } else {
+    newParams.delete(kValidationSetQueryParam);
+  }
+  return newParams;
+};
+
+// Retrieves the dataframe columns parameter from URL search params.
+export const getColumnsParam = (
+  searchParams: URLSearchParams
+): string[] | undefined => {
+  const raw = searchParams.get(kDataframeColumnsQueryParam);
+  if (!raw) return undefined;
+  const columns = raw.split(",").filter(Boolean);
+  return columns.length > 0 ? columns : undefined;
+};
+
+// Updates the dataframe columns parameter in URL search params.
+export const updateColumnsParam = (
+  searchParams: URLSearchParams,
+  columns: string[] | undefined
+): URLSearchParams => {
+  const newParams = new URLSearchParams(searchParams);
+  if (columns && columns.length > 0) {
+    newParams.set(kDataframeColumnsQueryParam, columns.join(","));
+  } else {
+    newParams.delete(kDataframeColumnsQueryParam);
+  }
+  return newParams;
+};

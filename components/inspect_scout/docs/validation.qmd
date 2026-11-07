@@ -1,0 +1,401 @@
+---
+title: "Validation"
+lightbox: true
+llms-description: "Validation of scanner results against ground truth target values"
+---
+
+{{< include _validation-workflow.md >}}
+
+## Validation Splits {#validation-splits}
+
+Validation cases can be organized into named groups called "splits" (e.g., "dev", "test", etc.). This enables you to iterate your scanner prompts on a subset of cases (e.g. "dev") then do final testing on a holdout set (e.g. "test"). Maintaining this separation is often critical to ensure that your scanner prompts aren't overfit to your validation set.
+
+### Defining Splits
+
+Use the validation pane to assign splits to validation cases:
+
+![](images/validation-split.png){.border}
+
+Select multiple transcripts to assign several splits at once:
+
+![](images/validation-split-multiple.png){.border}
+
+You can also directly assign splits from within the validation case editor in the transcripts and scan results views.
+
+Splits are then written to validation set CSVs using a `split` column:
+
+``` {.default filename="validation.csv"}
+id,target,split
+Fg3KBpgFr6RSsEWmHBUqeo,true,dev
+VFkCH7gXWpJYUYonvfHxrG,false,dev
+SiEXpECj7U9nNAvM3H7JqB,true,test
+```
+
+### Applying Splits
+
+Pass the `split` option to `validation_set()` to filter by split when creating your validation set:
+
+``` python
+from inspect_scout import validation_set
+
+# Use only dev cases
+validation = validation_set("validation.csv", split="dev")
+
+# Use multiple splits
+validation = validation_set("validation.csv", split=["dev", "test"])
+```
+
+When filtering by split, only cases with matching split values are included. Cases without a split value are excluded when a split filter is applied.
+
+<!----
+
+## Validating Labels
+
+When a scanner returns a list of multiple results (see [Multiple Results](custom_scanner.qmd#multiple-results)), you can validate whether results with specific labels are present or absent. This is particularly useful for scanners that detect multiple types of findings in a single transcript.
+
+### Specifying Labels
+
+Use the labels UI within the validation case editor to specify lables that are expected (or not expected) for a transcript:
+
+![](images/validation-panel-transcripts.png){.border}
+
+### Label Validation
+
+Label validation uses boolean expectations to check for presence or absence of labeled results:
+
+-   **`true`**: Validation passes if at least one result with that label has a **positive** (non-negative) value
+-   **`false`**: Validation passes if no results with that label exist, or if all results have **negative** values
+
+**Negative values** are: `false`, `null`/`None`, `0`, `""` (empty string), `"NONE"`, `{}` (empty dict), `[]` (empty list).
+
+**Positive values** are: `true`, non-zero numbers, non-empty strings, non-empty dicts/lists.
+
+For example, if your validation expects the `deception` label and the scanner returns a result with `label="deception"` and `value={"confidence": 0.9}`, the validation passes because a non-empty dict is a positive value.
+
+If your validation does not expect the `phishing` label and the scanner returns no results with `label="phishing"`, validation passes because absence is treated as negative.
+
+### Labels in CSV/YAML
+
+If you are editing validation CSV files directly, use `label_*` columns:
+
+``` {.default filename="security-validation.csv"}
+id, label_deception, label_jailbreak, label_misconfig
+Fg3KBpgFr6RSsEWmHBUqeo, true, false, false
+VFkCH7gXWpJYUYonvfHxrG, false, true, false
+SiEXpECj7U9nNAvM3H7JqB, false, false, true
+```
+
+For YAML/JSON files, use a labels key instead of target:
+
+``` yaml
+- id: Fg3KBpgFr6RSsEWmHBUqeo 
+  labels: 
+    deception: true 
+    jailbreak: false 
+    misconfig: false
+
+- id: VFkCH7gXWpJYUYonvfHxrG 
+  labels: 
+    deception: false 
+    jailbreak: true 
+    misconfig: false
+```
+
+---->
+
+## Predicates
+
+By default, validation compares scanner results to targets using equality (`eq`). You can specify different comparison predicates either per-case or as a default for all cases.
+
+### Per-Case Predicates
+
+When specifying a non-boolean target for a validation case, you can also customize the predicate used for comparison:
+
+![](images/validation-panel-predicate.png){.border width=297}
+
+Within a validation set CSV, add a `predicate` column to specify comparison logic for individual cases:
+
+``` {.default filename="validation.csv"}
+id,target,predicate
+SiEXpECj7U9nNAvM3H7JqB,true,eq
+VFkCH7gXWpJYUYonvfHxrG,hello,contains
+Fg3KBpgFr6RSsEWmHBUqeo,5,gte
+```
+
+In this example:
+
+-   First case passes if scanner result equals `true`
+-   Second case passes if scanner result contains "hello"
+-   Third case passes if scanner result is ≥ 5
+
+### Available Predicates
+
+| Predicate    | Description               |
+|--------------|---------------------------|
+| `eq`         | Equal (default)           |
+| `ne`         | Not equal                 |
+| `gt`         | Greater than              |
+| `gte`        | Greater than or equal     |
+| `lt`         | Less than                 |
+| `lte`        | Less than or equal        |
+| `contains`   | String contains substring |
+| `startswith` | String starts with prefix |
+| `endswith`   | String ends with suffix   |
+| `icontains`  | Case-insensitive contains |
+| `iequals`    | Case-insensitive equals   |
+
+### Default Predicate
+
+You can also set a default predicate for all cases using the `predicate` parameter of `validation_set()`:
+
+``` python
+validation_set(cases="validation.csv", predicate="gte")
+```
+
+When both are specified, per-case predicates take precedence over the default. This allows you to set a common predicate while overriding it for specific cases:
+
+``` {.default filename="validation.csv"}
+id,target,predicate
+Fg3KBpgFr6RSsEWmHBUqeo,5,
+VFkCH7gXWpJYUYonvfHxrG,3,lt
+SiEXpECj7U9nNAvM3H7JqB,10,
+```
+
+``` python
+# Default is "gte", but second case uses "lt"
+validation_set(cases="validation.csv", predicate="gte")
+```
+
+### Custom Predicates
+
+Use `@validation_predicate` when a custom predicate must be recorded and
+recreated for scan resume:
+
+``` python
+from pydantic import JsonValue
+
+from inspect_scout import (
+    Result,
+    ValidationPredicate,
+    validation_predicate,
+    validation_set,
+)
+
+
+@validation_predicate
+def within_range(distance: float = 10) -> ValidationPredicate:
+    async def check(result: Result, target: JsonValue) -> bool:
+        if not isinstance(result.value, (int, float)):
+            return False
+        if not isinstance(target, (int, float)):
+            return False
+        return abs(result.value - target) <= distance
+
+    return check
+
+
+validation = validation_set(
+    "validation.csv",
+    predicate=within_range(distance=5),
+)
+```
+
+Scout records the registered predicate's name and Inspect registry-compatible
+creation parameters, not its Python implementation. Use the same parameter
+conventions as other Inspect extensions: ordinary serializable values and
+registered Inspect objects or models are portable, while arbitrary Python
+objects are not. Non-finite floating-point values are rejected rather than
+silently changed in the scan artifact. The predicate's module or package must
+be available when the scan is resumed.
+
+If the predicate is defined in a local source file rather than an installed
+package, Scout records the file path and loads that file when the scan is
+resumed (the same way it loads the source file of a scanner defined outside a
+package). Listing or viewing a scan never loads predicate code.
+
+An unregistered async callable can still be used for the current scan:
+
+``` python
+async def normalized_equal(result: Result, target: JsonValue) -> bool:
+    return str(result.value).strip().lower() == str(target).strip().lower()
+
+
+validation = validation_set(
+    "validation.csv",
+    predicate=normalized_equal,
+)
+```
+
+Unregistered callables are not stored in the portable scan specification.
+Resume from Python by supplying the trusted callable again:
+
+``` python
+from inspect_scout import scan_resume
+
+scan_resume(
+    scan_location,
+    predicate_overrides={
+        "my_scanner": normalized_equal,
+    },
+)
+```
+
+Completed scans remain viewable without loading predicate code. A scan with an
+unregistered or legacy custom predicate cannot be resumed by location alone
+(including with `scout scan resume`), and Scout never substitutes a missing
+predicate with equality.
+
+## Advanced
+
+### Non-Transcript IDs
+
+In the above examples, we provided a validation set of transcript_id =\> boolean. Of course, not every scanner takes a transcript id (some take event or message ids). All of these other variations are supported (including lists of events or messages yielded by a custom [Loader](custom_scanner.qmd#loaders)).
+
+For example, imagine we have a scanner that counts the incidences of "backtracking" in reasoning traces. In this case our scanner yields a number rather than a boolean. So our validation set would be message_id =\> number:
+
+``` {.default filename="backtracking.csv"}
+id,target
+Fg3KBpgFr6RSsEWmHBUqeo,2
+VFkCH7gXWpJYUYonvfHxrG,0
+SiEXpECj7U9nNAvM3H7JqB,3
+```
+
+In the case of a custom loader (.e.g. one that extracts user/assistant message pairs) we can also include multiple IDs:
+
+``` {.default filename="validation.csv"}
+id,target
+"Fg3KBpgFr6RSsEWmHBUqeo,VFkCH7gXWpJYUYonvfHxrG",true
+```
+
+When specifying multiple IDs in CSV format, you can use either:
+
+- **Comma-separated format:** `"id1,id2"` (quote the entire value)
+- **JSON array format:** `"[\"id1\",\"id2\"]"`
+
+Both formats are automatically parsed into a list of IDs.
+
+### Complex Targets
+
+Some scanners yield complex values (e.g. lists or dictionaries). For purposes of validation it's often much better to deal with simple values, however if you want to validate against lists and dicts this is fully supported (although you can't define validation cases with non-scaner targets in the Scout View UI).
+
+One middle ground is that if your scanner is yielding a dict (e.g for [Structured Answers](llm_scanner.qmd#structured-answers)) you can still mark one of the dict fields as the "value" using `alias="value"`. For example:
+
+``` python
+class Refusal(BaseModel):
+    refusal_exists: bool = Field(
+        alias="value",
+        description="Whether the assistant refused or declined to complete the user's requested task.",
+    )
+
+    type: str = Field(
+        alias="label",
+        description=(
+            "The type of refusal: `NO_REFUSAL`, `PARTIAL_REFUSAL`, `INDIRECT_REFUSAL` or `CRITICAL_REFUSAL`"
+        )
+    )
+```
+
+This enables you to combine complex results with more straightforward validation. See the [File Formats](#file-formats) section below for details on specifying dict values as validation targets.
+
+## File Formats {#file-formats}
+
+You can specify a `ValidationSet` either in code, as a CSV, YAML, JSON, or JSONL file.
+
+### CSV
+
+Here are the various ways you can structure a validation CSV for different scenarios:
+
+| Format | Header Row | Example |
+|--------------------|-----------------------------|-----------------------|
+| Single target | `id,target` | `id,target`<br>`abc123,true` |
+| Dict targets | `id,target_*,...` | `id,target_foo,target_bar`<br>`abc123,true,42` |
+| Label validation | `id,label_*,...` | `id,label_deception,label_jailbreak`<br>`abc123,true,false` |
+| With splits | `id,target,split` | `id,target,split`<br>`abc123,true,dev` |
+
+### YAML
+
+Here is what a YAML file would look like for a single target:
+
+``` {.yaml filename="validation.yaml"}
+- id: Fg3KBpgFr6RSsEWmHBUqeo
+  target: true
+
+- id: VFkCH7gXWpJYUYonvfHxrG
+  target: false
+```
+
+Here is a YAML file for multiple targets:
+
+``` {.yaml filename="validation.yaml"}
+- id: Fg3KBpgFr6RSsEWmHBUqeo
+  target:
+     deception: true
+     backtracks: 2
+
+- id: VFkCH7gXWpJYUYonvfHxrG
+  target:
+     deception: false
+     backtracks: 0
+```
+
+Here is a YAML file for label-based validation (resultsets):
+
+``` {.yaml filename="validation.yaml"}
+- id: Fg3KBpgFr6RSsEWmHBUqeo
+  labels:
+     deception: true
+     jailbreak: false
+     misconfig: false
+
+- id: VFkCH7gXWpJYUYonvfHxrG
+  labels:
+     deception: false
+     jailbreak: true
+     misconfig: false
+```
+
+Here is a YAML file with splits using the flat format (split field on each case):
+
+``` {.yaml filename="validation.yaml"}
+- id: Fg3KBpgFr6RSsEWmHBUqeo
+  target: true
+  split: dev
+
+- id: VFkCH7gXWpJYUYonvfHxrG
+  target: false
+  split: test
+```
+
+You can also use a nested format that groups cases by split:
+
+``` {.yaml filename="validation.yaml"}
+- split: dev
+  cases:
+    - id: Fg3KBpgFr6RSsEWmHBUqeo
+      target: true
+    - id: VFkCH7gXWpJYUYonvfHxrG
+      target: false
+
+- split: test
+  cases:
+    - id: SiEXpECj7U9nNAvM3H7JqB
+      target: true
+```
+
+### JSON
+
+JSON files use the same structure as YAML:
+
+``` {.json filename="validation.json"}
+[
+  {"id": "Fg3KBpgFr6RSsEWmHBUqeo", "target": true},
+  {"id": "VFkCH7gXWpJYUYonvfHxrG", "target": false}
+]
+```
+
+JSONL (JSON Lines) format has one case per line:
+
+``` {.default filename="validation.jsonl"}
+{"id": "Fg3KBpgFr6RSsEWmHBUqeo", "target": true}
+{"id": "VFkCH7gXWpJYUYonvfHxrG", "target": false}
+```

@@ -1,0 +1,158 @@
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Literal
+
+from pydantic import Field, PrivateAttr, field_serializer
+
+from inspect_ai._util.dateutil import UtcDatetime, datetime_to_iso_format_safe
+from inspect_ai.model._chat_message import ChatMessage
+from inspect_ai.model._generate_config import GenerateConfig
+from inspect_ai.model._model_call import ModelCall, ModelRequestId
+from inspect_ai.model._model_output import ModelOutput
+from inspect_ai.tool._tool_choice import ToolChoice
+from inspect_ai.tool._tool_info import ToolInfo
+
+from ._base import BaseEvent
+
+OPERATOR_CANCEL_ERROR = "Cancelled by operator"
+"""Sentinel string stamped on ``ModelEvent.error`` when an external
+operator (e.g. ``AcpTransport.cancel_current_turn``) cancels an in-flight
+``generate`` call. Read sites:
+
+- ``inspect_ai.model._model.complete()`` short-circuits its
+  natural-completion overwrite when the event already carries this
+  marker (the model can return successfully inside the cancellation
+  propagation window).
+- TUI / log renderers can suppress display of cancelled events.
+
+The value is intentionally a fixed string so it round-trips through
+the JSON eval log; downstream tooling can detect operator cancels
+without depending on the agent/ACP layer.
+"""
+
+LIMIT_CANCEL_ERROR = "Cancelled by limit"
+"""Sentinel for cancels triggered by a sample-level limit (tokens,
+time, cost, messages). Sibling of :data:`OPERATOR_CANCEL_ERROR` —
+same sticky-stamp + display-suppress contract, but provenance is
+clearly a limit trip rather than an operator action. Pairs with
+``InterruptEvent.source="limit"``."""
+
+SYSTEM_CANCEL_ERROR = "Cancelled by system"
+"""Sentinel for cancels triggered by the eval system (shutdown,
+external orchestration). Sibling of :data:`OPERATOR_CANCEL_ERROR` —
+same sticky-stamp + display-suppress contract, but provenance is
+the eval host rather than the operator. Pairs with
+``InterruptEvent.source="system"``."""
+
+CANCEL_ERRORS: frozenset[str] = frozenset(
+    {OPERATOR_CANCEL_ERROR, LIMIT_CANCEL_ERROR, SYSTEM_CANCEL_ERROR}
+)
+"""All cancel sentinels. Use ``event.error in CANCEL_ERRORS`` in
+renderers / consumers that should treat every cancel cause the same
+way (e.g. suppressing display of an interrupted generation)."""
+
+
+@dataclass
+class ModelEventProgress:
+    """In-flight progress on a pending model call.
+
+    Written per stream chunk by the model layer's stream observer
+    (`inspect_ai.model._stream`) and read by pollers of the pending event
+    (control channel, TUI). Ephemeral by design: it describes an attempt
+    still in flight, so it lives in a `PrivateAttr` (never serialized —
+    adding it to the event schema would leak a monitoring artifact into
+    eval logs and the type-generation pipeline) and is discarded with the
+    attempt. See design/ctl/generate-progress.md (layer 2).
+    """
+
+    last_progress_at: float | None = None
+    """Unix timestamp of the last observed stream progress."""
+
+    output_tokens: int | None = None
+    """Cumulative output tokens streamed so far (`None` when the provider
+    reports no usage mid-stream — counts are never estimated)."""
+
+
+def model_event_progress(event: "ModelEvent") -> ModelEventProgress | None:
+    """In-flight progress record for a pending model event (if any).
+
+    `None` when the event is not pending, or when no provider stream has
+    reported progress (non-streamed calls, providers not yet instrumented).
+    """
+    return event._progress if event.pending else None
+
+
+class ModelEvent(BaseEvent):
+    """Call to a language model."""
+
+    event: Literal["model"] = Field(default="model")
+    """Event type."""
+
+    model: str
+    """Model name."""
+
+    role: str | None = Field(default=None)
+    """Model role."""
+
+    requested_model: str | None = Field(default=None)
+    """Model name the client requested, for calls made through an agent bridge
+    (`None` for direct calls). Differs from `model` when the bridge served the
+    request with a different model."""
+
+    origin: str | None = Field(default=None)
+    """Where the call was made: `"agent"` for one of its conversation's agent turns; otherwise `"environment"`, `"helper"`, `"tool"`, `"compaction"`, `"approval"`, `"review"`, `"sampling"`, `"sentinel"`, `"scorer"` or `"setup"` (a call outside the solve that is not scoring, such as one at sample init). Inspect owns the set of kinds, and a reader treats a kind it does not know as not an agent turn. `None` in logs written before it was recorded."""
+
+    input: list[ChatMessage]
+    """Model input (list of messages)."""
+
+    input_refs: list[tuple[int, int]] | None = Field(default=None)
+    """Message pool references for input. Each element is a (start, end_exclusive) range."""
+
+    tools: list[ToolInfo]
+    """Tools available to the model."""
+
+    tool_choice: ToolChoice
+    """Directive to the model which tools to prefer."""
+
+    config: GenerateConfig
+    """Generate config used for call to model."""
+
+    output: ModelOutput
+    """Output from model."""
+
+    retries: int | None = Field(default=None)
+    """Retries for the model API request."""
+
+    request_ids: list[ModelRequestId] | None = Field(default=None)
+    """Provider request ids from the responses to this call's requests (including retries)."""
+
+    error: str | None = Field(default=None)
+    """Error which occurred during model call."""
+
+    traceback: str | None = Field(default=None)
+    """Error traceback (plain text)."""
+
+    traceback_ansi: str | None = Field(default=None)
+    """Error traceback with ANSI color codes for display."""
+
+    cache: Literal["read", "write"] | None = Field(default=None)
+    """Was this a cache read or write."""
+
+    call: ModelCall | None = Field(default=None)
+    """Raw call made to model API."""
+
+    completed: UtcDatetime | None = Field(default=None)
+    """Time that model call completed (see `timestamp` for started)"""
+
+    working_time: float | None = Field(default=None)
+    """working time for model call that succeeded (i.e. was not retried)."""
+
+    _progress: ModelEventProgress | None = PrivateAttr(default=None)
+    """In-flight stream progress while pending (see :class:`ModelEventProgress`);
+    access via :func:`model_event_progress`."""
+
+    @field_serializer("completed")
+    def serialize_completed(self, dt: datetime | None) -> str | None:
+        if dt is None:
+            return None
+        return datetime_to_iso_format_safe(dt)

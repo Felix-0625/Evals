@@ -1,0 +1,1395 @@
+import dataclasses
+import json
+from collections.abc import Mapping, MutableMapping
+from logging import getLogger
+from typing import (
+    Callable,
+    Final,
+    Literal,
+    NamedTuple,
+    Sequence,
+    overload,
+)
+
+from pydantic import BaseModel, JsonValue
+from typing_extensions import NotRequired, TypedDict
+
+from inspect_ai._util.constants import BASE_64_DATA_REMOVED
+from inspect_ai._util.content import (
+    Content,
+    ContentAudio,
+    ContentData,
+    ContentDocument,
+    ContentImage,
+    ContentReasoning,
+    ContentText,
+    ContentToolUse,
+    ContentVideo,
+)
+from inspect_ai._util.hash import mm3_hash
+from inspect_ai._util.json import JsonChange, exceeds_max_depth, to_json_safe
+from inspect_ai._util.lineage import PrefixLineages
+from inspect_ai._util.url import is_data_uri
+from inspect_ai.dataset._dataset import Sample
+from inspect_ai.event._pool import (
+    _CALL_MESSAGE_KEYS,
+    CallMessageKey,
+    _build_call_index,
+    _build_msg_index,
+    condense_model_event_calls,
+    condense_model_event_inputs,
+    resolve_model_event_calls,
+    resolve_model_event_inputs,
+)
+from inspect_ai.event._validate import (
+    _chat_message_list_adapter,
+    validate_chat_messages,
+    validate_events_json,
+)
+from inspect_ai.model._chat_message import (
+    ChatMessage,
+    ChatMessageAssistant,
+    ChatMessageBase,
+    logged_json,
+)
+from inspect_ai.model._model_call import ModelCall
+from inspect_ai.model._model_output import ModelOutput
+from inspect_ai.tool._tool import ToolResult
+from inspect_ai.tool._tool_call import ToolCall
+from inspect_ai.tool._tool_info import ToolInfo
+
+from ..event._communication import CommunicationEvent
+from ..event._event import (
+    Event,
+)
+from ..event._info import InfoEvent
+from ..event._model import ModelEvent
+from ..event._sample_init import SampleInitEvent
+from ..event._state import StateEvent
+from ..event._store import StoreEvent
+from ..event._subtask import SubtaskEvent
+from ..event._swarm import SwarmEvent
+from ..event._tool import ToolEvent
+from ._log import EvalSample, EventsData
+
+logger = getLogger(__name__)
+
+
+ATTACHMENT_PROTOCOL = "attachment://"
+
+MAX_SAMPLE_DUMP_DEPTH = 250
+"""Nesting depth at which a condensed sample is checked for serializability.
+
+Not a rejection threshold: exceeding it only triggers the explicit
+serialization check in `condense_sample` (see there). Set just below
+pydantic-core's hard JSON serialization limit (it writes 254 nested containers
+but fails at 255) and above `MAX_JSON_VALUE_DEPTH` (240) plus the nesting a
+walked value's position within the sample typically adds, so ordinary samples
+rarely pay for the check (and when a deep-but-writable sample does trip it,
+the serialization check — not this threshold — decides acceptance).
+"""
+
+
+class SampleSerializationError(ValueError):
+    """Sample content cannot be serialized to the eval log.
+
+    Raised by `condense_sample` when a sample's content defeats the log
+    writer's serializer (e.g. nested beyond pydantic-core's depth limit).
+    A `ValueError` subclass so callers handling condensation failures
+    generically keep working; `log_sample` catches this type specifically
+    so recorder/flush I/O errors are never mistaken for it.
+    """
+
+
+class WalkContext(TypedDict):
+    message_cache: dict[str, tuple[ChatMessage, ChatMessage]]
+    """Cache of walked messages keyed by message id.
+
+    Each value is ``(pre_walk_message, walked_result)``: lookups verify
+    against the *pre-walk* message (by identity first, then equality)
+    because the walked result has rewritten content and never compares
+    equal to an incoming un-walked message.
+
+    The entry holds the live pre-walk object, so a message mutated in
+    place after being walked identity-hits and resolves to its stale
+    first-walked form (consistent with ``event/_pool_index.py``).
+    Staleness needs a mutation to land between two walks sharing one
+    context, so the rule for callers is that a context must not outlive
+    the walk that built it: build it, walk, drop it, with nothing else
+    running in between. The two contexts that do outlive a single walk
+    are safe for their own reasons — log recovery walks only messages it
+    deserialized itself, and ``Transcript``'s per-sample context reaches
+    ``CallWalkCache.condense`` only, which walks the JSON call payload
+    and never a ``ChatMessage``, so its message cache stays empty.
+
+    Entries are only valid for one content function — never share a
+    context across walks with different content functions.
+    """
+
+    only_core: bool
+
+    call_message_cache: NotRequired[dict[int, tuple[JsonValue, JsonValue]]]
+    """Walked model-call wire messages keyed by ``id`` of the pre-walk value.
+
+    Each value is ``(pre_walk_value, walked_result)``; a hit requires the
+    identical object. Logged calls share wire-message objects across events
+    (see ``CallMessageInterner``), so walking every event's call costs one
+    walk per distinct message. Same lifetime rule as ``message_cache``.
+    """
+
+    media_fn: NotRequired[Callable[[str], str]]
+    """Content function for media in tool results (``walk_tool_result``).
+
+    Condensation sets it to the message media policy (every data URI
+    pooled or removed, other values inline) so a result image is treated
+    exactly like the same image in the tool message, while ``content_fn``
+    keeps pooling the event's text. When absent, media go through
+    ``content_fn``: resolution needs no distinction, and the sample buffer
+    applies its one policy to messages and events alike.
+    """
+
+
+def attachment_refs_from_value(value: JsonValue) -> set[str]:
+    """Collect ``attachment://`` refs from a parsed-JSON (or dumped) value.
+
+    JSON containers are a subset of the object graphs
+    :func:`attachment_refs_from_object` walks, so this is that walk under a
+    narrower parameter type — one traversal to keep in sync, not two.
+    """
+    return attachment_refs_from_object(value)
+
+
+def attachment_refs_from_object(
+    value: object,
+    message_refs: Callable[["ChatMessageBase"], frozenset[str] | None] | None = None,
+) -> set[str]:
+    """Collect ``attachment://`` refs by walking a live object graph.
+
+    Equivalent to ``attachment_refs_from_value(obj.model_dump(mode="python"))``
+    without materializing the dump — for a ``ModelEvent`` the dump deep-copies
+    the entire conversation on every call, which made per-update refcounting
+    O(conversation) on the event loop.
+
+    Unlike the dump-based path, cyclic values (reachable via ``metadata`` or
+    ``SubtaskEvent.result``) terminate cleanly instead of raising
+    ``RecursionError``: container nodes are visited once by identity.
+
+    Args:
+        value: Root object (typically an ``Event``).
+        message_refs: Optional hook consulted for every ``ChatMessageBase``
+            encountered. Returning a ``frozenset`` supplies that message's
+            refs without traversing it (memoization); returning ``None``
+            falls through to inline scanning.
+
+    Returns:
+        Referenced attachment hashes (``attachment://`` prefix stripped).
+    """
+    refs: set[str] = set()
+    prefix_len = len(ATTACHMENT_PROTOCOL)
+    seen: set[int] = set()  # container nodes visited once, by identity
+    stack: list[object] = [value]
+    while stack:
+        v = stack.pop()
+        if isinstance(v, str):
+            if v.startswith(ATTACHMENT_PROTOCOL):
+                refs.add(v[prefix_len:])
+            continue
+        if id(v) in seen:
+            continue
+        seen.add(id(v))
+        if isinstance(v, BaseModel):
+            if message_refs is not None and isinstance(v, ChatMessageBase):
+                cached = message_refs(v)
+                if cached is not None:
+                    refs.update(cached)
+                    continue
+            # __dict__ plus __pydantic_extra__ (extra="allow" models, e.g.
+            # CheckpointEvent); __pydantic_private__ is excluded from dumps
+            # too, so correctly never reached here
+            stack.extend(v.__dict__.values())
+            extra = v.__pydantic_extra__
+            if extra:
+                stack.extend(extra.values())
+        elif isinstance(v, dict):
+            stack.extend(v.values())  # keys are never scanned, matching the dump path
+        elif isinstance(v, (list, tuple, set, frozenset)):
+            stack.extend(v)
+        elif dataclasses.is_dataclass(v) and not isinstance(v, type):
+            # e.g. ToolCall - a pydantic dataclass, not a BaseModel
+            stack.extend(getattr(v, f.name) for f in dataclasses.fields(v))
+    return refs
+
+
+def condense_events(
+    events: Sequence[Event],
+) -> tuple[list[Event], EventsData]:
+    """De-duplicate repeated content in a sequence of events.
+
+    Extracts repeated ModelEvent inputs and calls into shared pools,
+    replacing inline content with pool index references.
+
+    Args:
+        events: Events to condense.
+
+    Returns:
+        Tuple of (condensed events, events data containing message and call pools).
+    """
+    condensed_events, _, new_msgs = condense_model_event_inputs(events, 0, {})
+    message_pool: list[ChatMessage] = [msg for _, msg in new_msgs]
+    condensed_events, _, new_calls = condense_model_event_calls(condensed_events, 0, {})
+    call_pool: list[JsonValue] = [call_msg for _, call_msg in new_calls]
+    return condensed_events, EventsData(messages=message_pool, calls=call_pool)
+
+
+def expand_events(
+    events: Sequence[Event] | str,
+    data: EventsData | str,
+) -> list[Event]:
+    """Reverse :func:`condense_events` — restore pooled content into events.
+
+    Args:
+        events: Condensed events (with pool index references), or a JSON-serialized
+            ``list[Event]``.
+        data: Events data returned by :func:`condense_events`, or a JSON-serialized
+            ``EventsData``.
+
+    Returns:
+        Events with full message inputs and call request messages restored.
+    """
+    if isinstance(events, str):
+        events = validate_events_json(events)
+    if isinstance(data, str):
+        raw = json.loads(data)
+        data = EventsData(
+            messages=validate_chat_messages(raw.get("messages", [])),
+            calls=raw.get("calls", []),
+        )
+    result = resolve_model_event_inputs(list(events), data["messages"])
+    result = resolve_model_event_calls(result, data["calls"])
+    return result
+
+
+def is_log_serializable(sample: EvalSample) -> bool:
+    """Whether every log writer can actually serialize this sample.
+
+    Uses the recorders' own serialization, probed at the deepest position a
+    writer places the sample: the `.eval` recorder writes it at the JSON root,
+    but the `.json` recorder writes the whole `EvalLog`, nesting each sample
+    two containers deeper (`EvalLog` -> `samples` list -> sample). The two
+    wrapper lists reproduce that nesting, so a sample accepted here cannot
+    fail later at flush time in either format.
+    """
+    try:
+        to_json_safe([[sample]], indent=None)
+        return True
+    except Exception:
+        return False
+
+
+def condense_sample(sample: EvalSample, log_images: bool = True) -> EvalSample:
+    """Reduce the storage size of the eval sample.
+
+    Reduce size by:
+    1. De-duplicating larger content fields (especially important for images
+       but also for message repeated over and over in the event stream)
+    2. Removing base64 encoded images if log_images is True
+
+    The de-duplication of content fields can be reversed by calling
+    `resolve_attachments()`. Removal of base64 encoded images is a
+    one-way operation.
+
+    Args:
+       sample (EvalSample): Eval sample to condense.
+       log_images (bool): Should base64 images be logged for this sample.
+
+    Returns:
+       EvalSample: Eval sample in condensed form.
+    """
+    existing_attachments = dict(sample.attachments)
+    attachments = dict(existing_attachments)
+    rewritten_attachments: set[str] = set()
+    events_fn = existing_attachments_content_fn(
+        existing_attachments,
+        rewritten_attachments,
+        events_attachment_fn(attachments, log_images),
+    )
+    messages_fn = existing_attachments_content_fn(
+        existing_attachments,
+        rewritten_attachments,
+        messages_attachment_fn(attachments, log_images),
+    )
+    # The events and messages walks rewrite content differently (events_fn
+    # pools long text as attachments; messages_fn leaves it inline), so they
+    # must not share a message cache: sample.messages contains the same
+    # objects/ids as event inputs and a shared cache would return
+    # event-walked results during the messages walk.
+    events_context = WalkContext(
+        message_cache={},
+        only_core=False,
+        media_fn=messages_fn,
+        call_message_cache={},
+    )
+    messages_context = WalkContext(message_cache={}, only_core=False)
+    condensed_events = walk_events(sample.events, events_fn, events_context)
+    retry_events_context = WalkContext(
+        message_cache={},
+        only_core=False,
+        media_fn=messages_fn,
+        call_message_cache={},
+    )
+    condensed_error_retries = (
+        [
+            retry.model_copy(
+                update={
+                    "events": walk_events(
+                        retry.events,
+                        events_fn,
+                        retry_events_context,
+                    )
+                    if retry.events is not None
+                    else None
+                }
+            )
+            for retry in sample.error_retries
+        ]
+        if sample.error_retries is not None
+        else None
+    )
+
+    # condense events
+    existing = sample.events_data
+    existing_context = WalkContext(message_cache={}, only_core=False)
+    existing_msgs = (
+        [
+            walk_chat_message(message, events_fn, existing_context)
+            for message in existing["messages"]
+        ]
+        if existing
+        else []
+    )
+    existing_calls = (
+        [
+            walk_json_value(call, events_fn, existing_context)
+            for call in existing["calls"]
+        ]
+        if existing
+        else []
+    )
+
+    msg_index = _build_msg_index(existing_msgs)
+    condensed_events, _, new_msgs = condense_model_event_inputs(
+        condensed_events, len(existing_msgs), msg_index
+    )
+    message_pool: list[ChatMessage] = [
+        *existing_msgs,
+        *(msg for _, msg in new_msgs),
+    ]
+
+    call_index = _build_call_index(existing_calls)
+    condensed_events, _, new_calls = condense_model_event_calls(
+        condensed_events, len(existing_calls), call_index
+    )
+    call_pool: list[JsonValue] = [
+        *existing_calls,
+        *(call_msg for _, call_msg in new_calls),
+    ]
+    events_data = EventsData(messages=message_pool, calls=call_pool)
+
+    condensed_sample = sample.model_copy(
+        update={
+            "input": walk_input(sample.input, messages_fn, messages_context),
+            "messages": walk_chat_messages(
+                sample.messages, messages_fn, messages_context
+            ),
+            "events": condensed_events,
+            "error_retries": condensed_error_retries,
+            "attachments": attachments,
+            "events_data": events_data,
+        }
+    )
+    # Rewrites can disagree across fields that share one attachment. Determine
+    # liveness only after every field is condensed so no surviving reference is
+    # orphaned; the full dump is the correctness cost of that final GC pass.
+    dumped_sample = condensed_sample.model_dump(mode="python", exclude={"attachments"})
+
+    # Refuse to produce a sample the log writer cannot serialize. pydantic-core
+    # enforces a hard recursion limit when writing JSON, and content nested
+    # beyond it (e.g. in un-walked `Any`-typed fields like store or metadata)
+    # is not rejected by the python-mode dump above — it would instead detonate
+    # later, when the recorder serializes the buffered sample at flush time,
+    # outside the sample-logging path that can degrade gracefully (see
+    # `log_sample` in _eval/task/run.py, which handles this error by logging a
+    # stripped record). Failing here keeps the failure attributable to one
+    # sample. The depth test only selects candidates: rejection is confirmed by
+    # the writers' own serialization, so content every log format can in fact
+    # write is never rejected (offline paths — convert, recover, log rewrite —
+    # call this on already-logged samples and must not start failing on them).
+    if exceeds_max_depth(
+        dumped_sample, MAX_SAMPLE_DUMP_DEPTH
+    ) and not is_log_serializable(condensed_sample):
+        raise SampleSerializationError(
+            f"Sample content (id: {sample.id}, epoch: {sample.epoch}) is nested "
+            "too deeply to be serialized to the eval log."
+        )
+
+    referenced_attachments = attachment_refs_from_value(dumped_sample)
+    return condensed_sample.model_copy(
+        update={
+            "attachments": {
+                hash: value
+                for hash, value in attachments.items()
+                if hash not in rewritten_attachments or hash in referenced_attachments
+            }
+        }
+    )
+
+
+def condense_event(
+    event: Event,
+    attachments: MutableMapping[str, str],
+    log_images: bool = True,
+    context: WalkContext | None = None,
+) -> Event:
+    event_fn = events_attachment_fn(attachments, log_images)
+    media_fn = messages_attachment_fn(attachments, log_images)
+    context = WalkContext(
+        message_cache=context["message_cache"] if context else {},
+        only_core=False,
+        media_fn=media_fn,
+    )
+    return walk_event(event, event_fn, context)
+
+
+def events_attachment_fn(
+    attachments: MutableMapping[str, str], log_images: bool = True
+) -> Callable[[str], str]:
+    create_attachment = attachment_fn(attachments)
+
+    # for events, we want to strip images when requested and
+    # create attachments for text > 100
+    def fn(text: str) -> str:
+        if not log_images and is_data_uri(text):
+            return BASE_64_DATA_REMOVED
+        elif len(text) > 100:
+            return create_attachment(text)
+        else:
+            return text
+
+    return fn
+
+
+def messages_attachment_fn(
+    attachments: MutableMapping[str, str], log_images: bool = True
+) -> Callable[[str], str]:
+    create_attachment = attachment_fn(attachments)
+
+    # for messages, we only want to handle images (either stripping
+    # them or turning them into attachments as required)
+    def fn(text: str) -> str:
+        if is_data_uri(text):
+            if log_images:
+                return create_attachment(text)
+            else:
+                return BASE_64_DATA_REMOVED
+        else:
+            return text
+
+    return fn
+
+
+def existing_attachments_content_fn(
+    existing: Mapping[str, str],
+    rewritten_attachments: set[str],
+    content_fn: Callable[[str], str],
+) -> Callable[[str], str]:
+    """Apply a content policy to values referenced by existing attachments."""
+
+    def fn(text: str) -> str:
+        if text.startswith(ATTACHMENT_PROTOCOL):
+            hash = text.removeprefix(ATTACHMENT_PROTOCOL)
+            value = existing.get(hash)
+            if value is not None:
+                rewritten = content_fn(value)
+                if rewritten != text:
+                    rewritten_attachments.add(hash)
+                return rewritten
+        return content_fn(text)
+
+    return fn
+
+
+def attachment_fn(attachments: MutableMapping[str, str]) -> Callable[[str], str]:
+    def create_attachment(text: str) -> str:
+        hash = mm3_hash(text)
+        attachments[hash] = text
+        return f"{ATTACHMENT_PROTOCOL}{hash}"
+
+    return create_attachment
+
+
+def resolve_attachment_fn(attachments: Mapping[str, str]) -> Callable[[str], str]:
+    """Content function that swaps `attachment://` refs for their content.
+
+    Refs missing from `attachments` are left as they are.
+    """
+
+    def content_fn(text: str) -> str:
+        # migrate previous flavor of content reference
+        CONTENT_PROTOCOL = "tc://"
+        if text.startswith(CONTENT_PROTOCOL):
+            text = text.replace(CONTENT_PROTOCOL, ATTACHMENT_PROTOCOL, 1)
+        if text.startswith(ATTACHMENT_PROTOCOL):
+            return attachments.get(text.replace(ATTACHMENT_PROTOCOL, "", 1), text)
+        else:
+            return text
+
+    return content_fn
+
+
+class _CreatedAttachment(NamedTuple):
+    """An attachment produced while walking one message."""
+
+    hash: str
+    content: str
+
+
+def _recording_attachment_fn(
+    inner: Callable[[str], str], created: list[_CreatedAttachment]
+) -> Callable[[str], str]:
+    """Wrap a content fn, recording (hash, content) for attachments it creates."""
+
+    def fn(text: str) -> str:
+        result = inner(text)
+        if result is not text and result.startswith(ATTACHMENT_PROTOCOL):
+            created.append(_CreatedAttachment(result[len(ATTACHMENT_PROTOCOL) :], text))
+        return result
+
+    return fn
+
+
+_CALL_WALK_SLOTS: Final = 8
+"""Retained request lineages per `CallWalkCache` (see `PrefixLineages`).
+
+Each generate stream produces two lineages per turn (the raw request, and
+the transcript-condensed form the timestamp update re-notifies), so 8 cover
+~4 interleaved streams with distinct request prefixes.
+"""
+
+
+_CALL_WALK_MAX_IDLE: Final = 4 * _CALL_WALK_SLOTS
+"""Prefix scans a lineage may go unmatched before it is dropped."""
+
+
+class _WalkedCallMessage(NamedTuple):
+    """One cached wire message: its walked form plus what walking created.
+
+    ``attachments`` records what walking this message created, so prefix
+    reuse can re-assert content that bounded-mode refcounting has since
+    pruned from the caller's attachment map.
+    """
+
+    walked: JsonValue
+    attachments: list[_CreatedAttachment]
+
+
+class CallWalkCache:
+    """Prefix cache for condensing model-call payloads into attachment refs.
+
+    Prefix-cached equivalent of :func:`walk_model_call`: consecutive calls
+    from one generate stream share their conversation prefix, so only the
+    divergent tail (plus non-message request fields and the response, which
+    change per notification) is walked. Requests are matched against recent
+    ones (see `PrefixLineages`); logged requests share message objects
+    across calls (see `CallMessageInterner`), so matching is mostly identity
+    checks.
+
+    Walked messages are shared by every condensed call that reuses them,
+    and lineages retain the requests' own message objects, so neither
+    requests nor condensed calls may be mutated in place.
+    """
+
+    def __init__(self) -> None:
+        self._lineages: PrefixLineages[CallMessageKey, _WalkedCallMessage] = (
+            PrefixLineages(_CALL_WALK_SLOTS, _CALL_WALK_MAX_IDLE)
+        )
+
+    def condense(
+        self,
+        call: ModelCall,
+        attachments: MutableMapping[str, str],
+        context: WalkContext,
+    ) -> ModelCall:
+        """Condense a model call's payload into attachment references.
+
+        Prefix messages reused from a cached lineage have their attachment
+        content re-asserted into ``attachments`` — bounded-mode refcounting
+        may have pruned it while the prefix text lives on in the
+        conversation.
+
+        Args:
+            call: Model call to condense.
+            attachments: Attachment map extracted content is written to.
+            context: Walk context (shared message cache); ``only_core``
+                leaves the call untouched, as in :func:`walk_model_call`.
+
+        Returns:
+            The condensed call.
+        """
+        if context.get("only_core") is True:
+            return call
+
+        msg_key = next((k for k in _CALL_MESSAGE_KEYS if k in call.request), None)
+        msgs = call.request.get(msg_key) if msg_key is not None else None
+        if msg_key is None or not isinstance(msgs, list) or not msgs:
+            return walk_model_call(call, events_attachment_fn(attachments), context)
+
+        match = self._lineages.match(msg_key, msgs)
+        entries = match.entries
+        for entry in entries:
+            for created in entry.attachments:
+                attachments[created.hash] = created.content
+
+        event_fn = events_attachment_fn(attachments)
+        for msg in msgs[match.length :]:
+            created_attachments: list[_CreatedAttachment] = []
+            walked = walk_json_value(
+                msg, _recording_attachment_fn(event_fn, created_attachments), context
+            )
+            entries.append(_WalkedCallMessage(walked, created_attachments))
+
+        self._lineages.record(match, list(msgs), entries)
+
+        rest = {k: v for k, v in call.request.items() if k != msg_key}
+        new_request: dict[str, JsonValue] = dict(
+            walk_json_dict(rest, event_fn, context)
+        )
+        new_request[msg_key] = [entry.walked for entry in entries]
+
+        return call.model_copy(
+            update={
+                "request": new_request,
+                "response": walk_json_dict(call.response, event_fn, context)
+                if call.response
+                else None,
+            }
+        )
+
+
+def resolve_sample_attachments(
+    sample: EvalSample,
+    resolve_attachments: bool | Literal["full", "core"] = "core",
+) -> EvalSample:
+    """Resolve content attachments (typically images) in sample.
+
+    Take 'attachment://*` references and resolve them to their
+    underlying content, then remove the 'attachments' entries that are no
+    longer referenced. "core" leaves `ModelEvent.call` condensed, so the
+    attachments its references still point at are retained; "full" resolves
+    everything and clears the field.
+
+    Args:
+       sample (EvalSample): Eval sample with attachments.
+       resolve_attachments: Should attachments be resolved. "core" means only resolving attachments in the core fields.
+
+    Returns:
+       EvalSample: Sample with attachment content resolved.
+    """
+    if resolve_attachments is False:
+        return sample
+
+    content_fn = resolve_attachment_fn(sample.attachments)
+    context = WalkContext(
+        message_cache={},
+        only_core=resolve_attachments == "core",
+    )
+
+    # Resolve pools before events — pool messages may contain attachment:// refs
+    ed = sample.events_data
+    msg_pool = ed["messages"] if ed else []
+    call_pool = ed["calls"] if ed else []
+
+    resolved_pool: list[ChatMessage] = [
+        walk_chat_message(v, content_fn, context) for v in msg_pool
+    ]
+    resolved_call_pool: list[JsonValue] = (
+        call_pool
+        if context.get("only_core")
+        else [walk_json_value(v, content_fn, context) for v in call_pool]
+    )
+
+    resolved_events = walk_events(sample.events, content_fn, context)
+    resolved_events = resolve_model_event_inputs(resolved_events, resolved_pool)
+    resolved_events = resolve_model_event_calls(resolved_events, resolved_call_pool)
+    retry_events_context = WalkContext(
+        message_cache={},
+        only_core=resolve_attachments == "core",
+    )
+    resolved_error_retries = (
+        [
+            retry.model_copy(
+                update={
+                    "events": walk_events(
+                        retry.events,
+                        content_fn,
+                        retry_events_context,
+                    )
+                    if retry.events is not None
+                    else None
+                }
+            )
+            for retry in sample.error_retries
+        ]
+        if sample.error_retries is not None
+        else None
+    )
+
+    resolved_sample = sample.model_copy(
+        update={
+            "input": walk_input(sample.input, content_fn, context),
+            "messages": walk_chat_messages(sample.messages, content_fn, context),
+            "events": resolved_events,
+            "error_retries": resolved_error_retries,
+            "attachments": {},
+            "events_data": None,
+        }
+    )
+
+    # "full" resolves every reference, so nothing can still point at the map.
+    if resolve_attachments != "core" or not sample.attachments:
+        return resolved_sample
+
+    # "core" leaves ModelEvent.call condensed, so its attachment:// refs
+    # survive into the resolved sample. Retain what they point at (the same
+    # liveness pass condense_sample runs) or they become unresolvable.
+    referenced_attachments = _sample_attachment_refs(resolved_sample)
+    if not referenced_attachments:
+        return resolved_sample
+    return resolved_sample.model_copy(
+        update={
+            "attachments": {
+                hash: value
+                for hash, value in sample.attachments.items()
+                if hash in referenced_attachments
+            }
+        }
+    )
+
+
+def _sample_attachment_refs(sample: EvalSample) -> set[str]:
+    """Collect refs from the sample's dump, dumping each shared message once.
+
+    Expanded pools share input and call request messages across model
+    events, so dumping them in place repeats them once per event.
+    """
+    messages: dict[int, ChatMessage] = {}
+    call_messages: dict[int, JsonValue] = {}
+
+    def without_shared(events: list[Event]) -> list[Event]:
+        stripped: list[Event] = []
+        for event in events:
+            if isinstance(event, ModelEvent):
+                messages.update((id(m), m) for m in event.input)
+                update: dict[str, object] = {"input": []}
+                if event.call is not None:
+                    request = event.call.request
+                    key = next((k for k in _CALL_MESSAGE_KEYS if k in request), None)
+                    msgs = request.get(key) if key is not None else None
+                    if isinstance(msgs, list):
+                        call_messages.update((id(m), m) for m in msgs)
+                        update["call"] = event.call.model_copy(
+                            update={
+                                "request": {
+                                    k: v for k, v in request.items() if k != key
+                                }
+                            }
+                        )
+                event = event.model_copy(update=update)
+            elif isinstance(event, (SubtaskEvent, ToolEvent)):
+                event = event.model_copy(
+                    update={"events": without_shared(event.events)}
+                )
+            stripped.append(event)
+        return stripped
+
+    stripped_sample = sample.model_copy(
+        update={
+            "events": without_shared(sample.events),
+            "error_retries": [
+                retry.model_copy(update={"events": without_shared(retry.events)})
+                if retry.events is not None
+                else retry
+                for retry in sample.error_retries
+            ]
+            if sample.error_retries is not None
+            else None,
+        }
+    )
+    return (
+        attachment_refs_from_value(
+            stripped_sample.model_dump(mode="python", exclude={"attachments"})
+        )
+        | attachment_refs_from_value(
+            _chat_message_list_adapter.dump_python(
+                list(messages.values()), mode="python"
+            )
+        )
+        | attachment_refs_from_value(list(call_messages.values()))
+    )
+
+
+def resolve_events_attachments(
+    events: list[Event],
+    attachments: Mapping[str, str],
+    resolve_attachments: bool | Literal["full", "core"] = "core",
+) -> list[Event]:
+    """Resolve ``attachment://`` references in a list of events.
+
+    The events must already have their message / call *pools* resolved
+    (the buffer history provider does this via
+    ``materialize_pooled_events``); this only swaps ``attachment://<hash>``
+    content references back to their underlying values from
+    ``attachments``.
+
+    Args:
+       events: Events (pool-resolved) that may carry ``attachment://`` refs.
+       attachments: Mapping of attachment hash -> underlying content.
+       resolve_attachments: Which fields to resolve. ``"core"`` (default)
+           leaves ``ModelEvent.call`` condensed — matching resident
+           in-memory events, whose model-call payloads stay condensed
+           after ``Transcript._process_event``. ``"full"`` / ``True``
+           also resolves the model call. ``False`` is a no-op.
+
+    Returns:
+       Events with attachment content resolved (a new list; inputs are
+       not mutated). Returns ``events`` unchanged when
+       ``resolve_attachments`` is ``False``.
+    """
+    if resolve_attachments is False:
+        return events
+
+    content_fn = resolve_attachment_fn(attachments)
+    context = WalkContext(message_cache={}, only_core=resolve_attachments == "core")
+    return walk_events(events, content_fn, context)
+
+
+def attachments_content_fn(
+    log_images: bool, max_length: int, attachments: MutableMapping[str, str]
+) -> Callable[[str], str]:
+    def create_attachment(text: str) -> str:
+        hash = mm3_hash(text)
+        attachments[hash] = text
+        return f"{ATTACHMENT_PROTOCOL}{hash}"
+
+    def content_fn(text: str) -> str:
+        if not log_images and is_data_uri(text):
+            return BASE_64_DATA_REMOVED
+        elif len(text) > max_length:
+            return create_attachment(text)
+        else:
+            return text
+
+    return content_fn
+
+
+def walk_events(
+    events: list[Event], content_fn: Callable[[str], str], context: WalkContext
+) -> list[Event]:
+    return [walk_event(event, content_fn, context) for event in events]
+
+
+def walk_event(
+    event: Event, content_fn: Callable[[str], str], context: WalkContext
+) -> Event:
+    if isinstance(event, SampleInitEvent):
+        return walk_sample_init_event(event, content_fn, context)
+    elif isinstance(event, ModelEvent):
+        return walk_model_event(event, content_fn, context)
+    elif isinstance(event, StateEvent):
+        return walk_state_event(event, content_fn, context)
+    elif isinstance(event, StoreEvent):
+        return walk_store_event(event, content_fn, context)
+    elif isinstance(event, SubtaskEvent):
+        return walk_subtask_event(event, content_fn, context)
+    elif isinstance(event, ToolEvent):
+        return walk_tool_event(event, content_fn, context)
+    elif isinstance(event, InfoEvent):
+        return walk_info_event(event, content_fn, context)
+    elif isinstance(event, CommunicationEvent):
+        return walk_communication_event(event, content_fn, context)
+    elif isinstance(event, SwarmEvent):
+        return walk_swarm_event(event, content_fn, context)
+    else:
+        return event
+
+
+def walk_subtask_event(
+    event: SubtaskEvent, content_fn: Callable[[str], str], context: WalkContext
+) -> SubtaskEvent:
+    return event.model_copy(
+        update=dict(events=walk_nested_events(event.events, content_fn, context))
+    )
+
+
+def walk_tool_event(
+    event: ToolEvent,
+    content_fn: Callable[[str], str],
+    context: WalkContext,
+    *,
+    walk_result: bool = True,
+) -> ToolEvent:
+    return event.model_copy(
+        update=dict(
+            arguments=walk_json_dict(event.arguments, content_fn, context),
+            result=walk_tool_result(event.result, context.get("media_fn", content_fn))
+            if walk_result
+            else event.result,
+            events=walk_nested_events(event.events, content_fn, context),
+        )
+    )
+
+
+def walk_nested_events(
+    events: list[Event], content_fn: Callable[[str], str], context: WalkContext
+) -> list[Event]:
+    """Walk the deprecated nested ``events`` of a tool or subtask event.
+
+    Nested events are typed ``list[Any]`` and reload from a log as plain
+    dicts, which ``walk_event`` leaves untouched, so a reference written
+    into a nested tool result could never be resolved on read. The results
+    of nested tool events therefore stay inline.
+    """
+    return [
+        walk_tool_event(event, content_fn, context, walk_result=False)
+        if isinstance(event, ToolEvent)
+        else walk_event(event, content_fn, context)
+        for event in events
+    ]
+
+
+_MediaContent = ContentImage | ContentAudio | ContentVideo | ContentDocument
+
+
+def walk_tool_result(
+    result: ToolResult, content_fn: Callable[[str], str]
+) -> ToolResult:
+    """Apply ``content_fn`` to the media in a tool result.
+
+    Only media (image, audio, video, document) is walked, through the same
+    ``walk_media_content`` as message content and with the media content
+    function from ``WalkContext`` when condensing, so a result image is pooled
+    or removed exactly as the same image in a message. Text (a ``str`` result
+    or ``ContentText``) stays inline: the same text is already inline in the
+    tool message the model sees next, so pooling it would add an attachment
+    without removing a copy.
+    """
+    if isinstance(result, list):
+        return [
+            walk_media_content(content, content_fn)
+            if isinstance(content, _MediaContent)
+            else content
+            for content in result
+        ]
+    elif isinstance(result, _MediaContent):
+        return walk_media_content(result, content_fn)
+    else:
+        return result
+
+
+def walk_media_content(
+    content: _MediaContent, content_fn: Callable[[str], str]
+) -> _MediaContent:
+    """Apply ``content_fn`` to the source field of a media content block."""
+    if isinstance(content, ContentImage):
+        return content.model_copy(update=dict(image=content_fn(content.image)))
+    elif isinstance(content, ContentAudio):
+        return content.model_copy(update=dict(audio=content_fn(content.audio)))
+    elif isinstance(content, ContentVideo):
+        return content.model_copy(update=dict(video=content_fn(content.video)))
+    else:
+        return content.model_copy(update=dict(document=content_fn(content.document)))
+
+
+def walk_info_event(
+    event: InfoEvent, content_fn: Callable[[str], str], context: WalkContext
+) -> InfoEvent:
+    return event.model_copy(
+        update=dict(data=walk_json_value(event.data, content_fn, context))
+    )
+
+
+def walk_communication_event(
+    event: CommunicationEvent, content_fn: Callable[[str], str], context: WalkContext
+) -> CommunicationEvent:
+    send = event.send
+    if send is not None:
+        record = send.record
+        if record.content is not None:
+            record = record.model_copy(update=dict(content=content_fn(record.content)))
+        rejected = send.rejected
+        if rejected is not None:
+            rejected = rejected.model_copy(
+                update=dict(reason=content_fn(rejected.reason))
+            )
+        send = send.model_copy(update=dict(record=record, rejected=rejected))
+    return event.model_copy(
+        update=dict(
+            send=send,
+            data=walk_json_dict(event.data, content_fn, context),
+        )
+    )
+
+
+def walk_swarm_event(
+    event: SwarmEvent, content_fn: Callable[[str], str], context: WalkContext
+) -> SwarmEvent:
+    return event.model_copy(
+        update=dict(data=walk_json_dict(event.data, content_fn, context))
+    )
+
+
+def walk_sample_init_event(
+    event: SampleInitEvent, content_fn: Callable[[str], str], context: WalkContext
+) -> SampleInitEvent:
+    return event.model_copy(
+        update=dict(
+            sample=walk_sample(event.sample, content_fn, context),
+            state=walk_json_value(event.state, content_fn, context),
+        )
+    )
+
+
+def walk_sample(
+    sample: Sample, content_fn: Callable[[str], str], context: WalkContext
+) -> Sample:
+    if isinstance(sample.input, str):
+        return sample.model_copy(
+            update=dict(input=walk_json_value(sample.input, content_fn, context))
+        )
+    else:
+        return sample.model_copy(
+            update=dict(input=walk_chat_messages(sample.input, content_fn, context))
+        )
+
+
+def walk_model_event(
+    event: ModelEvent, content_fn: Callable[[str], str], context: WalkContext
+) -> ModelEvent:
+    return event.model_copy(
+        update=dict(
+            tools=walk_tools(event.tools, content_fn, context),
+            input=walk_chat_messages(event.input, content_fn, context),
+            output=walk_model_output(event.output, content_fn, context),
+            call=walk_model_call(event.call, content_fn, context),
+        ),
+    )
+
+
+def walk_model_output(
+    output: ModelOutput, content_fn: Callable[[str], str], context: WalkContext
+) -> ModelOutput:
+    return output.model_copy(
+        update=dict(
+            choices=[
+                choice.model_copy(
+                    update=dict(
+                        message=walk_chat_message(choice.message, content_fn, context)
+                    )
+                )
+                for choice in output.choices
+            ]
+        )
+    )
+
+
+@overload
+def walk_model_call(
+    call: ModelCall, content_fn: Callable[[str], str], context: WalkContext
+) -> ModelCall: ...
+
+
+@overload
+def walk_model_call(
+    call: None, content_fn: Callable[[str], str], context: WalkContext
+) -> None: ...
+
+
+@overload
+def walk_model_call(
+    call: ModelCall | None, content_fn: Callable[[str], str], context: WalkContext
+) -> ModelCall | None: ...
+
+
+def walk_model_call(
+    call: ModelCall | None, content_fn: Callable[[str], str], context: WalkContext
+) -> ModelCall | None:
+    if context.get("only_core") is True:
+        return call
+    if call:
+        return call.model_copy(
+            update={
+                "request": _walk_call_request(call.request, content_fn, context),
+                "response": walk_json_dict(call.response, content_fn, context)
+                if call.response
+                else None,
+            }
+        )
+    else:
+        return None
+
+
+def _walk_call_request(
+    request: dict[str, JsonValue],
+    content_fn: Callable[[str], str],
+    context: WalkContext,
+) -> dict[str, JsonValue]:
+    cache = context.get("call_message_cache")
+    msg_key = next((k for k in _CALL_MESSAGE_KEYS if k in request), None)
+    msgs = request.get(msg_key) if msg_key is not None else None
+    if cache is None or msg_key is None or not isinstance(msgs, list):
+        return walk_json_dict(request, content_fn, context)
+
+    walked_msgs: list[JsonValue] | None = None
+    for i, msg in enumerate(msgs):
+        hit = cache.get(id(msg))
+        if hit is not None and hit[0] is msg:
+            walked = hit[1]
+        else:
+            walked = walk_json_value(msg, content_fn, context, depth=2)
+            cache[id(msg)] = (msg, walked)
+        if walked is not msg:
+            if walked_msgs is None:
+                walked_msgs = list(msgs)
+            walked_msgs[i] = walked
+    rest = {k: v for k, v in request.items() if k != msg_key}
+    walked_rest = walk_json_dict(rest, content_fn, context)
+    if walked_msgs is None and walked_rest is rest:
+        return request
+    new_msgs = walked_msgs if walked_msgs is not None else msgs
+    return {k: new_msgs if k == msg_key else walked_rest[k] for k in request}
+
+
+def walk_state_event(
+    event: StateEvent, content_fn: Callable[[str], str], context: WalkContext
+) -> StateEvent:
+    event = event.model_copy(
+        update=dict(
+            changes=[
+                walk_state_json_change(change, content_fn, context)
+                for change in event.changes
+            ]
+        )
+    )
+    return event
+
+
+def walk_store_event(
+    event: StoreEvent, content_fn: Callable[[str], str], context: WalkContext
+) -> StoreEvent:
+    event = event.model_copy(
+        update=dict(
+            changes=[
+                walk_state_json_change(change, content_fn, context)
+                for change in event.changes
+            ]
+        )
+    )
+    return event
+
+
+def walk_state_json_change(
+    change: JsonChange, content_fn: Callable[[str], str], context: WalkContext
+) -> JsonChange:
+    return change.model_copy(
+        update=dict(value=walk_json_value(change.value, content_fn, context))
+    )
+
+
+MAX_JSON_VALUE_DEPTH = 240
+"""Maximum container nesting depth walked (and preserved) in JSON values.
+
+Deeper content is replaced with `JSON_VALUE_MAX_DEPTH_EXCEEDED`: the walk
+recurses per nesting level (unbounded depth would exhaust the interpreter
+stack), and pydantic-core refuses to serialize structures nested beyond a
+hard limit of ~255, which would otherwise crash sample logging. Set as close
+to that limit as the nesting a value's position within its sample adds
+(events/messages wrapper containers, well under 10 levels) allows, so values
+that serialize today keep round-tripping; it also leaves ample headroom over
+`MAX_TOOL_CALL_ARGUMENTS_DEPTH` (100), so depth-bounded tool arguments are
+never truncated here.
+"""
+
+JSON_VALUE_MAX_DEPTH_EXCEEDED = "<max nesting depth exceeded>"
+"""Marker substituted for JSON content nested beyond `MAX_JSON_VALUE_DEPTH`."""
+
+
+def walk_json_value(
+    value: JsonValue,
+    content_fn: Callable[[str], str],
+    context: WalkContext,
+    depth: int = 0,
+) -> JsonValue:
+    if isinstance(value, str):
+        return content_fn(value)
+    elif isinstance(value, (list, dict)):
+        if depth >= MAX_JSON_VALUE_DEPTH:
+            return JSON_VALUE_MAX_DEPTH_EXCEEDED
+        elif isinstance(value, list):
+            return walk_json_list(value, content_fn, context, depth)
+        else:
+            return walk_json_dict(value, content_fn, context, depth)
+    else:
+        return value
+
+
+def walk_json_list(
+    value: list[JsonValue],
+    content_fn: Callable[[str], str],
+    context: WalkContext,
+    depth: int = 0,
+) -> list[JsonValue]:
+    walked_list: list[JsonValue] | None = None
+
+    for i, v in enumerate(value):
+        walked = walk_json_value(v, content_fn, context, depth + 1)
+        if walked is not v:
+            if walked_list is None:
+                walked_list = list(value)
+            walked_list[i] = walked
+
+    return walked_list if walked_list is not None else value
+
+
+def walk_json_dict(
+    value: dict[str, JsonValue],
+    content_fn: Callable[[str], str],
+    context: WalkContext,
+    depth: int = 0,
+) -> dict[str, JsonValue]:
+    walked_dict: dict[str, JsonValue] | None = None
+
+    for k, v in value.items():
+        walked = walk_json_value(v, content_fn, context, depth + 1)
+        if walked is not v:
+            if walked_dict is None:
+                walked_dict = value.copy()
+            walked_dict[k] = walked
+
+    return walked_dict if walked_dict is not None else value
+
+
+def walk_input(
+    input: str | list[ChatMessage],
+    content_fn: Callable[[str], str],
+    context: WalkContext,
+) -> str | list[ChatMessage]:
+    if isinstance(input, str):
+        return input
+    else:
+        return walk_chat_messages(input, content_fn, context)
+
+
+def walk_chat_messages(
+    messages: list[ChatMessage],
+    content_fn: Callable[[str], str],
+    context: WalkContext,
+) -> list[ChatMessage]:
+    return [walk_chat_message(message, content_fn, context) for message in messages]
+
+
+def walk_chat_message(
+    message: ChatMessage, content_fn: Callable[[str], str], context: WalkContext
+) -> ChatMessage:
+    cache = context.get("message_cache")
+    if cache is not None and message.id is not None:
+        hit = cache.get(message.id)
+        if hit is not None:
+            pre_walk, walked = hit
+            if pre_walk is message:
+                return walked
+            # snapshots give one id several versions, some == but logged
+            # differently (True and 1), so compare what the log writes; a
+            # match re-keys the entry so later sightings hit by identity
+            logged = logged_json(message)
+            if logged is not None and logged == logged_json(pre_walk):
+                cache[message.id] = (message, walked)
+                return walked
+    if isinstance(message.content, str):
+        res = message.model_copy(update=dict(content=content_fn(message.content)))
+    else:
+        res = message.model_copy(
+            update=dict(
+                tool_calls=[
+                    walk_tool_call(tool_call, content_fn, context)
+                    for tool_call in message.tool_calls
+                ]
+                if isinstance(message, ChatMessageAssistant) and message.tool_calls
+                else None,
+                content=[
+                    walk_content(content, content_fn, context)
+                    for content in message.content
+                ],
+            )
+        )
+    if cache is not None and message.id is not None:
+        cache[message.id] = (message, res)
+    return res
+
+
+def walk_content(
+    content: Content, content_fn: Callable[[str], str], context: WalkContext
+) -> Content:
+    if isinstance(content, ContentText):
+        return content.model_copy(update=dict(text=content_fn(content.text)))
+    elif isinstance(content, _MediaContent):
+        return walk_media_content(content, content_fn)
+    elif isinstance(content, ContentReasoning):
+        return content.model_copy(update=dict(reasoning=content_fn(content.reasoning)))
+    elif isinstance(content, ContentToolUse):
+        return content.model_copy(
+            update=dict(
+                arguments=walk_json_value(content.arguments, content_fn, context),
+                result=walk_json_value(content.result, content_fn, context),
+                error=content_fn(content.error) if content.error else content.error,
+            )
+        )
+    elif isinstance(content, ContentData):
+        return content.model_copy(
+            update=dict(data=walk_json_value(content.data, content_fn, context))
+        )
+
+
+def walk_tools(
+    tools: list[ToolInfo], content_fn: Callable[[str], str], context: WalkContext
+) -> list[ToolInfo]:
+    return [
+        tool.model_copy(
+            update=dict(
+                description=content_fn(tool.description),
+            )
+        )
+        for tool in tools
+    ]
+
+
+def walk_tool_call(
+    tool_call: ToolCall, content_fn: Callable[[str], str], context: WalkContext
+) -> ToolCall:
+    return ToolCall(
+        id=tool_call.id,
+        function=tool_call.function,
+        arguments=walk_json_dict(tool_call.arguments, content_fn, context),
+        parse_error=tool_call.parse_error,
+        view=tool_call.view.model_copy(
+            update=dict(
+                # ToolCallContent.content is a non-optional str (default ""),
+                # so preserve an empty content as "" — nulling it here breaks
+                # readback validation (e.g. title-only lifecycle-tool views).
+                content=content_fn(tool_call.view.content)
+                if tool_call.view.content
+                else tool_call.view.content,
+            )
+        )
+        if tool_call.view
+        else None,
+        type=tool_call.type,
+    )

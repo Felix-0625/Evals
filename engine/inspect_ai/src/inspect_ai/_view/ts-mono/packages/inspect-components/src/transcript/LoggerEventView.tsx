@@ -1,0 +1,41 @@
+import clsx from "clsx";
+import { FC } from "react";
+
+import type { LoggerEvent } from "@tsmono/inspect-common/types";
+import { MetaDataGrid } from "@tsmono/inspect-components/content";
+import { logLevelIcon } from "@tsmono/react/icons";
+import { parseJsonRecord } from "@tsmono/util";
+
+import { EventRow } from "./event/EventRow";
+import styles from "./LoggerEventView.module.css";
+import { EventNode } from "./types";
+
+interface LoggerEventViewProps {
+  eventNode: EventNode<LoggerEvent>;
+  className?: string;
+}
+
+export const LoggerEventView: FC<LoggerEventViewProps> = ({
+  eventNode,
+  className,
+}) => {
+  const event = eventNode.event;
+  const obj = parseJsonRecord(event.message.message);
+  return (
+    <EventRow
+      eventNodeId={eventNode.id}
+      className={className}
+      title={event.message.level}
+      icon={logLevelIcon(event.message.level) ?? "info"}
+    >
+      <div className={clsx("text-size-base", styles.grid)}>
+        <div className={clsx("text-size-smaller")}>
+          {obj ? <MetaDataGrid entries={obj} /> : event.message.message}
+        </div>
+        <div className={clsx("text-size-smaller", "text-style-secondary")}>
+          {event.message.filename}:{event.message.lineno}
+        </div>
+      </div>
+    </EventRow>
+  );
+};

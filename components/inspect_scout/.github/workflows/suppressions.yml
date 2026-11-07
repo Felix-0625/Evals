@@ -1,0 +1,35 @@
+# Suppression ledger gate — see scripts/check_suppressions.py and the
+# "Suppression gate" section in AGENTS.md. Enforcement only: it runs
+# fine with the read-only token fork PRs get. The PR delta comment is
+# posted by suppressions-comment.yml (pull_request_target), which needs a
+# write token — keep the two concerns in their separate workflows.
+name: Suppressions
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+      - "release/**"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  suppressions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The gate is stdlib-only by design: no dependency install needed.
+      # py-test in build.yaml runs its tests from uv.lock.
+      - name: Check suppressions ledger
+        run: python3 scripts/check_suppressions.py

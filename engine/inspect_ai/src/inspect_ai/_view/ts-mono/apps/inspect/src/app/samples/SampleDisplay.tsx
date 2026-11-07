@@ -1,0 +1,1600 @@
+import clsx from "clsx";
+import {
+  FC,
+  Fragment,
+  MouseEvent,
+  ReactNode,
+  RefObject,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { useNavigate } from "react-router";
+
+import { EvalSample, EvalSpec } from "@tsmono/inspect-common/types";
+import { modelRoleNames } from "@tsmono/inspect-common/utils";
+import {
+  ChatViewRowsVirtualList,
+  type MessageRow,
+} from "@tsmono/inspect-components/chat";
+import {
+  DisplayModeContext,
+  RecordTree,
+} from "@tsmono/inspect-components/content";
+import {
+  hasEventTimestamps,
+  SampleActivityPanel,
+} from "@tsmono/inspect-components/sample-activity";
+import { SelectTool } from "@tsmono/inspect-components/selection";
+import {
+  dynamicDefaultExcludeEvents,
+  eventsToStr,
+  type TranscriptLayoutRightRailProps,
+} from "@tsmono/inspect-components/transcript";
+import type { SearchScope } from "@tsmono/inspect-components/transcript-search";
+import {
+  buildArgsByModel,
+  buildArgsByRole,
+  buildConfigsByModel,
+  buildConfigsByRole,
+  fmtClock,
+  fmtCompactDuration,
+  MetaItem,
+  UsagePanel,
+} from "@tsmono/inspect-components/usage";
+import {
+  ActivityRail,
+  ANSIDisplay,
+  Card,
+  CardBody,
+  CardHeader,
+  ErrorPanel,
+  LoadingBar,
+  NoContentsPanel,
+  RailDock,
+  StickyScroll,
+  TabPanel,
+  TabSet,
+  ToolButton,
+  ToolDropdownButton,
+  type ActivityRailItem,
+} from "@tsmono/react/components";
+import {
+  useChromeNavOwnership,
+  useCopyToClipboard,
+  useDocumentTitleText,
+  useElementHeight,
+  useEventListener,
+  useUnmount,
+  useVisitId,
+} from "@tsmono/react/hooks";
+import { IconName } from "@tsmono/react/icons";
+import { openRouteInNewTab } from "@tsmono/react/routing";
+import { isHostedEnvironment, isVscode } from "@tsmono/util";
+
+import { Events } from "../../@types/extraInspect";
+import { getApi } from "../../app_config";
+import { SampleSummary } from "../../client/api/types";
+import {
+  kSampleActivityTabId,
+  kSampleErrorTabId,
+  kSampleInfoTabId,
+  kSampleJsonTabId,
+  kSampleMessagesTabId,
+  kSampleRetriesTabId,
+  kSampleScoringTabId,
+  kSampleTerminalsTabId,
+  kSampleTranscriptTabId,
+  sampleTabAlias,
+} from "../../constants";
+import {
+  kDefaultMessageRowOptions,
+  messagesFromEvents,
+  useMessagesExport,
+  useSampleMessages,
+} from "../../log_data";
+import { documentTitle } from "../../state/actions";
+import {
+  useSelectedEvalSampleData,
+  useSelectedLogDetails,
+  useSelectedSampleSummary,
+} from "../../state/hooks";
+import { useStore } from "../../state/store";
+import { cssVars } from "../../utils/cssVars";
+import { formatDateTime } from "../../utils/format";
+import { useCurrentSampleHandle } from "../routing/currentSelection";
+import { useSampleDetailNavigation } from "../routing/sampleNavigation";
+import {
+  printSampleUrl,
+  sampleEventUrl,
+  toFullUrl,
+  useFullSampleMessageUrlBuilder,
+  useLogOrSampleRouteParams,
+  useRoutePrefix,
+  useSampleUrlBuilder,
+} from "../routing/url";
+
+import styles from "./SampleDisplay.module.css";
+import { SampleJSONView } from "./SampleJSONView";
+import { SampleRetriedErrors } from "./SampleRetriedErrors";
+import { SampleSummaryView } from "./SampleSummaryView";
+import { ScansSidebarPanel } from "./scans/ScansSidebarPanel";
+import { useSampleScans } from "./scans/useSampleScans";
+import { SampleScoresView } from "./scores/SampleScoresView";
+import { AgentPicker } from "./terminals/AgentPicker";
+import { storeCasts } from "./terminals/asciicast";
+import {
+  buildTerminalSample,
+  parseTerminalCasts,
+} from "./terminals/terminalModel";
+import { TerminalsView, type TerminalsResume } from "./terminals/TerminalsView";
+import { ChunkedTranscriptPanel } from "./transcript/chunked/ChunkedTranscriptPanel";
+import { useTranscriptFilter } from "./transcript/hooks";
+import { useInspectSearchContext } from "./transcript/search/inspectSearchAdapters";
+import { mergeTranscriptLabelContext } from "./transcript/search/mergeTranscriptLabelContext";
+import { SearchPanelSlot } from "./transcript/search/SearchPanelSlot";
+import { useInspectSearchReferenceLabels } from "./transcript/search/useInspectSearchReferenceLabels";
+import { TranscriptFilterPopover } from "./transcript/TranscriptFilter";
+import { TranscriptPanel } from "./transcript/TranscriptPanel";
+import {
+  useEvidenceSelection,
+  type EvidenceFormat,
+} from "./useEvidenceSelection";
+
+interface SampleDisplayProps {
+  id: string;
+  scrollRef: RefObject<HTMLDivElement | null>;
+  showActivity: boolean;
+  focusOnLoad?: boolean;
+}
+
+type ActivityRailItemId = "search" | "scans";
+
+// stable empty rows while the messages read is pending, so the list's
+// props don't churn per render
+const kNoMessageRows: MessageRow[] = [];
+/**
+ * Component to display a sample with relevant context and visibility control.
+ */
+export const SampleDisplay: FC<SampleDisplayProps> = ({
+  id,
+  scrollRef,
+  showActivity,
+  focusOnLoad,
+}) => {
+  // Tab ids
+  const baseId = `sample-display`;
+
+  const prefix = useRoutePrefix();
+  const sampleData = useSelectedEvalSampleData();
+  const sample = sampleData.sample;
+  const eventsCleared = sampleData.eventsCleared;
+
+  const runningSampleData = sampleData.running;
+  const backfilling = sampleData.backfilling;
+
+  const logDetails = useSelectedLogDetails();
+  const evalSpec = logDetails?.eval;
+  useDocumentTitleText(documentTitle({ evalSpec, sample }));
+
+  // Selected tab handling
+  const selectedTab = useStore((state) => state.app.tabs.sample);
+  const setSelectedTab = useStore((state) => state.appActions.setSampleTab);
+
+  // A sample with no events has no transcript to show; default to the
+  // messages tab when its body settles. (Chunked samples carry an empty
+  // shell `events` array but window their transcript separately.)
+  const isChunked = sampleData.chunked !== undefined;
+  // eslint-disable-next-line tsmono/no-raw-use-effect -- baselined at rule introduction; migrate to a named hook or derived state
+  useEffect(() => {
+    if (sample !== undefined && sample.events.length < 1 && !isChunked) {
+      setSelectedTab(kSampleMessagesTabId);
+    }
+  }, [sample, isChunked, setSelectedTab]);
+
+  // Per-tab scroll positions persist while tabbing within one VISIT to a
+  // sample: each tab's VirtualList snapshot is keyed by the visit, so a
+  // later return to the same sample (or a hop to a sibling) can never
+  // restore this visit's offsets — a fresh visit starts at the top.
+  const visitHandle = useCurrentSampleHandle();
+  const visitId = useVisitId(
+    `${visitHandle?.logFile}-${visitHandle?.id}-${visitHandle?.epoch}`
+  );
+  const transcriptListId = `${baseId}-transcript-display-${id}-${visitId}`;
+  const chatListId = `${baseId}-chat-${id}-${visitId}`;
+  const removeBagsByPrefix = useStore(
+    (state) => state.appActions.removeBagsByPrefix
+  );
+  // eslint-disable-next-line tsmono/no-raw-use-effect -- baselined at rule introduction; migrate to a named hook or derived state
+  useEffect(() => {
+    // Drop the visit's snapshot bags when it ends (identity change or
+    // unmount) — the keys are unreachable afterwards, this is only garbage
+    // collection. Prefixes cover the dynamic suffixes on these bag names
+    // (the transcript's `:<timeline>` selection, branch ids, etc.).
+    const snapshotBagPrefixes = [`chat-${chatListId}`, transcriptListId];
+    return () => {
+      for (const prefix of snapshotBagPrefixes) {
+        removeBagsByPrefix(prefix);
+      }
+    };
+  }, [chatListId, transcriptListId, removeBagsByPrefix]);
+
+  // Navigation hook for URL updates
+  const navigate = useNavigate();
+
+  const tabsRef: RefObject<HTMLUListElement | null> = useRef(null);
+  const tabsHeight = useElementHeight(tabsRef);
+
+  const selectedSampleSummary = useSelectedSampleSummary();
+
+  // Consolidate the events into the proper list whether running or not
+  const sampleEvents = sample?.events || runningSampleData;
+
+  // Is the sample running?
+  const running = useMemo(() => {
+    return isRunning(
+      selectedSampleSummary,
+      runningSampleData,
+      sampleData.status
+    );
+  }, [selectedSampleSummary, runningSampleData, sampleData.status]);
+
+  // Get all URL parameters at component level
+  const {
+    logPath: urlLogPath,
+    id: urlSampleId,
+    epoch: urlEpoch,
+    sampleTabId,
+  } = useLogOrSampleRouteParams();
+
+  // Reset tab to default when this sample view unmounts
+  const clearSampleTab = useStore((state) => state.appActions.clearSampleTab);
+  useUnmount(() => {
+    clearSampleTab();
+  });
+
+  // Use sampleTabId from parsed route if available, otherwise use the one from state
+  const routedTab = sampleTabId || selectedTab;
+  const effectiveSelectedTab = routedTab
+    ? sampleTabAlias(routedTab)
+    : routedTab;
+
+  // The Messages tab's rows, assembled by the data layer. Which feed serves
+  // the conversation (monolith fetch, chunked hydration, live stream) is
+  // subsystem-private; the tab-open gate keeps chunked hydration from ever
+  // being paid at sample open.
+  const sampleHandle = useCurrentSampleHandle();
+
+  // Dynamic Default event-filter exclusions: store events with rich renderers
+  // (e.g. human-baseline terminal sessions) are visible by default. Chunked
+  // transcripts stream events lazily, so they keep the static defaults.
+  const defaultExcludeEvents = useMemo(
+    () => dynamicDefaultExcludeEvents(sampleEvents),
+    [sampleEvents]
+  );
+  const messagesTabOpen = effectiveSelectedTab === kSampleMessagesTabId;
+  const sampleDetailNavigation = useSampleDetailNavigation();
+  const sampleMessages = useSampleMessages(
+    sampleHandle,
+    sampleData,
+    messagesTabOpen,
+    running,
+    // `?message=` is also set by transcript-bound links (scan refs, transcript
+    // search hits), and the settled read stays activated once this tab has been
+    // opened — without the gate those ids would drain pages for a hidden tab.
+    messagesTabOpen ? sampleDetailNavigation.message : null
+  );
+  const exportMessages = useMessagesExport(sampleData);
+
+  // Focus the panel when it loads
+  // eslint-disable-next-line tsmono/no-raw-use-effect -- baselined at rule introduction; migrate to a named hook or derived state
+  useEffect(() => {
+    if (!focusOnLoad) return;
+    const id = setTimeout(() => scrollRef.current?.focus(), 10);
+    return () => clearTimeout(id);
+  }, [focusOnLoad, scrollRef]);
+
+  // Tab selection
+  const sampleUrlBuilder = useSampleUrlBuilder();
+  const sampleTabHref = (tabId: string) =>
+    urlLogPath
+      ? toFullUrl(sampleUrlBuilder(urlLogPath, urlSampleId, urlEpoch, tabId))
+      : undefined;
+  const onSelectedTab = useCallback(
+    (e: MouseEvent<HTMLElement>) => {
+      const el = e.currentTarget;
+      const id = el.id;
+      setSelectedTab(id);
+
+      // Use navigation hook to update URL with tab
+      if (id !== sampleTabId && urlLogPath) {
+        const url = sampleUrlBuilder(urlLogPath, urlSampleId, urlEpoch, id);
+        navigate(url);
+      }
+    },
+    [
+      setSelectedTab,
+      sampleTabId,
+      urlLogPath,
+      sampleUrlBuilder,
+      urlSampleId,
+      urlEpoch,
+      navigate,
+    ]
+  );
+
+  const setNativeFind = useStore((state) => state.appActions.setNativeFind);
+
+  // Absolute URL (origin + host path + hash route): ChatMessage copies this
+  // value to the clipboard as a shareable link.
+  const getMessageUrl = useFullSampleMessageUrlBuilder();
+
+  // Stable option objects so memoized ChatMessageRow rows don't re-render on
+  // every streaming poll just because these were fresh literals each render.
+  const chatDisplay = useMemo(() => ({ indented: true, formatDateTime }), []);
+  const chatLinking = useMemo(
+    () => ({ enabled: isHostedEnvironment(), getMessageUrl }),
+    [getMessageUrl]
+  );
+  // Derived from the fold options: the rows arrive pre-folded and numbered
+  // by kDefaultMessageRowOptions, and render-side tool options must agree
+  // with them or block numbering and rendering diverge.
+  const chatTools = useMemo(
+    () => ({ callStyle: kDefaultMessageRowOptions.toolCallStyle }),
+    []
+  );
+
+  // The casts (multi-MB strings) parse once per store; a running sample's
+  // event polls only redo the join. Memoised for that identity, not speed.
+  const sampleStore = sample?.store;
+  const terminalCasts = useMemo(() => {
+    const casts = sampleStore ? storeCasts(sampleStore) : [];
+    return casts.length > 0 ? parseTerminalCasts(casts) : undefined;
+  }, [sampleStore]);
+  const terminalSample = useMemo(
+    () =>
+      terminalCasts
+        ? buildTerminalSample(terminalCasts, sampleEvents)
+        : undefined,
+    [terminalCasts, sampleEvents]
+  );
+  const [pickedTerminalAgent, setPickedTerminalAgent] = useState<string>();
+  const [terminalsFill, setTerminalsFill] = useState(false);
+  const terminalsKey = sample
+    ? sample.uuid || `${sample.id}:${sample.epoch}`
+    : undefined;
+  // Where this sample's terminals left off when the tab was last left.
+  const [terminalsResume, setTerminalsResume] = useState<{
+    key: string;
+    resume: TerminalsResume;
+  }>();
+  const terminalAgent = terminalSample
+    ? (terminalSample.agents.find(
+        (agent) => agent.id === pickedTerminalAgent
+      ) ?? terminalSample.agents[0])
+    : undefined;
+  const sampleUsages = usageViewsForSample(`${baseId}-${id}`, sample, evalSpec);
+  const sampleMetadatas = metadataViewsForSample(
+    `${baseId}-${id}`,
+    // The helper only forwards scrollRef into JSX props (RecordTree
+    // scrollRef={...}); it never reads .current during render.
+    // eslint-disable-next-line react-hooks/refs
+    scrollRef,
+    sample
+  );
+
+  const tabsetId = `task-sample-details-tab-${id}`;
+
+  const isShowing = useStore((state) => state.app.dialogs.transcriptFilter);
+  const setShowing = useStore(
+    (state) => state.appActions.setShowingTranscriptFilterDialog
+  );
+
+  const displayMode = useStore((state) => state.app.displayMode);
+  const setDisplayMode = useStore((state) => state.appActions.setDisplayMode);
+
+  const [filterButtonEl, setFilterButtonEl] =
+    useState<HTMLButtonElement | null>(null);
+  const optionsRef = useRef<HTMLButtonElement | null>(null);
+
+  // Inline single-sample routes omit id/epoch; the current handle derives them.
+  const printLogPath = urlLogPath;
+  const printSampleId = urlSampleId ?? sampleHandle?.id.toString();
+  const printEpoch = urlEpoch ?? sampleHandle?.epoch.toString();
+
+  // Evidence selection: with rows selected, Copy/Download/Print act on them.
+  const evidence = useEvidenceSelection({
+    handle: visitHandle,
+    tab: effectiveSelectedTab,
+    selectable:
+      !isChunked &&
+      (effectiveSelectedTab === kSampleTranscriptTabId
+        ? sampleEvents.length > 0
+        : (sampleMessages.rows.data?.length ?? 0) > 0),
+    events: sampleEvents,
+    running,
+    messages: () => sample?.messages ?? messagesFromEvents(runningSampleData),
+  });
+  const selected = evidence.selected;
+
+  const handlePrintClick = () => {
+    if (printLogPath && printSampleId && printEpoch) {
+      const printUrl = printSampleUrl(
+        printLogPath,
+        printSampleId,
+        printEpoch,
+        effectiveSelectedTab,
+        prefix,
+        selected ? { item: selected.item, ids: selected.printIds() } : undefined
+      );
+      openRouteInNewTab(printUrl);
+    }
+  };
+
+  // Intercept Cmd+P / Ctrl+P to use custom print route
+  const printShortcutEnabled =
+    !isVscode() && !!printLogPath && !!printSampleId && !!printEpoch;
+  useEventListener(
+    printShortcutEnabled ? document : null,
+    "keydown",
+    (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "p") {
+        e.preventDefault();
+        e.stopPropagation();
+        handlePrintClick();
+      }
+    },
+    { capture: true }
+  );
+
+  const toggleFilter = useCallback(() => {
+    setShowing(!isShowing);
+  }, [setShowing, isShowing]);
+
+  const toggleDisplayMode = useCallback(() => {
+    setDisplayMode(displayMode === "rendered" ? "raw" : "rendered");
+  }, [displayMode, setDisplayMode]);
+
+  const collapsedMode = useStore((state) => state.sample.collapsedMode);
+  const setCollapsedMode = useStore(
+    (state) => state.sampleActions.setCollapsedMode
+  );
+
+  const isCollapsed = (mode: "collapsed" | "expanded" | null) => {
+    return mode === "collapsed"; //null is expanded
+  };
+
+  const toggleCollapsedMode = useCallback(() => {
+    setCollapsedMode(isCollapsed(collapsedMode) ? "expanded" : "collapsed");
+  }, [collapsedMode, setCollapsedMode]);
+
+  const { isDebugFilter, isDefaultFilter, isNoneFilter } =
+    useTranscriptFilter(defaultExcludeEvents);
+
+  // ── Activity tab ──────────────────────────────────────────────────────
+  // Hidden entirely for old logs whose events lack timestamps (design spec);
+  // chunked samples carry an empty shell events array, so they hide it too.
+  const hasActivityTab = hasEventTimestamps(sampleEvents);
+  // Durable Activity UI state (band toggles, filters, selection) is keyed
+  // per log + sample so it survives tab switches without leaking across
+  // samples.
+  const activityPersistScope = `${sampleHandle?.logFile ?? ""}:${String(
+    sampleHandle?.id ?? id
+  )}:${sampleHandle?.epoch ?? 1}`;
+  // Click-through target for every Activity span, glyph, and history row:
+  // the Transcript tab scrolled to the event (?event=<uuid>). Modifier
+  // clicks open the same route in a new browser tab.
+  const openEventInTranscript = (uuid: string, event: MouseEvent) => {
+    const sampleId = urlSampleId ?? sampleHandle?.id;
+    const sampleEpoch = urlEpoch ?? sampleHandle?.epoch;
+    if (!urlLogPath || sampleId === undefined || sampleEpoch === undefined) {
+      return;
+    }
+    const url = sampleEventUrl(
+      sampleUrlBuilder,
+      uuid,
+      urlLogPath,
+      sampleId,
+      sampleEpoch
+    );
+    if (event.metaKey || event.ctrlKey || event.shiftKey) {
+      openRouteInNewTab(url);
+      return;
+    }
+    setSelectedTab(kSampleTranscriptTabId);
+    navigate(url);
+  };
+
+  const api = getApi();
+  const downloadFiles = useStore((state) => state.capabilities.downloadFiles);
+
+  const { copied, copy: copyText } = useCopyToClipboard();
+  const icon: IconName = copied ? "confirm" : "copy";
+  const downloadFile = (name: string, content: string | Blob) => {
+    api.download_file(name, content).catch((error: unknown) => {
+      console.error("Failed to download:", error);
+    });
+  };
+  // An export whose ids resolve to nothing is refused rather than copying or
+  // downloading an empty document under a success icon.
+  const copySelected = (format: EvidenceFormat) => {
+    const content = selected?.render(format);
+    if (content !== undefined) copyText(content);
+  };
+  const downloadSelected = (
+    format: EvidenceFormat,
+    sampleId: string | number
+  ) => {
+    const content = selected?.render(format);
+    if (selected && content !== undefined) {
+      const ext =
+        format === "markdown" ? "md" : format === "text" ? "txt" : "json";
+      downloadFile(`${sampleId}-${selected.item}s.${ext}`, content);
+    }
+  };
+
+  // Right-docked sidebar — search and scans share a single slot (one at a
+  // time), each toggled from the toolbar. Scope follows the active tab. The
+  // choice is persisted per log so a closed dock stays closed across reloads.
+  const setPropertyValue = useStore(
+    (state) => state.appActions.setPropertyValue
+  );
+  const dockKey = urlLogPath || "na";
+  const storedDock = useStore((state) => {
+    const value = state.app.propertyBags["rail-dock"]?.[dockKey];
+    return value === "none" || value === "search" || value === "scans"
+      ? value
+      : undefined;
+  });
+  // Scanner scores power the docked Scans panel (and the transcript cite
+  // labels). `open` gates the label computation to when the panel is showing;
+  // it's phrased on storedDock (a superset of the derived `rightDock ===
+  // "scans"` below) to avoid a circular dependency on `scans.hasScans` — the
+  // hook yields no labels for a sample without scans anyway.
+  const scans = useSampleScans({
+    allScores: sample?.scores ?? null,
+    sampleId: sample?.id ?? undefined,
+    sampleEpoch: sample?.epoch ?? undefined,
+    open: storedDock === undefined || storedDock === "scans",
+  });
+  // Default the dock to Scans when the sample has scan results and this log
+  // has no stored choice — including "none": a user who closed the dock shouldn't
+  // have it forced back open. Derived rather than persisted; nothing is
+  // written until the user acts.
+  const rightDock = storedDock ?? (scans.hasResults ? "scans" : "none");
+  const setRightDock = useCallback(
+    (value: "none" | "search" | "scans") =>
+      setPropertyValue("rail-dock", dockKey, value),
+    [setPropertyValue, dockKey]
+  );
+  const searchScope: SearchScope | undefined =
+    effectiveSelectedTab === kSampleTranscriptTabId
+      ? "events"
+      : effectiveSelectedTab === kSampleMessagesTabId
+        ? "messages"
+        : undefined;
+  const searchContext = useInspectSearchContext(sample);
+  const canSearch = searchContext !== null && searchScope !== undefined;
+  const closeDock = useCallback(() => setRightDock("none"), [setRightDock]);
+  // Rail entries toggle their panel: re-selecting the active one closes it,
+  // selecting another switches directly (panels are mutually exclusive).
+  const onRailSelect = useCallback(
+    (id: ActivityRailItemId) => setRightDock(rightDock === id ? "none" : id),
+    [rightDock, setRightDock]
+  );
+  // Panel width is a global preference persisted across samples and reloads,
+  // shared by the Transcript and Messages tabs.
+  const railPanelWidth = useStore((state) => {
+    const value = state.app.propertyBags["sidebar-widths"]?.["rail-panel"];
+    return typeof value === "number" ? value : undefined;
+  });
+  const setRailPanelWidth = useCallback(
+    (value: number) => setPropertyValue("sidebar-widths", "rail-panel", value),
+    [setPropertyValue]
+  );
+
+  // Search cites label the transcript the same way scanner cites do; the
+  // hook follows the active tab's scope and yields nothing until a search
+  // runs. Rail panels are mutually exclusive, so in practice only one of
+  // scan/search labels is present at a time, but the merge is defensive.
+  const searchReferenceLabels = useInspectSearchReferenceLabels({
+    scope: searchScope ?? "events",
+    context: searchContext,
+  });
+  const transcriptSearchLabels =
+    searchScope === "events" ? searchReferenceLabels : undefined;
+  const messagesSearchLabels =
+    searchScope === "messages" ? searchReferenceLabels : undefined;
+  const transcriptEventNodeContext = useMemo(
+    () => ({
+      ...mergeTranscriptLabelContext(
+        scans.eventNodeContext,
+        transcriptSearchLabels
+      ),
+      makeCiteUrl: scans.makeCiteUrl,
+    }),
+    [scans.eventNodeContext, transcriptSearchLabels, scans.makeCiteUrl]
+  );
+
+  // Build the toolbar in left-to-right groups separated by thin dividers:
+  //   [tab-specific view controls] | [shared sample actions] | [Search]
+  const tools: ReactNode[] = [];
+
+  const terminalAgentPicker =
+    terminalSample && terminalAgent && terminalSample.agents.length > 1 ? (
+      <AgentPicker
+        key="sample-terminals-agent"
+        agents={terminalSample.agents}
+        selected={terminalAgent}
+        onSelect={setPickedTerminalAgent}
+      />
+    ) : null;
+  if (effectiveSelectedTab === kSampleTerminalsTabId && terminalSample) {
+    if (terminalAgentPicker) tools.push(terminalAgentPicker);
+    tools.push(
+      <ToolButton
+        key="sample-terminals-fill"
+        className={styles.fullscreenTool}
+        label="Fullscreen"
+        icon="fullscreen"
+        onClick={() => setTerminalsFill(true)}
+        subtle
+        collapseLabel
+      />
+    );
+  }
+
+  if (effectiveSelectedTab === kSampleTranscriptTabId) {
+    const label = isNoneFilter
+      ? "None"
+      : isDebugFilter
+        ? "Debug"
+        : isDefaultFilter
+          ? "Default"
+          : "Custom";
+
+    tools.push(
+      <ToolButton
+        key="sample-filter-transcript"
+        label={`Events: ${label}`}
+        icon="filter"
+        onClick={toggleFilter}
+        ref={setFilterButtonEl}
+        subtle
+      />,
+      <ToolButton
+        key="sample-collapse-transcript"
+        label={isCollapsed(collapsedMode) ? "Expand" : "Collapse"}
+        icon={isCollapsed(collapsedMode) ? "expandAll" : "collapseAll"}
+        onClick={toggleCollapsedMode}
+        subtle
+        collapseLabel
+      />
+    );
+  }
+
+  tools.push(
+    <ToolButton
+      key="options-button"
+      label={"Raw"}
+      icon="display"
+      onClick={toggleDisplayMode}
+      ref={optionsRef}
+      latched={displayMode === "raw"}
+      subtle
+      collapseLabel
+    />
+  );
+
+  tools.push(
+    <span
+      key="actions-separator"
+      className={styles.toolSeparator}
+      aria-hidden="true"
+    />
+  );
+
+  if (evidence.tool) {
+    tools.push(
+      <SelectTool key="sample-select" {...evidence.tool} collapseLabel />
+    );
+  }
+
+  tools.push(
+    <ToolDropdownButton
+      key="sample-copy"
+      label="Copy"
+      icon={icon}
+      subtle
+      collapseLabel
+      dropdownClassName="text-size-smallest"
+      heading={selected?.menu.heading}
+      footer={selected?.menu.footer}
+      items={
+        selected
+          ? {
+              Markdown: () => copySelected("markdown"),
+              Text: () => copySelected("text"),
+            }
+          : {
+              UUID: () => {
+                if (sample?.uuid) {
+                  copyText(sample.uuid);
+                }
+              },
+              // offered only when a settled conversation exists to export —
+              // live streaming samples have none, and a silent no-op menu
+              // item reads as broken (chunked samples stream the text on
+              // demand inside the export, window by window — never a
+              // whole-conversation hydration)
+              ...(exportMessages
+                ? {
+                    Messages: () => {
+                      exportMessages()
+                        .then((parts) => copyText(parts.join("")))
+                        .catch((error: unknown) => {
+                          console.error("Failed to copy messages:", error);
+                        });
+                    },
+                  }
+                : {}),
+              Transcript: () => {
+                if (sampleEvents.length > 0) {
+                  copyText(eventsToStr(sampleEvents));
+                }
+              },
+            }
+      }
+    />
+  );
+
+  if (downloadFiles && sample) {
+    const sampleId = sample.id;
+    tools.push(
+      <ToolDropdownButton
+        key="sample-download"
+        label="Download"
+        icon="download"
+        subtle
+        collapseLabel
+        dropdownClassName="text-size-smallest"
+        heading={selected?.menu.heading}
+        footer={selected?.menu.footer}
+        items={
+          selected
+            ? {
+                Markdown: () => downloadSelected("markdown", sampleId),
+                Text: () => downloadSelected("text", sampleId),
+                JSON: () => downloadSelected("json", sampleId),
+              }
+            : {
+                "Sample JSON": () => {
+                  downloadFile(
+                    `${sampleId}.json`,
+                    JSON.stringify(sample, null, 2)
+                  );
+                },
+                // offered only when a settled conversation exists to export
+                // (see the copy dropdown)
+                ...(exportMessages
+                  ? {
+                      Messages: () => {
+                        exportMessages()
+                          .then((parts) =>
+                            downloadFile(
+                              `${sampleId}-messages.txt`,
+                              new Blob(parts, { type: "text/plain" })
+                            )
+                          )
+                          .catch((error: unknown) => {
+                            console.error(
+                              "Failed to download messages:",
+                              error
+                            );
+                          });
+                      },
+                    }
+                  : {}),
+                Transcript: () => {
+                  if (sampleEvents.length > 0) {
+                    downloadFile(
+                      `${sampleId}-transcript.txt`,
+                      eventsToStr(sampleEvents)
+                    );
+                  }
+                },
+              }
+        }
+      />
+    );
+  }
+
+  if (!isVscode() && printLogPath && printSampleId && printEpoch) {
+    tools.push(
+      <ToolButton
+        key="sample-print-tool"
+        label={selected ? `Print · ${selected.count}` : "Print"}
+        title={
+          selected
+            ? `Print ${selected.count} selected ${selected.item}${selected.count === 1 ? "" : "s"}`
+            : undefined
+        }
+        icon="print"
+        onClick={handlePrintClick}
+        subtle
+        collapseLabel
+      />
+    );
+  }
+
+  // Search and Scans are no longer toolbar buttons — the always-visible
+  // activity rail (rendered below the timeline) is the sole entry point.
+
+  // Only a SUCCESSFUL finish may scroll the transcript/messages back to the
+  // top when a live sample completes. An errored or cancelled run renders its
+  // error panel at the bottom — exactly where the user watching the live tail
+  // is looking — so the view must stay put.
+  const scrollToTopOnFinish =
+    !sample?.error &&
+    !selectedSampleSummary?.error &&
+    logDetails?.status !== "error" &&
+    logDetails?.status !== "cancelled";
+
+  const displayModeContext = useMemo(
+    () => ({ displayMode: displayMode ?? ("rendered" as const) }),
+    [displayMode]
+  );
+
+  // Headroom collapse: `collapsed` is the position-derived `hidden` alone —
+  // deliberately NOT gated on sticky state, which StickyScroll reports
+  // asynchronously (a gate makes the initial state depend on report-vs-
+  // landing timing); the at-top scroll branch and `k` past turn 1 both
+  // clear `hidden`. Deep-link mounts (?event=/?message=) land scrolled
+  // down, so the header must START collapsed — the summary is often cached
+  // and would paint expanded for a frame and blink away. Bare mounts start
+  // expanded statically (transitions run on changes only).
+  const mountsAtDeepLink = !!(
+    sampleDetailNavigation.event || sampleDetailNavigation.message
+  );
+  const onTerminalsTab =
+    effectiveSelectedTab === kSampleTerminalsTabId && !!terminalSample;
+  // Shared with TranscriptPanel: while navigation owns the chrome (deep-link
+  // mounts, f/h/j/k/l forces), the header's natural-scroll detection is fully
+  // suppressed; a physical user gesture on the scroller hands ownership back.
+  // The hook (and its release) lives here — not only in TranscriptPanel,
+  // which unmounts on other tabs — so ownership can't leak past the
+  // transcript tab. No findActiveRef: the header runs stayHiddenOnUpScroll
+  // and find-forward collapse is intended.
+  const {
+    hidden: headerCollapsed,
+    resetAnchor: headerResetAnchor,
+    setHidden: headerSetHidden,
+    navOwnsRef: chromeNavOwnsRef,
+  } = useChromeNavOwnership(scrollRef, {
+    ownedForKey: () => mountsAtDeepLink,
+    // The header survives sibling navigation; its collapse belongs to this visit.
+    resetKey: visitId,
+    scrollDirection: { threshold: 80, stayHiddenOnUpScroll: true },
+  });
+
+  // The Terminals tab shows the header collapsed (the terminals want the
+  // height); it's derived rather than written into the header's scroll state,
+  // so leaving the tab shows that state again untouched. Leaving also ends
+  // fullscreen.
+  const sampleHeaderCollapsed = headerCollapsed || onTerminalsTab;
+  if (!onTerminalsTab && terminalsFill) setTerminalsFill(false);
+
+  const headerWrapperRef = useRef<HTMLDivElement | null>(null);
+  const headerHeight = useElementHeight(
+    headerWrapperRef,
+    !!selectedSampleSummary
+  );
+
+  // useElementHeight stops measuring while disabled, so zero out the stale
+  // last-measured height here when there's no summary mounted.
+  const effectiveHeaderHeight = selectedSampleSummary ? headerHeight : 0;
+  const stickyOffsetTop = tabsHeight + effectiveHeaderHeight;
+
+  const tabsContainerStyle = useMemo(
+    () =>
+      cssVars({
+        "--inspect-sample-header-height": `${effectiveHeaderHeight}px`,
+      }),
+    [effectiveHeaderHeight]
+  );
+
+  // Which rail entry (if any) is showing its panel. Scans only applies on the
+  // Transcript tab and only when the sample actually has scans.
+  const activeRailId: ActivityRailItemId | null =
+    rightDock === "scans" && scans.hasScans
+      ? "scans"
+      : rightDock === "search" && searchContext
+        ? "search"
+        : null;
+
+  // Shared rail entries for both the Transcript and Messages tabs: Search on
+  // top, Scans below (per design). Scans is omitted entirely when the sample
+  // has none.
+  const railItems = useMemo<ActivityRailItem<ActivityRailItemId>[]>(() => {
+    const items: ActivityRailItem<ActivityRailItemId>[] = [];
+    if (canSearch) {
+      items.push({
+        id: "search",
+        label: "Search",
+        icon: "search",
+      });
+    }
+    if (scans.hasScans) {
+      items.push({
+        id: "scans",
+        label: "Scans",
+        icon: "scanner",
+      });
+    }
+    return items;
+  }, [canSearch, scans.hasScans]);
+
+  // When there are no rail entries (no search capability and no scans), the
+  // rail host is omitted entirely so the right gutter doesn't render blank.
+  const hasRail = railItems.length > 0;
+
+  // Rail + panel nodes shared verbatim by the Transcript and Messages tabs;
+  // the search scope follows the active tab.
+  const railNode = useMemo(
+    () => (
+      <ActivityRail
+        items={railItems}
+        active={activeRailId}
+        onSelect={onRailSelect}
+      />
+    ),
+    [railItems, activeRailId, onRailSelect]
+  );
+  const railPanel = useMemo(
+    () =>
+      activeRailId === "scans" ? (
+        <ScansSidebarPanel
+          scores={scans.scores}
+          events={sampleEvents}
+          makeCiteUrl={scans.makeCiteUrl}
+          selected={scans.selected}
+          onSelectedChange={scans.setSelected}
+          onClose={closeDock}
+        />
+      ) : activeRailId === "search" && searchContext && searchScope ? (
+        <SearchPanelSlot
+          scope={searchScope}
+          context={searchContext}
+          onClose={closeDock}
+        />
+      ) : null,
+    [
+      activeRailId,
+      scans.scores,
+      scans.makeCiteUrl,
+      scans.selected,
+      scans.setSelected,
+      sampleEvents,
+      searchContext,
+      searchScope,
+      closeDock,
+    ]
+  );
+  const railLabel = activeRailId === "scans" ? "Scans" : "Search";
+
+  const transcriptRail = useMemo<TranscriptLayoutRightRailProps>(
+    () => ({
+      rail: railNode,
+      panel: railPanel,
+      label: railLabel,
+      panelWidth: railPanelWidth,
+      onPanelWidthChange: setRailPanelWidth,
+    }),
+    [railNode, railPanel, railLabel, railPanelWidth, setRailPanelWidth]
+  );
+
+  return (
+    <DisplayModeContext.Provider value={displayModeContext}>
+      <Fragment>
+        {selectedSampleSummary ? (
+          <StickyScroll scrollRef={scrollRef} offsetTop={0} zIndex={1002}>
+            <div ref={headerWrapperRef}>
+              <SampleSummaryView
+                parent_id={id}
+                sample={selectedSampleSummary}
+                collapsed={sampleHeaderCollapsed}
+              />
+            </div>
+          </StickyScroll>
+        ) : undefined}
+        <LoadingBar loading={showActivity} />
+
+        <div style={tabsContainerStyle}>
+          <TabSet
+            id={tabsetId}
+            tabsRef={tabsRef}
+            className={clsx(styles.tabControls)}
+            tabControlsClassName={clsx("text-size-base")}
+            tools={tools}
+            type="pills-small"
+          >
+            <TabPanel
+              key={kSampleTranscriptTabId}
+              id={kSampleTranscriptTabId}
+              className={clsx("sample-tab", styles.overflowVisible)}
+              title="Transcript"
+              onSelected={onSelectedTab}
+              href={sampleTabHref(kSampleTranscriptTabId)}
+              selected={
+                effectiveSelectedTab === kSampleTranscriptTabId ||
+                // A shared /activity URL on a log whose events lack
+                // timestamps hides that tab — fall back here rather than
+                // leaving no panel selected.
+                (effectiveSelectedTab === kSampleActivityTabId &&
+                  !hasActivityTab) ||
+                // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- intentional: persisted webview/store state isn't validated (#555); a restored store may omit the tab selection
+                effectiveSelectedTab === undefined
+              }
+              scrollable={false}
+            >
+              <TranscriptFilterPopover
+                showing={isShowing}
+                setShowing={setShowing}
+                positionEl={filterButtonEl}
+                defaultExcludeEvents={defaultExcludeEvents}
+              />
+
+              {sampleData.chunked ? (
+                <div className={styles.tabContent}>
+                  <ChunkedTranscriptPanel
+                    id={`${baseId}-transcript-display-${id}`}
+                    // sample identity in the key: anchor/selection refs must
+                    // not survive a switch between two chunked samples
+                    key={`${baseId}-chunked-transcript-${id}-${sampleData.chunked.shell.id}-${sampleData.chunked.shell.epoch}`}
+                    scrollRef={scrollRef}
+                    offsetTop={stickyOffsetTop}
+                    chunked={sampleData.chunked}
+                  />
+                </div>
+              ) : sampleEvents.length === 0 ? (
+                sampleData.status === "loading" ? null : (
+                  <NoContentsPanel
+                    text={
+                      eventsCleared
+                        ? "Transcript events were removed because this sample exceeds the browser's size limit. Use the Messages tab to view the conversation."
+                        : "No events to display."
+                    }
+                  />
+                )
+              ) : (
+                <div className={styles.tabContent}>
+                  <TranscriptPanel
+                    id={transcriptListId}
+                    key={transcriptListId}
+                    scrollRef={scrollRef}
+                    onHeaderResetAnchor={headerResetAnchor}
+                    onHeaderSetHidden={headerSetHidden}
+                    chromeNavOwnsRef={chromeNavOwnsRef}
+                    offsetTop={stickyOffsetTop}
+                    running={running}
+                    backfilling={backfilling}
+                    scrollToTopOnFinish={scrollToTopOnFinish}
+                    events={sampleEvents}
+                    defaultExcludeEvents={defaultExcludeEvents}
+                    timelines={sample?.timelines ?? undefined}
+                    eventNodeContext={transcriptEventNodeContext}
+                    initialEventId={sampleDetailNavigation.event}
+                    initialMessageId={sampleDetailNavigation.message}
+                    followRequested={sampleDetailNavigation.follow}
+                    rightRail={hasRail ? transcriptRail : undefined}
+                    selection={evidence.listSelection}
+                  />
+                </div>
+              )}
+            </TabPanel>
+            <TabPanel
+              key={kSampleMessagesTabId}
+              id={kSampleMessagesTabId}
+              className={clsx(
+                "sample-tab",
+                styles.fullWidth,
+                styles.overflowVisible
+              )}
+              title="Messages"
+              onSelected={onSelectedTab}
+              href={sampleTabHref(kSampleMessagesTabId)}
+              selected={effectiveSelectedTab === kSampleMessagesTabId}
+              scrollable={false}
+            >
+              <RailSidebarHost
+                contentClassName={styles.chat}
+                scrollRef={scrollRef}
+                panelTop={stickyOffsetTop}
+                panelWidth={railPanelWidth}
+                onPanelWidthChange={setRailPanelWidth}
+                rail={hasRail ? railNode : undefined}
+                panel={hasRail ? railPanel : undefined}
+                label={railLabel}
+              >
+                {sampleMessages.rows.error ? (
+                  // inside the rail host: the activity rail is the sole
+                  // search/scans entry point and must survive the error
+                  <ErrorPanel
+                    title="An error occurred while loading messages."
+                    error={sampleMessages.rows.error}
+                  />
+                ) : (
+                  <ChatViewRowsVirtualList
+                    key={chatListId}
+                    id={chatListId}
+                    rows={sampleMessages.rows.data ?? kNoMessageRows}
+                    hasMoreRows={sampleMessages.hasMore}
+                    onLoadMoreRows={sampleMessages.loadMore}
+                    initialMessageId={sampleDetailNavigation.message}
+                    followRequested={sampleDetailNavigation.follow}
+                    display={chatDisplay}
+                    labels={messagesSearchLabels}
+                    linking={chatLinking}
+                    onNativeFindChanged={setNativeFind}
+                    scrollRef={scrollRef}
+                    tools={chatTools}
+                    running={running}
+                    backfilling={backfilling || sampleMessages.rows.loading}
+                    scrollToTopOnFinish={scrollToTopOnFinish}
+                    className={styles.fullWidth}
+                    selection={evidence.listSelection}
+                  />
+                )}
+              </RailSidebarHost>
+            </TabPanel>
+            {terminalSample ? (
+              <TabPanel
+                key={kSampleTerminalsTabId}
+                id={kSampleTerminalsTabId}
+                className="sample-tab"
+                title="Terminals"
+                onSelected={onSelectedTab}
+                href={sampleTabHref(kSampleTerminalsTabId)}
+                selected={effectiveSelectedTab === kSampleTerminalsTabId}
+              >
+                <TerminalsView
+                  key={terminalsKey}
+                  id={`${baseId}-${id}-terminal-sessions`}
+                  sample={terminalSample}
+                  scrollRef={scrollRef}
+                  agentId={terminalAgent?.id}
+                  fill={
+                    terminalsFill
+                      ? {
+                          tools: terminalAgentPicker,
+                          onExit: () => setTerminalsFill(false),
+                        }
+                      : undefined
+                  }
+                  onFullscreen={() => setTerminalsFill(true)}
+                  resume={
+                    terminalsResume?.key === terminalsKey
+                      ? terminalsResume?.resume
+                      : undefined
+                  }
+                  onSuspend={(resume) =>
+                    terminalsKey &&
+                    setTerminalsResume({ key: terminalsKey, resume })
+                  }
+                />
+              </TabPanel>
+            ) : null}
+            <TabPanel
+              key={kSampleScoringTabId}
+              id={kSampleScoringTabId}
+              className="sample-tab"
+              title="Scoring"
+              onSelected={onSelectedTab}
+              href={sampleTabHref(kSampleScoringTabId)}
+              selected={effectiveSelectedTab === kSampleScoringTabId}
+            >
+              <SampleScoresView
+                sample={sample}
+                className={styles.padded}
+                scrollRef={scrollRef}
+              />
+            </TabPanel>
+            {hasActivityTab ? (
+              <TabPanel
+                key={kSampleActivityTabId}
+                id={kSampleActivityTabId}
+                className={clsx("sample-tab", styles.fullWidth)}
+                title="Activity"
+                onSelected={onSelectedTab}
+                selected={effectiveSelectedTab === kSampleActivityTabId}
+                scrollable={false}
+              >
+                <div className={styles.tabContent}>
+                  <SampleActivityPanel
+                    events={sampleEvents}
+                    startedAt={sample?.started_at}
+                    completedAt={sample?.completed_at}
+                    workingTime={sample?.working_time}
+                    totalTime={sample?.total_time}
+                    running={running}
+                    scrollRef={scrollRef}
+                    persistScope={activityPersistScope}
+                    onOpenEvent={openEventInTranscript}
+                  />
+                </div>
+              </TabPanel>
+            ) : null}
+            <TabPanel
+              id={kSampleInfoTabId}
+              className={clsx("sample-tab")}
+              title="Info"
+              onSelected={onSelectedTab}
+              href={sampleTabHref(kSampleInfoTabId)}
+              selected={effectiveSelectedTab === kSampleInfoTabId}
+            >
+              {sampleUsages.length > 0 || sampleMetadatas.length > 0 ? (
+                <div
+                  className={clsx(
+                    styles.padded,
+                    styles.fullWidth,
+                    styles.metadataPanel
+                  )}
+                >
+                  {sampleUsages}
+                  {sampleMetadatas}
+                </div>
+              ) : (
+                <NoContentsPanel text="No sample usage or metadata available" />
+              )}
+            </TabPanel>
+            {sample?.error && (
+              <TabPanel
+                id={kSampleErrorTabId}
+                className="sample-tab"
+                title="Error"
+                onSelected={onSelectedTab}
+                href={sampleTabHref(kSampleErrorTabId)}
+                selected={effectiveSelectedTab === kSampleErrorTabId}
+              >
+                <div className={clsx(styles.error)}>
+                  <Card key={`sample-error}`}>
+                    <CardHeader label={`Sample Error`} />
+                    <CardBody>
+                      <ANSIDisplay
+                        output={sample.error.traceback_ansi}
+                        className={clsx("text-size-small", styles.ansi)}
+                        style={{
+                          fontSize: "clamp(0.3rem, 1.1vw, 0.8rem)",
+                          margin: "0.5em 0",
+                        }}
+                      />
+                    </CardBody>
+                  </Card>
+                </div>
+              </TabPanel>
+            )}
+
+            {sample?.error_retries && sample.error_retries.length > 0 ? (
+              <TabPanel
+                id={kSampleRetriesTabId}
+                className="sample-tab"
+                title="Retries"
+                onSelected={onSelectedTab}
+                href={sampleTabHref(kSampleRetriesTabId)}
+                selected={effectiveSelectedTab === kSampleRetriesTabId}
+              >
+                <div className={styles.retriedErrors}>
+                  <SampleRetriedErrors
+                    key={sample.uuid || String(sample.id)}
+                    id={sample.uuid || String(sample.id)}
+                    retries={sample.error_retries}
+                    error={sample.error}
+                    limit={sample.limit}
+                    scrollRef={scrollRef}
+                  />
+                </div>
+              </TabPanel>
+            ) : null}
+
+            <TabPanel
+              id={kSampleJsonTabId}
+              className={"sample-tab"}
+              title="JSON"
+              onSelected={onSelectedTab}
+              href={sampleTabHref(kSampleJsonTabId)}
+              selected={effectiveSelectedTab === kSampleJsonTabId}
+            >
+              {!sample ? (
+                <NoContentsPanel text="JSON not available" />
+              ) : (
+                <div className={clsx(styles.padded, styles.fullWidth)}>
+                  <SampleJSONView
+                    sample={sample}
+                    className={clsx("text-size-small")}
+                  />
+                </div>
+              )}
+            </TabPanel>
+          </TabSet>
+        </div>
+      </Fragment>
+    </DisplayModeContext.Provider>
+  );
+};
+
+interface RailSidebarHostProps {
+  /** The always-visible activity rail. Omit to render content with no rail. */
+  rail?: ReactNode;
+  /** The open panel, or null when no panel is active. */
+  panel?: ReactNode;
+  /** The outer scroll container the panel sticks within. */
+  scrollRef: RefObject<HTMLDivElement | null>;
+  panelTop: number;
+  /** Controlled panel width, kept in sync with the Transcript tab's panel. */
+  panelWidth?: number;
+  onPanelWidthChange?: (width: number) => void;
+  /** aria-label root for the panel region. */
+  label?: string;
+  /** Extra className applied to the main content slot. */
+  contentClassName?: string;
+  children: ReactNode;
+}
+
+/**
+ * Flex host for tabs without a swimlane timeline (Messages): main content,
+ * then the shared <RailDock> (optional resizable panel + always-visible rail)
+ * pinned right. Mirrors the transcript tab's rail layout.
+ */
+const RailSidebarHost: FC<RailSidebarHostProps> = ({
+  rail,
+  panel,
+  scrollRef,
+  panelTop,
+  panelWidth,
+  onPanelWidthChange,
+  label,
+  contentClassName,
+  children,
+}) => (
+  <div className={styles.railHost}>
+    <div className={clsx(styles.tabContent, contentClassName)}>{children}</div>
+    {rail != null && (
+      <RailDock
+        rail={rail}
+        panel={panel}
+        scrollRef={scrollRef}
+        offsetTop={panelTop}
+        panelWidth={panelWidth}
+        onPanelWidthChange={onPanelWidthChange}
+        label={label}
+      />
+    )}
+  </div>
+);
+
+interface SampleUsagePanelProps {
+  id: string;
+  sample: EvalSample;
+  evalSpec?: EvalSpec;
+}
+
+const SampleUsagePanel: FC<SampleUsagePanelProps> = ({
+  id,
+  sample,
+  evalSpec,
+}) => {
+  const roleAliases = useMemo(
+    () => modelRoleNames(evalSpec?.model_roles),
+    [evalSpec]
+  );
+
+  const configsByModel = useMemo(
+    () => buildConfigsByModel(evalSpec),
+    [evalSpec]
+  );
+  const configsByRole = useMemo(() => buildConfigsByRole(evalSpec), [evalSpec]);
+  const argsByModel = useMemo(() => buildArgsByModel(evalSpec), [evalSpec]);
+  const argsByRole = useMemo(() => buildArgsByRole(evalSpec), [evalSpec]);
+
+  const meta = useMemo<MetaItem[]>(() => {
+    const items: MetaItem[] = [];
+    if (sample.working_time != null) {
+      items.push({
+        label: "Working time",
+        value: fmtCompactDuration(sample.working_time),
+      });
+    }
+    if (sample.total_time != null) {
+      items.push({
+        label: "Total time",
+        value: fmtCompactDuration(sample.total_time),
+      });
+    }
+    if (sample.started_at || sample.completed_at) {
+      const showDate = !!(
+        sample.started_at &&
+        sample.completed_at &&
+        new Date(sample.started_at).toDateString() !==
+          new Date(sample.completed_at).toDateString()
+      );
+      items.push({
+        label: "Window",
+        value: `${fmtClock(sample.started_at, showDate)} → ${fmtClock(sample.completed_at, showDate)}`,
+      });
+    }
+    return items;
+  }, [
+    sample.working_time,
+    sample.total_time,
+    sample.started_at,
+    sample.completed_at,
+  ]);
+
+  return (
+    <UsagePanel
+      key={`sample-usage-${id}`}
+      model_usage={sample.model_usage}
+      role_usage={sample.role_usage}
+      configs_by_model={configsByModel}
+      configs_by_role={configsByRole}
+      args_by_model={argsByModel}
+      args_by_role={argsByRole}
+      role_aliases={roleAliases}
+      meta={meta}
+    />
+  );
+};
+
+const usageViewsForSample = (
+  id: string,
+  sample?: EvalSample,
+  evalSpec?: EvalSpec
+) => {
+  if (!sample) return [];
+  const views = [];
+
+  if (
+    Object.keys(sample.model_usage).length > 0 ||
+    Object.keys(sample.role_usage).length > 0
+  ) {
+    views.push(
+      <SampleUsagePanel
+        key={`sample-usage-${id}`}
+        id={id}
+        sample={sample}
+        evalSpec={evalSpec}
+      />
+    );
+  }
+
+  return views;
+};
+
+const metadataViewsForSample = (
+  id: string,
+  scrollRef: RefObject<HTMLDivElement | null>,
+  sample?: EvalSample
+) => {
+  if (!sample) {
+    return [];
+  }
+  const sampleMetadatas = [];
+
+  // Show invalidation details prominently if sample is invalidated
+  if (sample.invalidation) {
+    const formatTimestamp = (timestamp: string) => {
+      try {
+        return formatDateTime(new Date(timestamp));
+      } catch {
+        return timestamp;
+      }
+    };
+
+    const invalidationRecord: Record<string, unknown> = {};
+    if (sample.invalidation.author) {
+      invalidationRecord["Author"] = sample.invalidation.author;
+    }
+    if (sample.invalidation.timestamp) {
+      invalidationRecord["Timestamp"] = formatTimestamp(
+        sample.invalidation.timestamp
+      );
+    }
+    if (sample.invalidation.reason) {
+      invalidationRecord["Reason"] = sample.invalidation.reason;
+    }
+    if (Object.keys(sample.invalidation.metadata).length > 0) {
+      invalidationRecord["Metadata"] = sample.invalidation.metadata;
+    }
+
+    sampleMetadatas.push(
+      <Card key={`sample-invalidation-${id}`}>
+        <CardHeader label="Invalidation" />
+        <CardBody padded={false}>
+          <RecordTree
+            id={`task-sample-invalidation-${id}`}
+            record={invalidationRecord}
+            className={clsx("tab-pane", styles.noTop)}
+            scrollRef={scrollRef}
+            copyButton={true}
+          />
+        </CardBody>
+      </Card>
+    );
+  }
+
+  if (Object.keys(sample.metadata).length > 0) {
+    sampleMetadatas.push(
+      <Card key={`sample-metadata-${id}`}>
+        <CardHeader label="Metadata" />
+        <CardBody padded={false}>
+          <RecordTree
+            id={`task-sample-metadata-${id}`}
+            record={sample.metadata}
+            className={clsx("tab-pane", styles.noTop)}
+            scrollRef={scrollRef}
+            copyButton={true}
+          />
+        </CardBody>
+      </Card>
+    );
+  }
+
+  // Asciicasts play in the Terminals tab rather than printing as (very long)
+  // strings in the store tree.
+  const castKeys = new Set(storeCasts(sample.store).map((cast) => cast.key));
+  const storeRecord = Object.fromEntries(
+    Object.entries(sample.store).filter(([key]) => !castKeys.has(key))
+  );
+  if (Object.keys(storeRecord).length > 0) {
+    sampleMetadatas.push(
+      <Card key={`sample-store-${id}`}>
+        <CardHeader label="Store" />
+        <CardBody padded={false}>
+          <RecordTree
+            id={`task-sample-store-${id}`}
+            record={storeRecord}
+            className={clsx("tab-pane", styles.noTop)}
+            scrollRef={scrollRef}
+            processStore={true}
+            copyButton={true}
+          />
+        </CardBody>
+      </Card>
+    );
+  }
+
+  return sampleMetadatas;
+};
+
+const isRunning = (
+  sampleSummary?: SampleSummary,
+  runningSampleData?: Events,
+  status?: string
+): boolean => {
+  // If a completed sample has been loaded, it's not running
+  if (status === "ok") {
+    return false;
+  }
+
+  if (sampleSummary && sampleSummary.completed === false) {
+    // An explicitly incomplete sample summary
+    return true;
+  }
+
+  if (
+    !sampleSummary &&
+    (!runningSampleData || runningSampleData.length === 0)
+  ) {
+    // No sample summary yet and no running samples, must've just started
+    return true;
+  }
+
+  if (runningSampleData && runningSampleData.length > 0) {
+    // There are running samples
+    return true;
+  }
+
+  return false;
+};

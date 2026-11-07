@@ -1,0 +1,496 @@
+import { skipToken } from "@tanstack/react-query";
+import { VscodeSplitLayout } from "@vscode-elements/react-elements";
+import { clsx } from "clsx";
+import { FC, ReactNode, useCallback, useMemo, useRef, useState } from "react";
+import { useNavigate, useSearchParams } from "react-router";
+
+import { trustContentSetting } from "@tsmono/inspect-components/content";
+import {
+  ContentTrustProvider,
+  JSONPanel,
+  LoadingBar,
+  TabPanel,
+  TabSet,
+  ToolButton,
+} from "@tsmono/react/components";
+import { useDocumentTitle, useMirrorToStore } from "@tsmono/react/hooks";
+import { openRouteInNewTab } from "@tsmono/react/routing";
+
+import {
+  getValidationParam,
+  transcriptRoute,
+  updateValidationParam,
+} from "../../router/url";
+import { useScannerParam } from "../../router/useScannerParam";
+import { useScanRoute } from "../../router/useScanRoute";
+import { useStore } from "../../state/store";
+import { ScansNavbar } from "../components/ScansNavbar";
+import { useEnsureVisibleScannerResults } from "../hooks/useEnsureVisibleScannerResults";
+import { useSelectedScan } from "../hooks/useSelectedScan";
+import { useSelectedScanResultData } from "../hooks/useSelectedScanResultData";
+import { useSelectedScanResultDetail } from "../hooks/useSelectedScanResultDetail";
+import { useAppConfig } from "../server/useAppConfig";
+import { useHasTranscript } from "../server/useHasTranscript";
+import { isTranscriptInput, ScanResultData } from "../types";
+import { getScanDisplayName } from "../utils/scan";
+import { getTranscriptDisplayName } from "../utils/transcript";
+import { useScansDir } from "../utils/useScansDir";
+import { useTranscriptsDir } from "../utils/useTranscriptsDir";
+import { ValidationCaseEditor } from "../validation/components/ValidationCaseEditor";
+
+import { AllScoresDialog } from "./AllScoresDialog";
+import { ErrorPanel } from "./error/ErrorPanel";
+import { InfoPanel } from "./info/InfoPanel";
+import { MetadataPanel } from "./metadata/MetadataPanel";
+import { ResultPanel } from "./result/ResultPanel";
+import { ScannerResultHeader } from "./ScannerResultHeader";
+import { ScannerResultNav } from "./ScannerResultNav";
+import styles from "./ScannerResultPanel.module.css";
+import { TranscriptPanel } from "./transcript/TranscriptPanel";
+
+const kTabIdResult = "Result";
+const kTabIdError = "Error";
+const kTabIdInput = "Input";
+const kTabIdInfo = "Info";
+const kTabIdJson = "JSON";
+const kTabIdTranscript = "transcript";
+const kTabIdMetadata = "Metadata";
+
+const kUrlSelectableTabs = [
+  kTabIdResult,
+  kTabIdInput,
+  kTabIdInfo,
+  kTabIdJson,
+  kTabIdTranscript,
+];
+
+// The tab the URL asks for, if any. Deep-link params (message/event) imply
+// the Result tab and win over an explicit ?tab; an unknown ?tab is ignored.
+const tabFromSearchParams = (
+  searchParams: URLSearchParams
+): string | undefined => {
+  if (searchParams.get("message") || searchParams.get("event")) {
+    return kTabIdResult;
+  }
+  const tab = searchParams.get("tab");
+  return tab && kUrlSelectableTabs.includes(tab) ? tab : undefined;
+};
+
+export const ScannerResultPanel: FC = () => {
+  const headerCollapsedRef = useRef(false);
+  const [headerCollapsed, setHeaderCollapsed] = useState(false);
+  // Track which result's scores dialog is open — auto-resets on navigation
+  const [scoresDialogResultId, setScoresDialogResultId] = useState<
+    string | undefined
+  >();
+
+  // Collapse header when any scroll container inside contentArea has scrolled.
+  // Uses a callback ref so the listener attaches when the node mounts.
+  // After collapsing, the layout shift can cause scroll containers to resize
+  // and auto-clamp scrollTop to 0, which would immediately un-collapse.
+  // A brief cooldown prevents this bounce.
+  const cleanupRef = useRef<(() => void) | null>(null);
+  const collapsedAtRef = useRef(0);
+  const contentRef = useCallback((node: HTMLDivElement | null) => {
+    cleanupRef.current?.();
+    cleanupRef.current = null;
+    if (!node) {
+      headerCollapsedRef.current = false;
+      setHeaderCollapsed(false);
+      return;
+    }
+
+    const kScrollThreshold = 100;
+
+    const onScroll = (e: Event) => {
+      const target = e.target;
+      if (!(target instanceof Element)) {
+        return;
+      }
+      const scrolled = target.scrollTop > kScrollThreshold;
+      if (scrolled && !headerCollapsedRef.current) {
+        // Collapsing frees vertical space (~140px). If the container's
+        // overflow is smaller than that, scrollTop will clamp to 0 after
+        // the layout shift, causing an immediate un-collapse flash.
+        const overflow = target.scrollHeight - target.clientHeight;
+        if (overflow < 150) return;
+        headerCollapsedRef.current = true;
+        collapsedAtRef.current = Date.now();
+        setHeaderCollapsed(true);
+      } else if (!scrolled && headerCollapsedRef.current) {
+        if (Date.now() - collapsedAtRef.current < 150) return;
+        const allAtTop = Array.from(node.querySelectorAll("*")).every(
+          (el) => el.scrollTop === 0
+        );
+        if (allAtTop) {
+          headerCollapsedRef.current = false;
+          setHeaderCollapsed(false);
+        }
+      }
+    };
+    node.addEventListener("scroll", onScroll, { passive: true, capture: true });
+    cleanupRef.current = () =>
+      node.removeEventListener("scroll", onScroll, { capture: true });
+  }, []);
+
+  // Url data
+  const { scanResultUuid } = useScanRoute();
+  const [searchParams, setSearchParams] = useSearchParams();
+
+  // Seed the prev/next navigator list when this page is opened directly
+  // (deep link / reload) and the scan-list view never mounted to populate it.
+  useEnsureVisibleScannerResults();
+
+  // Required server data
+  const { loading: scanLoading, data: selectedScan } = useSelectedScan();
+  const { displayScansDir, resolvedScansDirSource, setScansDir } =
+    useScansDir(true);
+  useScannerParam();
+
+  // Keep the last highlighted row when returning to the list.
+  const setSelectedScanResult = useStore(
+    (state) => state.setSelectedScanResult
+  );
+  useMirrorToStore(scanResultUuid, setSelectedScanResult);
+
+  const appConfig = useAppConfig();
+
+  // Validation sidebar - URL is the source of truth
+  const validationSidebarCollapsed = !getValidationParam(searchParams);
+
+  const toggleValidationSidebar = useCallback(() => {
+    setSearchParams((prevParams) => {
+      const isCurrentlyOpen = getValidationParam(prevParams);
+      return updateValidationParam(prevParams, !isCurrentlyOpen);
+    });
+  }, [setSearchParams]);
+
+  const selectedTab = useStore((state) => state.selectedResultTab);
+  const visibleScannerResults = useStore(
+    (state) => state.visibleScannerResults
+  );
+
+  const setSelectedResultTab = useStore((state) => state.setSelectedResultTab);
+  const { data: selectedResult, loading: resultLoading } =
+    useSelectedScanResultData(scanResultUuid);
+
+  const { loading: detailLoading, data: detailData } =
+    useSelectedScanResultDetail(selectedResult?.uuid);
+  const inputData = detailData?.input;
+  const detailScanEvents = detailData?.scanEvents;
+
+  // Set document title with task name and scan location
+  const taskName =
+    inputData && isTranscriptInput(inputData)
+      ? getTranscriptDisplayName(inputData.input)
+      : undefined;
+  useDocumentTitle(
+    taskName,
+    getScanDisplayName(selectedScan, appConfig.scans.dir),
+    "Scans"
+  );
+
+  const { resolvedTranscriptsDir } = useTranscriptsDir(false);
+  const { loading: hasTranscriptLoading, data: hasTranscript } =
+    useHasTranscript(
+      !selectedResult
+        ? skipToken
+        : { id: selectedResult.transcriptId, location: resolvedTranscriptsDir }
+    );
+
+  // The URL overrides the store's tab whenever it names one.
+  useMirrorToStore(tabFromSearchParams(searchParams), setSelectedResultTab);
+
+  const handleTabChange = useCallback(
+    (tabId: string) => {
+      setSelectedResultTab(tabId);
+      setSearchParams((prevParams) => {
+        const newParams = new URLSearchParams(prevParams);
+        newParams.set("tab", tabId);
+        // Clear deep-link params so the URL-sync effect doesn't
+        // override the user's explicit tab choice on the next render
+        newParams.delete("message");
+        newParams.delete("event");
+        return newParams;
+      });
+    },
+    [setSelectedResultTab, setSearchParams]
+  );
+
+  const showEvents = useMemo(() => {
+    if (!detailScanEvents || detailScanEvents.length === 0) {
+      return false;
+    }
+    const hasNonSpanEvents = detailScanEvents.some((event) => {
+      return event.event !== "span_begin" && event.event !== "span_end";
+    });
+    return hasNonSpanEvents;
+  }, [detailScanEvents]);
+
+  const hasError = selectedResult?.scanError !== undefined;
+
+  const highlightLabeled = useStore((state) => state.highlightLabeled);
+  const setHighlightLabeled = useStore((state) => state.setHighlightLabeled);
+  const toggleHighlightLabeled = useCallback(() => {
+    setHighlightLabeled(!highlightLabeled);
+  }, [highlightLabeled, setHighlightLabeled]);
+
+  const navigate = useNavigate();
+
+  const handleNavigateToTranscript = useCallback(
+    (e: React.MouseEvent) => {
+      const route = transcriptRoute(
+        resolvedTranscriptsDir,
+        selectedResult?.transcriptId ?? ""
+      );
+      if (e.metaKey || e.ctrlKey) {
+        openRouteInNewTab(route);
+      } else {
+        navigate(route);
+      }
+    },
+    [navigate, resolvedTranscriptsDir, selectedResult?.transcriptId]
+  );
+
+  const tools = useMemo(() => {
+    const toolButtons: ReactNode[] = [];
+
+    // Existing highlight refs button (keep as-is)
+    if (
+      selectedTab === kTabIdInput &&
+      selectedResult?.inputType === "transcript" &&
+      selectedResult.messageReferences.length > 0
+    ) {
+      toolButtons.push(
+        <ToolButton
+          icon="highlight"
+          key="highlight-labeled"
+          latched={!!highlightLabeled}
+          onClick={toggleHighlightLabeled}
+          label="Highlight Refs"
+        />
+      );
+    }
+
+    // Transcript button - navigate to full transcript view
+    const canNavigateToTranscript =
+      !!hasTranscript &&
+      resolvedTranscriptsDir.length > 0 &&
+      !!selectedResult?.transcriptId;
+    if (canNavigateToTranscript) {
+      toolButtons.push(
+        <ToolButton
+          key="transcript-navigate"
+          label="Transcript"
+          icon="transcript"
+          onClick={handleNavigateToTranscript}
+          title="View complete transcript (Cmd/Ctrl+click to open in new tab)"
+          subtle={true}
+        />
+      );
+    }
+
+    // Validation button - only show when transcriptId is available
+    if (selectedResult?.transcriptId) {
+      toolButtons.push(
+        <ToolButton
+          key="validation-sidebar-toggle"
+          label="Validation"
+          icon="edit"
+          onClick={toggleValidationSidebar}
+          title={
+            validationSidebarCollapsed
+              ? "Show validation editor"
+              : "Hide validation editor"
+          }
+          subtle={true}
+        />
+      );
+    }
+
+    return toolButtons;
+  }, [
+    highlightLabeled,
+    toggleHighlightLabeled,
+    selectedTab,
+    selectedResult,
+    toggleValidationSidebar,
+    validationSidebarCollapsed,
+    handleNavigateToTranscript,
+    hasTranscript,
+    resolvedTranscriptsDir,
+  ]);
+
+  const renderTabSet = (resultData: ScanResultData) => (
+    <TabSet
+      id={"scan-result-tabs"}
+      type="pills"
+      tabPanelsClassName={clsx(styles.tabSet)}
+      tabControlsClassName={clsx(styles.tabControl)}
+      className={clsx(styles.tabs)}
+      tools={tools}
+    >
+      {hasError ? (
+        <TabPanel
+          id={kTabIdError}
+          selected={selectedTab === kTabIdError || selectedTab === undefined}
+          title="Error"
+          onSelected={() => {
+            handleTabChange(kTabIdError);
+          }}
+        >
+          <ErrorPanel
+            error={resultData.scanError}
+            traceback={resultData.scanErrorTraceback}
+          />
+        </TabPanel>
+      ) : undefined}
+      {!hasError ? (
+        <TabPanel
+          id={kTabIdResult}
+          selected={selectedTab === kTabIdResult || selectedTab === undefined}
+          title="Result"
+          scrollable={false}
+          onSelected={() => {
+            handleTabChange(kTabIdResult);
+          }}
+          className={styles.fullHeight}
+        >
+          {inputData && (
+            <ResultPanel resultData={resultData} inputData={inputData} />
+          )}
+        </TabPanel>
+      ) : undefined}
+      {showEvents ? (
+        <TabPanel
+          id={kTabIdTranscript}
+          selected={selectedTab === kTabIdTranscript}
+          title="Events"
+          onSelected={() => {
+            handleTabChange(kTabIdTranscript);
+          }}
+        >
+          <TranscriptPanel
+            id="scan-transcript"
+            events={detailScanEvents ?? []}
+          />
+        </TabPanel>
+      ) : undefined}
+      <TabPanel
+        id={kTabIdMetadata}
+        selected={selectedTab === kTabIdMetadata}
+        title="Metadata"
+        onSelected={() => {
+          handleTabChange(kTabIdMetadata);
+        }}
+      >
+        <MetadataPanel resultData={resultData} />
+      </TabPanel>
+      <TabPanel
+        id={kTabIdInfo}
+        selected={selectedTab === kTabIdInfo}
+        title="Info"
+        onSelected={() => {
+          handleTabChange(kTabIdInfo);
+        }}
+      >
+        <InfoPanel resultData={resultData} />
+      </TabPanel>
+      <TabPanel
+        id={kTabIdJson}
+        selected={selectedTab === kTabIdJson}
+        title="JSON"
+        onSelected={() => {
+          handleTabChange(kTabIdJson);
+        }}
+      >
+        <JSONPanel
+          id="scan-result-json-contents"
+          data={resultData}
+          simple={true}
+        />
+      </TabPanel>
+    </TabSet>
+  );
+
+  return (
+    <div className={clsx(styles.root)}>
+      <ScansNavbar
+        scansDir={displayScansDir}
+        scansDirSource={resolvedScansDirSource}
+        setScansDir={setScansDir}
+      >
+        {visibleScannerResults.length > 0 && <ScannerResultNav />}
+      </ScansNavbar>
+      <LoadingBar
+        loading={
+          scanLoading || resultLoading || detailLoading || hasTranscriptLoading
+        }
+      />
+      {/* Untrusted until the result (and so its transcript's trust) loads. */}
+      <ContentTrustProvider
+        value={
+          selectedResult
+            ? trustContentSetting(selectedResult.transcriptTrustContent)
+            : "untrusted"
+        }
+      >
+        <ScannerResultHeader
+          inputData={inputData}
+          resultData={selectedResult}
+          scan={selectedScan}
+          appConfig={appConfig}
+          collapsed={headerCollapsed}
+          onShowAllScores={() => setScoresDialogResultId(scanResultUuid)}
+        />
+        {selectedResult && (
+          <div
+            ref={contentRef}
+            className={clsx(
+              styles.contentArea,
+              !validationSidebarCollapsed && styles.withValidation
+            )}
+          >
+            {validationSidebarCollapsed || !selectedResult.transcriptId ? (
+              <div className={styles.tabSetWrapper}>
+                {renderTabSet(selectedResult)}
+              </div>
+            ) : (
+              <VscodeSplitLayout
+                className={styles.splitLayout}
+                fixedPane="end"
+                initialHandlePosition="80%"
+                minEnd="180px"
+                minStart="200px"
+              >
+                <div slot="start" className={styles.splitStart}>
+                  {renderTabSet(selectedResult)}
+                </div>
+                <div slot="end" className={styles.validationSidebar}>
+                  <ValidationCaseEditor
+                    transcriptId={selectedResult.transcriptId}
+                    taskId={
+                      selectedResult.transcriptTaskId != null
+                        ? String(selectedResult.transcriptTaskId)
+                        : undefined
+                    }
+                    taskRepeat={selectedResult.transcriptTaskRepeat}
+                  />
+                </div>
+              </VscodeSplitLayout>
+            )}
+          </div>
+        )}
+        {selectedResult?.transcriptScore != null && (
+          <AllScoresDialog
+            showing={scoresDialogResultId === scanResultUuid}
+            setShowing={(show) =>
+              setScoresDialogResultId(show ? scanResultUuid : undefined)
+            }
+            score={selectedResult.transcriptScore}
+          />
+        )}
+      </ContentTrustProvider>
+    </div>
+  );
+};

@@ -1,0 +1,44 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "//": "Shared tooling is outside every package's own input set, so without this a rule/compiler-option change is a cache hit and CI reports green without re-running lint or typecheck.",
+  "globalDependencies": [
+    "tooling/eslint-config/**",
+    "tooling/tsconfig/**",
+    "tooling/prettier-config/**",
+    "tooling/vitest-config/**"
+  ],
+  "tasks": {
+    "generate:css": {
+      "inputs": ["**/*.module.css", "tsconfig.json"],
+      "outputs": ["**/*.module.css.d.ts"]
+    },
+    "build": {
+      "dependsOn": ["^build", "generate:css"],
+      "outputs": ["dist/**", "lib/**"]
+    },
+    "lint": {
+      "dependsOn": ["generate:css", "^generate:css"]
+    },
+    "typecheck": {
+      "dependsOn": ["generate:css", "^generate:css"]
+    },
+    "format": {},
+    "format:check": {},
+    "check": {
+      "dependsOn": ["lint", "typecheck", "format:check"]
+    },
+    "test": {
+      "cache": false
+    },
+    "e2e": {
+      "cache": false
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "storybook:build": {
+      "outputs": ["storybook-static/**"]
+    }
+  }
+}

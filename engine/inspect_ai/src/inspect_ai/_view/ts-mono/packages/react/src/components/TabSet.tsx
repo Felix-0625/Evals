@@ -1,0 +1,246 @@
+import clsx from "clsx";
+import {
+  Children,
+  CSSProperties,
+  FC,
+  Fragment,
+  isValidElement,
+  MouseEvent,
+  ReactElement,
+  ReactNode,
+  RefObject,
+  useRef,
+} from "react";
+
+import { useStatefulScrollPosition } from "../hooks";
+import { Icon, IconName } from "../icons";
+
+import { inAppHref, inAppLinkClick } from "./inAppLink";
+import styles from "./TabSet.module.css";
+
+interface TabSetProps {
+  id: string;
+  tabsRef?: RefObject<HTMLUListElement | null>;
+  type?: "tabs" | "pills" | "pills-small";
+  className?: string | string[];
+  tabPanelsClassName?: string | string[];
+  tabControlsClassName?: string | string[];
+  tools?: ReactNode;
+  children:
+    | ReactElement<TabPanelProps>
+    | (ReactElement<TabPanelProps> | null | undefined)[];
+}
+
+interface TabPanelProps {
+  id: string;
+  index?: number;
+  selected?: boolean;
+  style?: CSSProperties;
+  scrollable?: boolean;
+  scrollRef?: RefObject<HTMLDivElement | null>;
+
+  className?: string | string[];
+  children?: ReactNode;
+  title: string;
+  icon?: IconName;
+  onSelected: (e: MouseEvent<HTMLElement>) => void;
+  /** URL the tab navigates to. When set, the tab renders as a link so
+   *  cmd/ctrl/middle-click open it in a new tab; `onSelected` still handles
+   *  plain clicks. Ignored inside the VS Code webview. */
+  href?: string;
+}
+
+export const TabSet: FC<TabSetProps> = ({
+  id,
+  type = "tabs",
+  className,
+  tabPanelsClassName,
+  tabControlsClassName,
+  tools,
+  tabsRef,
+  children,
+}) => {
+  const validTabs = flattenChildren(children);
+  if (validTabs.length === 0) return null;
+
+  return (
+    <Fragment>
+      <ul
+        ref={tabsRef}
+        id={id}
+        className={clsx(
+          "nav",
+          type === "pills-small" ? "nav-pills" : `nav-${type}`,
+          type === "tabs" ? styles.tabStyle : undefined,
+          type === "pills-small" ? styles.pillSmallContainer : undefined,
+          className,
+          styles.tabs
+        )}
+        role="tablist"
+        aria-orientation="horizontal"
+      >
+        {validTabs.map((tab, index) => (
+          <Tab
+            key={tab.props.id}
+            index={index}
+            type={type}
+            tab={tab}
+            className={clsx(tabControlsClassName)}
+          />
+        ))}
+        {tools && (
+          <Fragment>
+            <li className={styles.tabSpacer} aria-hidden="true" />
+            <TabTools tools={tools} />
+          </Fragment>
+        )}
+      </ul>
+      <TabPanels id={id} tabs={validTabs} className={tabPanelsClassName} />
+    </Fragment>
+  );
+};
+
+// Individual Tab Component
+const Tab: FC<{
+  type?: "tabs" | "pills" | "pills-small";
+  tab: ReactElement<TabPanelProps>;
+  index: number;
+  className?: string | string[];
+}> = ({ type = "tabs", tab, index, className }) => {
+  const tabId = tab.props.id || computeTabId("tabset", index);
+  const tabContentsId = computeTabContentsId(tab.props.id);
+  const isActive = tab.props.selected;
+  const href = inAppHref(tab.props.href);
+  const tabClassName = clsx(
+    "nav-link",
+    className,
+    isActive && "active",
+    // "pills" gets bootstrap's nav-pills styling alone; a module-level
+    // .pill rule never existed (styles.pill was always undefined).
+    type === "pills-small"
+      ? styles.pillSmall
+      : type === "pills"
+        ? undefined
+        : styles.tab,
+    type === "pills-small" ? "text-size-smallest" : "text-size-small",
+    "text-style-label"
+  );
+  const content = (
+    <>
+      {tab.props.icon && (
+        <Icon name={tab.props.icon} className={styles.tabIcon} />
+      )}
+      {tab.props.title}
+    </>
+  );
+
+  return (
+    <li role="presentation" className={clsx("nav-item", styles.tabItem)}>
+      {href ? (
+        <a
+          id={tabId}
+          href={href}
+          className={clsx(tabClassName, styles.linkTab)}
+          role="tab"
+          aria-controls={tabContentsId}
+          aria-selected={isActive}
+          onClick={inAppLinkClick(tab.props.onSelected)}
+          onKeyDown={(e) => {
+            // Links activate on Enter natively; tabs also take Space.
+            if (e.key === " ") {
+              e.preventDefault();
+              e.currentTarget.click();
+            }
+          }}
+        >
+          {content}
+        </a>
+      ) : (
+        <button
+          id={tabId}
+          className={tabClassName}
+          type="button"
+          role="tab"
+          aria-controls={tabContentsId}
+          aria-selected={isActive}
+          onClick={tab.props.onSelected}
+        >
+          {content}
+        </button>
+      )}
+    </li>
+  );
+};
+
+// Tab Panels Container
+const TabPanels: FC<{
+  id: string;
+  tabs: ReactElement<TabPanelProps>[];
+  className?: string | string[];
+}> = ({ id, tabs, className }) => (
+  <div className={clsx("tab-content", className)} id={`${id}-content`}>
+    {tabs.map((tab, index) => (
+      <TabPanel key={tab.props.id} {...tab.props} index={index} />
+    ))}
+  </div>
+);
+
+// Individual Tab Panel
+export const TabPanel: FC<TabPanelProps> = ({
+  id,
+  selected,
+  style,
+  scrollable = true,
+  scrollRef,
+  className,
+  children,
+}) => {
+  const tabContentsId = computeTabContentsId(id);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const tabContentsRef = scrollRef || panelRef;
+
+  // Attach a scroll listener to this ref to track scrolling
+  useStatefulScrollPosition(tabContentsRef, tabContentsId, 1000, scrollable);
+
+  return (
+    <div
+      id={tabContentsId}
+      ref={tabContentsRef}
+      className={clsx(
+        "tab-pane",
+        selected && "show active",
+        className,
+        styles.tabContents,
+        scrollable && styles.scrollable
+      )}
+      style={style}
+    >
+      {selected ? children : null}
+    </div>
+  );
+};
+
+// Tab Tools Component
+const TabTools: FC<{ tools?: ReactNode }> = ({ tools }) => (
+  <div className={clsx("tab-tools", styles.tabTools)}>{tools}</div>
+);
+
+// Utility functions
+const computeTabId = (id: string, index: number) => `${id}-${index}`;
+const computeTabContentsId = (id: string) => `${id}-contents`;
+
+const flattenChildren = (
+  children: ReactNode
+): ReactElement<TabPanelProps>[] => {
+  return Children.toArray(children).flatMap((child) => {
+    if (isValidElement<TabPanelProps>(child)) {
+      const element = child;
+
+      if (element.type === Fragment) {
+        return flattenChildren(element.props.children);
+      }
+      return element;
+    }
+    return [];
+  });
+};

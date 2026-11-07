@@ -1,0 +1,89 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+  - "tooling/*"
+
+# Run upstream POSIX-style script assignments consistently on Windows.
+shellEmulator: true
+
+# Require a 7-day soak before pnpm will resolve a newly published version.
+# Mitigates supply-chain attacks where a compromised release is detected and
+# yanked within days. pnpm 11 enables a 1-day floor by default; this is
+# stricter and aligns with current public guidance.
+minimumReleaseAge: 10080
+
+# Import-x 4.18 supports patched minimatch 11; security-only cooldown exception.
+minimumReleaseAgeExclude:
+  - "eslint-plugin-import-x@4.18.0"
+
+# eslint-plugin-react and eslint-plugin-jsx-a11y work with eslint 10 but
+# haven't published releases declaring ^10 peer support yet; drop these rules
+# when they do. openapi-typescript declares typescript ^5.x and the repo-wide
+# typescript is the 6.x preview alias (@typescript/typescript6); drop that
+# rule once it declares ^6 support.
+peerDependencyRules:
+  allowedVersions:
+    "eslint-plugin-react>eslint": ^10.0.0
+    "eslint-plugin-jsx-a11y>eslint": ^10.0.0
+    "openapi-typescript>typescript": ^6.0.0
+
+# Most entries below are advisory pins: they force a transitive dependency
+# onto a patched release. Bump them rather than deleting them. But don't
+# assume a pin still earns its place either — it goes inert once every
+# consumer's own range clears it, and it can invert, holding the tree back on
+# a stale release after its consumer moves on. `pnpm why <pkg>` and the
+# consumers' declared ranges tell you which; removing a still-live pin
+# silently downgrades.
+overrides:
+  # react-popper (used by packages/react PopOver) never published react-19
+  # peer support (declares ^16.8 || ^17 || ^18); widen it. Deletable only by
+  # migrating PopOver off react-popper (e.g. to floating-ui).
+  "react-popper>react": ^19.2.0
+  "react-popper>react-dom": ^19.1.1
+
+  js-yaml: ^4.3.2 # GHSA-h67p-54hq-rp68 + GHSA-2883-xcg3-v3hh, merge-key DoS
+  esbuild: ^0.28.2 # dev-server path traversal
+  "nanoid@3": ^3.3.18 # GHSA-2v37-7h3g-55p8
+  dompurify: ^3.4.16 # GHSA-p98j-92pf-mc4p
+  # Reached only via eslint-plugin-react-hooks and storybook's react-docgen,
+  # both of which parse with babel. Nothing here builds with babel.
+  "@babel/core": ^7.29.6
+  undici: ^8.12.2 # GHSA-3wwx-pv8p-q78v + GHSA-xjj6-f33q-929c + GHSA-4qv8-2p9j-2685 + GHSA-f72v-6w45-q472, via jsdom
+  zod: ^4.6.6 # GHSA-mrhx-c7xc-m3w5, via eslint-plugin-react-hooks
+  # solid-js 1.9.14 (via asciinema-player) pins ~1.5; solid-js 1.9.16 already
+  # ships on 1.6, so the 1.6 line is compatible. Plugins move in lockstep.
+  seroval: ^1.6.11 # GHSA-f86p-h4j2-7qgj + GHSA-9wx9-5pv9-3349
+  seroval-plugins: ^1.6.3
+  source-map-js: ^1.2.2 # GHSA-68fv-2mgg-jv7q, via @eslint/css-tree
+  postcss-selector-parser: ^7.1.6 # GHSA-rj75-hqrm-r3gf
+
+  # Together these evict brace-expansion 1.x and its ReDoS advisories.
+  # eslint-plugin-react, eslint-plugin-jsx-a11y and postcss-url all still ask
+  # for minimatch ^3.x; minimatch 5 is the oldest line that keeps the callable
+  # CJS export they need while depending on brace-expansion 2.x. Scoped
+  # per-major because consumers sit on both the 2.x and 5.x lines.
+  "minimatch@3": ^5.1.9
+  "minimatch@10": ^11.0.1 # GHSA-g3hv-75wg-m249; retains the named-export API
+  glob: ^14.0.2 # GHSA-3g3m-2fjr-6pw4
+  "brace-expansion@2": ^2.1.7
+  "brace-expansion@5": ^5.0.12
+
+# All false = same behavior as pnpm 10, which ignored these build scripts (no
+# approvals were configured anywhere). Flip one to true only if something
+# demonstrably needs its postinstall (esbuild gets binaries via
+# optionalDependencies; unrs-resolver has a JS fallback).
+allowBuilds:
+  # Same shape as esbuild: the native binding arrives via optionalDependencies
+  # (@swc/core-<platform>); the postinstall is only a fallback downloader.
+  "@swc/core": false
+  esbuild: false
+  msw: false
+  unrs-resolver: false
+
+# style-mod (CodeMirror's style injection) writes a <style> tag into
+# documents, which the viewer's CSP blocks; the patch makes it adopt a
+# constructed stylesheet there too, as it already does in shadow roots.
+# Keyed by name so it covers every version CodeMirror's packages resolve;
+# install fails if a bump changes the patched `root.head` branch.
+patchedDependencies:
+  style-mod: patches/style-mod.patch

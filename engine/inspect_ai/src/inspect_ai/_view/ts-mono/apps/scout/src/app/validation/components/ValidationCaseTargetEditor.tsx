@@ -1,0 +1,149 @@
+import {
+  VscodeRadio,
+  VscodeRadioGroup,
+  VscodeTextfield,
+} from "@vscode-elements/react-elements";
+import { FC, useEffect, useState } from "react";
+
+import type { JsonValue } from "@tsmono/inspect-common/types";
+import { useDebouncedCallback } from "@tsmono/react/hooks";
+import { valueAsString } from "@tsmono/util";
+
+import { eventValue } from "../../utils/formEvents";
+
+const kTargetModes = ["true", "false", "other", "unset"] as const;
+
+type TargetMode = (typeof kTargetModes)[number];
+
+/** Radio values are the modes themselves; anything else is "nothing chosen". */
+const toTargetMode = (value: string): TargetMode =>
+  kTargetModes.find((mode) => mode === value) ?? "unset";
+
+/**
+ * Determines the mode based on the target value.
+ * - null/undefined = "unset" (user hasn't selected anything)
+ * - "" (empty string) = "other" (user selected "Other" but hasn't typed a value)
+ * - "true"/true = "true"
+ * - "false"/false = "false"
+ * - any other value = "other"
+ */
+function getTargetMode(target?: JsonValue): TargetMode {
+  if (target === undefined || target === null) {
+    return "unset";
+  }
+  if (target === "true" || target === true) {
+    return "true";
+  }
+  if (target === "false" || target === false) {
+    return "false";
+  }
+  // Empty string or any other value = "other"
+  return "other";
+}
+
+interface ValidationCaseTargetEditorProps {
+  target?: JsonValue;
+  onChange: (newTarget: string) => void;
+  /** Called when the mode changes (e.g., user selects "other" radio) */
+  onModeChange?: (isOtherMode: boolean) => void;
+}
+
+/**
+ * Editor component for modifying the target of a validation case.
+ */
+export const ValidationCaseTargetEditor: FC<
+  ValidationCaseTargetEditorProps
+> = ({ target, onChange, onModeChange }) => {
+  const [mode, setMode] = useState<TargetMode>(() => getTargetMode(target));
+
+  // Notify parent when mode changes
+  // eslint-disable-next-line tsmono/no-raw-use-effect -- baselined at rule introduction; migrate to a named hook or derived state
+  useEffect(() => {
+    onModeChange?.(mode === "other");
+  }, [mode, onModeChange]);
+  const [customValue, setCustomValue] = useState(() =>
+    getTargetMode(target) === "other" ? valueAsString(target ?? "") : ""
+  );
+  // Track when user is typing to prevent sync from overwriting during debounce
+  const [isTyping, setIsTyping] = useState(false);
+
+  // Sync mode and customValue when target prop changes externally
+  // (e.g., data loads, switching cases/sets, or after our save completes)
+  // Skip sync while user is typing to avoid overwriting during debounce
+  // eslint-disable-next-line tsmono/no-raw-use-effect -- baselined at rule introduction; migrate to a named hook or derived state
+  useEffect(() => {
+    if (isTyping) return;
+
+    const newMode = getTargetMode(target);
+    // TODO: lint react-hooks/set-state-in-effect - consider if fixing this violation makes sense
+    /* eslint-disable react-hooks/set-state-in-effect */
+    setMode(newMode);
+    if (newMode === "other") {
+      setCustomValue(valueAsString(target ?? ""));
+    } else {
+      setCustomValue("");
+    }
+    /* eslint-enable react-hooks/set-state-in-effect */
+  }, [target, isTyping]);
+
+  // Debounce only the text input changes
+  const debouncedOnChange = useDebouncedCallback((value: string) => {
+    // Call onChange first to update the cache before clearing the typing flag.
+    onChange(value);
+    setIsTyping(false);
+  }, 600);
+
+  const handleRadioChange = (value: string) => {
+    const newMode = toTargetMode(value);
+    setMode(newMode);
+
+    if (newMode === "other") {
+      // When switching to "other", propagate empty string as sentinel immediately
+      // This distinguishes "other selected" from "never selected"
+      onChange(customValue || "");
+    } else {
+      // Radio changes fire immediately (no debounce)
+      onChange(newMode);
+    }
+  };
+
+  const handleCustomValueChange = (value: string) => {
+    setIsTyping(true); // Set typing flag to prevent sync during debounce
+    setCustomValue(value); // Update UI immediately
+    debouncedOnChange(value); // Debounce the parent callback
+  };
+
+  return (
+    <div>
+      <VscodeRadioGroup onChange={(e) => handleRadioChange(eventValue(e))}>
+        <VscodeRadio
+          name="target-mode"
+          label="True"
+          value="true"
+          checked={mode === "true"}
+        />
+        <VscodeRadio
+          name="target-mode"
+          label="False"
+          value="false"
+          checked={mode === "false"}
+        />
+        <VscodeRadio
+          name="target-mode"
+          label="Other"
+          value="other"
+          checked={mode === "other"}
+        />
+      </VscodeRadioGroup>
+
+      {mode === "other" && (
+        <VscodeTextfield
+          value={customValue}
+          placeholder="Enter target value"
+          onInput={(e) => handleCustomValueChange(eventValue(e))}
+          style={{ marginTop: "8px" }}
+        />
+      )}
+    </div>
+  );
+};

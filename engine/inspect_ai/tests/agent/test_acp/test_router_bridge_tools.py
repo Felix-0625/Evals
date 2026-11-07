@@ -1,0 +1,955 @@
+"""Live synthesis of tool-call cards for agent-bridge agents.
+
+Bridged scaffolds (claude_code, codex, …) run their own tools, so no
+``ToolEvent`` is ever emitted — the calls live only on the assistant message and
+their results return as ``ChatMessageTool`` in a later call's input. The router
+synthesizes ``ToolCallStart`` / ``ToolCallProgress`` cards from the
+``ModelEvent`` stream, gated on ``in_bridge_model_generate()`` so the react path
+(which has real ``ToolEvent``s) is left entirely untouched.
+
+These drive the real ``_AcpEventRouter`` with synthetic events, wrapping the
+bridged feeds in ``bridge_model_generate()`` so the synchronous subscriber sees
+the same flag a live bridge generate would set.
+"""
+
+from contextlib import nullcontext
+
+import anyio
+import pytest
+from acp.schema import (
+    ContentToolCallContent,
+    SessionNotification,
+    TextContentBlock,
+    ToolCallProgress,
+    ToolCallStart,
+)
+
+from inspect_ai.agent import AgentState
+from inspect_ai.agent._acp.event_mapping import (
+    SubagentDepthTracker,
+    _AcpEventRouter,
+    replay_transcript,
+)
+from inspect_ai.agent._acp.inspect_ext import TOOL_CALL_CANCELABLE_META_KEY
+from inspect_ai.agent._acp.transport_live import LiveAcpTransport
+from inspect_ai.agent._bridge.sandbox.service import call_tool
+from inspect_ai.agent._bridge.sandbox.types import SandboxAgentBridge
+from inspect_ai.agent._bridge.types import AgentBridge
+from inspect_ai.agent._bridge.util import bridge_generate, bridge_model_generate
+from inspect_ai.event import Event, InterruptEvent
+from inspect_ai.event._info import InfoEvent
+from inspect_ai.event._model import ModelEvent
+from inspect_ai.event._span import SpanBeginEvent, SpanEndEvent
+from inspect_ai.event._tool import ToolEvent
+from inspect_ai.log._samples import _sample_active as samples_var
+from inspect_ai.log._transcript import Transcript, _transcript
+from inspect_ai.model import (
+    ChatMessageAssistant,
+    ChatMessageTool,
+    ChatMessageUser,
+    get_model,
+)
+from inspect_ai.model._generate_config import GenerateConfig
+from inspect_ai.model._model_output import ChatCompletionChoice, ModelOutput
+from inspect_ai.tool import Tool, tool
+from inspect_ai.tool._tool_call import ToolCall, ToolCallContent, ToolCallError
+
+from ._capture import acp_test_active_sample
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _new_session() -> LiveAcpTransport:
+    session = LiveAcpTransport()
+    session._attachable_override = True
+    return session
+
+
+def _attach_router(
+    session: LiveAcpTransport,
+) -> tuple[_AcpEventRouter, list[SessionNotification]]:
+    published: list[SessionNotification] = []
+    session.publish = published.append  # type: ignore[method-assign,assignment]
+    router = _AcpEventRouter(session)
+    router.attach()
+    return router, published
+
+
+def _bash_call(
+    tool_id: str = "tc1", command: str = "ls -la", *, with_view: bool = True
+) -> ToolCall:
+    view = (
+        ToolCallContent(
+            title="bash", format="markdown", content=f"```bash\n{command}\n```\n"
+        )
+        if with_view
+        else None
+    )
+    return ToolCall(
+        id=tool_id, function="bash", arguments={"command": command}, view=view
+    )
+
+
+def _tool_call_event(*calls: ToolCall) -> ModelEvent:
+    """A completed bridged model turn whose assistant message holds *calls*."""
+    message = ChatMessageAssistant(content="", tool_calls=list(calls))
+    return ModelEvent(
+        model="mockllm/model",
+        input=[],
+        tools=[],
+        tool_choice="auto",
+        config=GenerateConfig(),
+        output=ModelOutput(
+            model="mockllm/model", choices=[ChatCompletionChoice(message=message)]
+        ),
+    )
+
+
+def _result_event(*results: ChatMessageTool) -> ModelEvent:
+    """A later bridged turn whose input carries the prior calls' *results*."""
+    message = ChatMessageAssistant(content="done")
+    return ModelEvent(
+        model="mockllm/model",
+        input=list(results),
+        tools=[],
+        tool_choice="auto",
+        config=GenerateConfig(),
+        output=ModelOutput(
+            model="mockllm/model", choices=[ChatCompletionChoice(message=message)]
+        ),
+    )
+
+
+def _starts(published: list[SessionNotification]) -> list[ToolCallStart]:
+    return [n.update for n in published if isinstance(n.update, ToolCallStart)]
+
+
+def _progress(published: list[SessionNotification]) -> list[ToolCallProgress]:
+    return [n.update for n in published if isinstance(n.update, ToolCallProgress)]
+
+
+def _content_text(update: ToolCallStart | ToolCallProgress) -> str:
+    assert update.content is not None
+    parts: list[str] = []
+    for block in update.content:
+        if isinstance(block, ContentToolCallContent) and isinstance(
+            block.content, TextContentBlock
+        ):
+            parts.append(block.content.text)
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+def test_bridge_model_event_synthesizes_in_progress_start() -> None:
+    """A bridged tool call becomes an in-progress card carrying the view."""
+    tr = Transcript()
+    token = _transcript.set(tr)
+    try:
+        _, published = _attach_router(_new_session())
+        with bridge_model_generate():
+            tr._event(_tool_call_event(_bash_call()))
+        starts = _starts(published)
+        assert len(starts) == 1
+        start = starts[0]
+        assert start.tool_call_id == "tc1"
+        assert start.status == "in_progress"
+        # descriptive title from the args, not a bare "bash"
+        assert start.title == "bash ls -la"
+        # raw args always forwarded for the client's debug view
+        assert start.raw_input == {"command": "ls -la"}
+        # the scaffold-provided view renders richly (not args-only)
+        assert "ls -la" in _content_text(start)
+        assert "```bash" in _content_text(start)
+    finally:
+        _transcript.reset(token)
+
+
+def test_bridge_tool_result_settles_completed() -> None:
+    """The result in a later turn's input flips the card to completed."""
+    tr = Transcript()
+    token = _transcript.set(tr)
+    try:
+        _, published = _attach_router(_new_session())
+        call = _bash_call(command="ls")
+        with bridge_model_generate():
+            tr._event(_tool_call_event(call))
+            tr._event(
+                _result_event(
+                    ChatMessageTool(
+                        tool_call_id="tc1", function="bash", content="total 0\nfile.txt"
+                    )
+                )
+            )
+        progress = _progress(published)
+        assert len(progress) == 1
+        upd = progress[0]
+        assert upd.tool_call_id == "tc1"
+        assert upd.status == "completed"
+        text = _content_text(upd)
+        # update REPLACES start content, so the view must be preserved...
+        assert "ls" in text
+        # ...alongside the (fenced) result
+        assert "total 0" in text
+    finally:
+        _transcript.reset(token)
+
+
+def test_bridge_tool_error_settles_failed() -> None:
+    """A tool result carrying an error flips the card to failed."""
+    tr = Transcript()
+    token = _transcript.set(tr)
+    try:
+        _, published = _attach_router(_new_session())
+        with bridge_model_generate():
+            tr._event(_tool_call_event(_bash_call()))
+            tr._event(
+                _result_event(
+                    ChatMessageTool(
+                        tool_call_id="tc1",
+                        function="bash",
+                        content="boom",
+                        error=ToolCallError(type="unknown", message="boom"),
+                    )
+                )
+            )
+        progress = _progress(published)
+        assert len(progress) == 1
+        assert progress[0].status == "failed"
+    finally:
+        _transcript.reset(token)
+
+
+def test_result_settles_on_pending_phase_of_next_turn() -> None:
+    """A pending (not yet completed) next turn already carries the result.
+
+    The result is in the request the moment the next generation starts, so the
+    card should flip to completed on the pending phase — no wait for the full
+    round-trip.
+    """
+    tr = Transcript()
+    token = _transcript.set(tr)
+    try:
+        _, published = _attach_router(_new_session())
+        call = _bash_call(command="ls")
+        with bridge_model_generate():
+            tr._event(_tool_call_event(call))
+            pending_next = ModelEvent(
+                model="mockllm/model",
+                input=[
+                    ChatMessageTool(tool_call_id="tc1", function="bash", content="ok")
+                ],
+                tools=[],
+                tool_choice="auto",
+                config=GenerateConfig(),
+                output=ModelOutput(model="mockllm/model", choices=[]),
+                pending=True,
+            )
+            tr._event(pending_next)
+        progress = _progress(published)
+        assert [p.status for p in progress] == ["completed"]
+    finally:
+        _transcript.reset(token)
+
+
+def test_react_model_event_does_not_synthesize() -> None:
+    """Without the bridge flag, a model event with tool_calls synthesizes nothing.
+
+    react has real ``ToolEvent``s; its in-flight view must keep coming from
+    those, never from a card the mapper invented (which would lack the view
+    until completion).
+    """
+    tr = Transcript()
+    token = _transcript.set(tr)
+    try:
+        _, published = _attach_router(_new_session())
+        # NOTE: no bridge_model_generate() wrapper — this is the react path
+        tr._event(_tool_call_event(_bash_call()))
+        assert _starts(published) == []
+        assert _progress(published) == []
+    finally:
+        _transcript.reset(token)
+
+
+def test_real_tool_event_after_synth_start_is_update_not_duplicate() -> None:
+    """Mixed-bridge safety net: a real ToolEvent for a synth'd id is an update.
+
+    If an Inspect tool somehow does emit a ``ToolEvent`` for a call we already
+    synthesized a start for, the ``seen_tool_call_ids`` dedup routes it through
+    the update branch — one card, not two.
+    """
+    tr = Transcript()
+    token = _transcript.set(tr)
+    try:
+        _, published = _attach_router(_new_session())
+        with bridge_model_generate():
+            tr._event(_tool_call_event(_bash_call(command="ls")))
+        # a real ToolEvent arrives for the same id
+        tr._event(
+            ToolEvent(
+                id="tc1",
+                function="bash",
+                arguments={"command": "ls"},
+                result="total 0",
+            )
+        )
+        assert len(_starts(published)) == 1
+        completed = [
+            p
+            for p in _progress(published)
+            if p.tool_call_id == "tc1" and p.status == "completed"
+        ]
+        assert completed
+    finally:
+        _transcript.reset(token)
+
+
+def test_bridge_text_only_turn_synthesizes_no_tool_cards() -> None:
+    """A bridged turn with no tool calls emits assistant content but no cards."""
+    tr = Transcript()
+    token = _transcript.set(tr)
+    try:
+        _, published = _attach_router(_new_session())
+        message = ChatMessageAssistant(content="just talking")
+        event = ModelEvent(
+            model="mockllm/model",
+            input=[],
+            tools=[],
+            tool_choice="auto",
+            config=GenerateConfig(),
+            output=ModelOutput(
+                model="mockllm/model", choices=[ChatCompletionChoice(message=message)]
+            ),
+        )
+        with bridge_model_generate():
+            tr._event(event)
+        assert _starts(published) == []
+        assert _progress(published) == []
+    finally:
+        _transcript.reset(token)
+
+
+def test_bridge_synth_start_marked_non_cancelable_live() -> None:
+    """The live synth start carries the non-cancelable marker.
+
+    Bridged tools are run by the scaffold (no `ToolEvent`), so
+    `inspect/cancel_tool_call` can't act on them. The marker tells the TUI to
+    suppress the per-tool cancel affordance rather than offer one that no-ops.
+    """
+    tr = Transcript()
+    token = _transcript.set(tr)
+    try:
+        _, published = _attach_router(_new_session())
+        with bridge_model_generate():
+            tr._event(_tool_call_event(_bash_call()))
+        starts = _starts(published)
+        assert len(starts) == 1
+        meta = getattr(starts[0], "field_meta", None) or {}
+        assert meta.get(TOOL_CALL_CANCELABLE_META_KEY) is False
+    finally:
+        _transcript.reset(token)
+
+
+def test_bridge_synth_start_marked_non_cancelable_replay() -> None:
+    """Replay-synthesized bridge cards are also marked non-cancelable."""
+    events = [
+        _tool_call_event(_bash_call(command="ls")),
+        _result_event(
+            ChatMessageTool(tool_call_id="tc1", function="bash", content="total 0")
+        ),
+    ]
+    notifs = list(replay_transcript(events, session_id="s"))
+    starts = _starts(notifs)
+    assert len(starts) == 1
+    meta = getattr(starts[0], "field_meta", None) or {}
+    assert meta.get(TOOL_CALL_CANCELABLE_META_KEY) is False
+
+
+async def test_bridge_generate_live_chain_publishes_tool_start() -> None:
+    """End-to-end live: real ``bridge_generate`` → router subscriber → synth start.
+
+    Exercises the genuine context-var wiring (not the ``bridge_model_generate()``
+    simulation the other live tests use): a tool call returned through
+    ``bridge_generate`` publishes an in-progress ``ToolCallStart`` on the bus.
+    """
+    tr = Transcript()
+    token = _transcript.set(tr)
+    try:
+        _, published = _attach_router(_new_session())
+        model = get_model(
+            "mockllm/model",
+            custom_outputs=[
+                ModelOutput.for_tool_call(
+                    model="mockllm/model",
+                    tool_name="bash",
+                    tool_arguments={"command": "ls"},
+                )
+            ],
+        )
+        bridge = AgentBridge(AgentState(messages=[]))
+        await bridge_generate(
+            bridge,
+            model,
+            [ChatMessageUser(content="hi")],
+            [],
+            None,
+            GenerateConfig(),
+            requested_model=None,
+        )
+        starts = _starts(published)
+        assert len(starts) == 1
+        assert starts[0].status == "in_progress"
+        assert starts[0].title.startswith("bash")
+    finally:
+        _transcript.reset(token)
+
+
+def test_bridge_start_without_view_falls_back_to_title() -> None:
+    """A bridged call whose scaffold attached no view still gets a titled card."""
+    tr = Transcript()
+    token = _transcript.set(tr)
+    try:
+        _, published = _attach_router(_new_session())
+        with bridge_model_generate():
+            tr._event(_tool_call_event(_bash_call(command="whoami", with_view=False)))
+        starts = _starts(published)
+        assert len(starts) == 1
+        assert starts[0].status == "in_progress"
+        assert starts[0].title == "bash whoami"
+        assert starts[0].content is None
+    finally:
+        _transcript.reset(token)
+
+
+def _write_call(
+    tool_id: str = "tc1",
+    *,
+    content: str = "hello world",
+    view_content: str = "```text\n{{content}}\n```\n",
+) -> ToolCall:
+    """A bridged Write call whose viewer emits a ``{{content}}`` placeholder."""
+    return ToolCall(
+        id=tool_id,
+        function="Write",
+        arguments={"file_path": "/tmp/x.txt", "content": content},
+        view=ToolCallContent(title="Write", format="markdown", content=view_content),
+    )
+
+
+def test_bridge_tool_view_substitutes_param_placeholders() -> None:
+    """Viewer ``{{param}}`` placeholders are filled from the call args.
+
+    inspect_swe's Write/Edit viewers emit ``{{content}}`` placeholders that the
+    web viewer fills via ``substituteToolCallContent`` (tool.ts). The ACP path
+    must do the same or editors/TUI render the literal ``{{content}}``.
+    """
+    tr = Transcript()
+    token = _transcript.set(tr)
+    try:
+        _, published = _attach_router(_new_session())
+        with bridge_model_generate():
+            tr._event(_tool_call_event(_write_call(content="hello world")))
+        starts = _starts(published)
+        assert len(starts) == 1
+        text = _content_text(starts[0])
+        assert "hello world" in text
+        assert "{{content}}" not in text
+    finally:
+        _transcript.reset(token)
+
+
+def test_bridge_tool_view_leaves_unknown_placeholder_literal() -> None:
+    """A ``{{param}}`` with no matching arg is left as-is (not blanked)."""
+    tr = Transcript()
+    token = _transcript.set(tr)
+    try:
+        _, published = _attach_router(_new_session())
+        with bridge_model_generate():
+            tr._event(
+                _tool_call_event(_write_call(view_content="{{content}} {{missing}}"))
+            )
+        starts = _starts(published)
+        assert len(starts) == 1
+        text = _content_text(starts[0])
+        assert "hello world" in text  # known key substituted
+        assert "{{missing}}" in text  # unknown key preserved
+    finally:
+        _transcript.reset(token)
+
+
+def test_bridge_tool_view_substitution_preserved_on_completion() -> None:
+    """The settled (completed) card also has placeholders substituted.
+
+    The update path runs through the same ``_content_from_view``, so the result
+    card must show the file body, not the literal ``{{content}}``.
+    """
+    tr = Transcript()
+    token = _transcript.set(tr)
+    try:
+        _, published = _attach_router(_new_session())
+        with bridge_model_generate():
+            tr._event(_tool_call_event(_write_call(content="hello world")))
+            tr._event(
+                _result_event(
+                    ChatMessageTool(
+                        tool_call_id="tc1", function="Write", content="wrote 1 file"
+                    )
+                )
+            )
+        progress = _progress(published)
+        assert len(progress) == 1
+        text = _content_text(progress[0])
+        assert "hello world" in text  # view preserved + substituted
+        assert "{{content}}" not in text
+    finally:
+        _transcript.reset(token)
+
+
+# ---------------------------------------------------------------------------
+# Replay (late-attach) — structural detection, no bridge context
+# ---------------------------------------------------------------------------
+
+
+def test_replay_synthesizes_single_completed_bridge_card() -> None:
+    """On replay a bridged call becomes ONE completed start (view + result).
+
+    Mirrors how a react ToolEvent replays as a single completed start — the tool
+    already ran, so there's no in-progress phase to show on catch-up.
+    """
+    events = [
+        _tool_call_event(_bash_call(command="ls")),
+        _result_event(
+            ChatMessageTool(tool_call_id="tc1", function="bash", content="total 0")
+        ),
+    ]
+    notifs = list(replay_transcript(events, session_id="s"))
+    starts = _starts(notifs)
+    assert len(starts) == 1
+    assert starts[0].tool_call_id == "tc1"
+    assert starts[0].status == "completed"
+    text = _content_text(starts[0])
+    assert "ls" in text  # view preserved
+    assert "total 0" in text  # result folded in
+    # single notification — no separate update on replay
+    assert _progress(notifs) == []
+
+
+def test_replay_does_not_synthesize_when_tool_event_present() -> None:
+    """A call with a real ToolEvent (react) is not duplicated by the synth path."""
+    events: list[Event] = [
+        _tool_call_event(_bash_call(command="ls")),
+        ToolEvent(
+            id="tc1", function="bash", arguments={"command": "ls"}, result="total 0"
+        ),
+    ]
+    notifs = list(replay_transcript(events, session_id="s"))
+    starts = [s for s in _starts(notifs) if s.tool_call_id == "tc1"]
+    # exactly one card — from the ToolEvent, not an extra structural synth
+    assert len(starts) == 1
+    assert starts[0].status == "completed"
+
+
+def test_replay_no_card_when_no_result_in_snapshot() -> None:
+    """A tool_call with neither a ToolEvent nor a result yields no replay card.
+
+    That state is ambiguous — a react tool awaiting approval (its pending
+    ToolEvent isn't recorded until approval resolves) looks identical to an
+    in-flight bridged tool. We must NOT guess "bridged" and emit a
+    non-cancelable in-progress card; the react tool gets its real ToolEvent once
+    live forwarding resumes. See `_map_bridge_tool_replay`.
+    """
+    events = [_tool_call_event(_bash_call(command="sleep 1"))]
+    notifs = list(replay_transcript(events, session_id="s"))
+    assert _starts(notifs) == []
+    assert _progress(notifs) == []
+
+
+def test_replay_does_not_misclassify_react_tool_awaiting_approval() -> None:
+    """A react tool mid-approval (tool_calls, no ToolEvent, no result) → no card.
+
+    Regression for the misclassification where replay rendered a normal react
+    tool as a non-cancelable bridged card during the approval window. Once the
+    tool runs, its real ToolEvent (carrying the result) drives a proper,
+    cancelable card — modeled here by a follow-up snapshot that includes it.
+    """
+    # snapshot captured DURING approval: the model proposed a tool call but no
+    # ToolEvent / result exists yet.
+    mid_approval: list[Event] = [_tool_call_event(_bash_call(command="rm -rf x"))]
+    notifs = list(replay_transcript(mid_approval, session_id="s"))
+    assert _starts(notifs) == []  # not synthesized as a (non-cancelable) bridged card
+
+    # snapshot captured AFTER the tool ran: the real ToolEvent is present, so the
+    # normal react path renders it (cancelable, not via the bridge synth path).
+    after_run: list[Event] = [
+        _tool_call_event(_bash_call(command="rm -rf x")),
+        ToolEvent(
+            id="tc1", function="bash", arguments={"command": "rm -rf x"}, result="ok"
+        ),
+    ]
+    notifs2 = list(replay_transcript(after_run, session_id="s"))
+    starts = [s for s in _starts(notifs2) if s.tool_call_id == "tc1"]
+    assert len(starts) == 1
+    # react card carries no non-cancelable marker (the affordance stays available)
+    meta = getattr(starts[0], "field_meta", None) or {}
+    assert TOOL_CALL_CANCELABLE_META_KEY not in meta
+
+
+def test_replay_bridge_card_failed_on_error() -> None:
+    """A bridged result carrying an error replays as a failed card."""
+    events = [
+        _tool_call_event(_bash_call()),
+        _result_event(
+            ChatMessageTool(
+                tool_call_id="tc1",
+                function="bash",
+                content="boom",
+                error=ToolCallError(type="unknown", message="boom"),
+            )
+        ),
+    ]
+    notifs = list(replay_transcript(events, session_id="s"))
+    starts = _starts(notifs)
+    assert len(starts) == 1
+    assert starts[0].status == "failed"
+
+
+def test_replay_mixed_bridge_and_react_each_once() -> None:
+    """A snapshot mixing a bridged call and a react call yields one card each."""
+    events: list[Event] = [
+        _tool_call_event(_bash_call("tc_bridge", "ls")),
+        _result_event(
+            ChatMessageTool(tool_call_id="tc_bridge", function="bash", content="ok")
+        ),
+        _tool_call_event(ToolCall(id="tc_react", function="my_tool", arguments={})),
+        ToolEvent(id="tc_react", function="my_tool", arguments={}, result="done"),
+    ]
+    notifs = list(replay_transcript(events, session_id="s"))
+    ids = sorted(s.tool_call_id for s in _starts(notifs))
+    assert ids == ["tc_bridge", "tc_react"]
+
+
+# ---------------------------------------------------------------------------
+# Host tools a sandbox bridge runs for the scaffold (``bridged_tools``)
+# ---------------------------------------------------------------------------
+
+
+def _host_tool_event(
+    tool_id: str, *, proposal_id: str | None, pending: bool | None = None
+) -> ToolEvent:
+    """A host tool event as the sandbox bridge records it."""
+    return ToolEvent(
+        id=tool_id,
+        function="read_file",
+        arguments={"path": "a"},
+        pending=pending,
+        metadata={
+            "bridge": {
+                "server": "host",
+                "tool": "read_file",
+                "function": "mcp__host__read_file",
+                "proposal_id": proposal_id,
+                "grant": "consumed" if proposal_id else "exempt",
+            }
+        },
+    )
+
+
+def _read_call(tool_id: str = "tc1") -> ToolCall:
+    return ToolCall(
+        id=tool_id, function="mcp__host__read_file", arguments={"path": "a"}
+    )
+
+
+def test_host_tool_event_settles_its_synthesized_card_once() -> None:
+    """The real event updates the card; the scaffold's result does not settle it again."""
+    tr = Transcript()
+    token = _transcript.set(tr)
+    try:
+        _, published = _attach_router(_new_session())
+        with bridge_model_generate():
+            tr._event(_tool_call_event(_read_call()))
+        event = _host_tool_event("tc1", proposal_id="tc1", pending=True)
+        tr._event(event)
+        event._set_result(
+            result="contents",
+            truncated=None,
+            error=None,
+            working_time=0,
+            agent=None,
+            failed=None,
+            message_id=None,
+        )
+        tr._event_updated(event)
+        settled = len(published)
+        with bridge_model_generate():
+            tr._event(
+                _result_event(
+                    ChatMessageTool(
+                        tool_call_id="tc1",
+                        function="mcp__host__read_file",
+                        content="contents",
+                    )
+                )
+            )
+
+        starts = _starts(published)
+        assert [s.tool_call_id for s in starts] == ["tc1"]
+        # the start keeps the title the model-facing name gave it
+        assert starts[0].title is not None
+        updates = [p for p in _progress(published) if p.tool_call_id == "tc1"]
+        assert [u.status for u in updates] == ["in_progress", "completed"]
+        # the synthesized start was non-cancelable; the real pending event
+        # can be cancelled, so its first update says so
+        assert starts[0].field_meta == {TOOL_CALL_CANCELABLE_META_KEY: False}
+        assert updates[0].field_meta == {TOOL_CALL_CANCELABLE_META_KEY: True}
+        assert not [
+            n
+            for n in published[settled:]
+            if isinstance(n.update, (ToolCallStart, ToolCallProgress))
+        ]
+    finally:
+        _transcript.reset(token)
+
+
+def test_unpaired_host_tool_event_gets_its_own_card() -> None:
+    tr = Transcript()
+    token = _transcript.set(tr)
+    try:
+        _, published = _attach_router(_new_session())
+        with bridge_model_generate():
+            tr._event(_tool_call_event(_read_call()))
+        tr._event(_host_tool_event("fresh", proposal_id=None))
+
+        assert [s.tool_call_id for s in _starts(published)] == ["tc1", "fresh"]
+        fresh = _starts(published)[1]
+        assert fresh.status == "completed"
+    finally:
+        _transcript.reset(token)
+
+
+def test_replay_host_tool_event_is_one_card() -> None:
+    events: list[Event] = [
+        _tool_call_event(_read_call()),
+        _host_tool_event("tc1", proposal_id="tc1"),
+        _result_event(
+            ChatMessageTool(
+                tool_call_id="tc1", function="mcp__host__read_file", content="contents"
+            )
+        ),
+    ]
+    notifs = list(replay_transcript(events, session_id="s"))
+    starts = _starts(notifs)
+    assert [s.tool_call_id for s in starts] == ["tc1"]
+    assert starts[0].status == "completed"
+    assert TOOL_CALL_CANCELABLE_META_KEY not in (starts[0].field_meta or {})
+    assert _progress(notifs) == []
+
+
+async def test_turn_cancel_marks_a_running_host_tool_cancelled() -> None:
+    """ACP's turn cancel stamps the host event; the runner still records the result."""
+    started = anyio.Event()
+    release = anyio.Event()
+
+    @tool
+    def read_file() -> Tool:
+        async def execute(path: str) -> str:
+            """Read a file from the host.
+
+            Args:
+                path: Path of the file.
+            """
+            started.set()
+            await release.wait()
+            return "contents"
+
+        return execute
+
+    bridge = SandboxAgentBridge(
+        state=AgentState(messages=[]),
+        filter=None,
+        retry_refusals=None,
+        compaction=None,
+        port=13131,
+        model=None,
+        bridged_tools={"host": {"read_file": read_file()}},
+        proposal_exempt_servers={"host"},
+    )
+
+    async def read_a() -> None:
+        await call_tool(bridge)("host", "read_file", {"path": "a"})
+
+    transcript = Transcript()
+    emissions: list[tuple[Event, bool | None]] = []
+    transcript._subscribe(lambda e: emissions.append((e, e.pending)))
+    token = _transcript.set(transcript)
+    sample = acp_test_active_sample(transcript)
+    session = sample.acp_transport
+    assert isinstance(session, LiveAcpTransport)
+    sample_token = samples_var.set(sample)
+    try:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(read_a)
+            await started.wait()
+            [event] = [e for e in transcript.events if isinstance(e, ToolEvent)]
+
+            session.cancel_current_turn()
+
+            assert event.pending is None
+            assert event.failed is True
+            assert event.error is not None and event.error.type == "cancelled"
+            [interrupt] = [
+                e for e in transcript.events if isinstance(e, InterruptEvent)
+            ]
+            assert interrupt.interrupted_tool_call_id == event.id
+            release.set()
+    finally:
+        samples_var.reset(sample_token)
+        _transcript.reset(token)
+
+    assert event.result == "contents"
+    assert event.completed is not None
+    assert event.error is not None and event.error.type == "cancelled"
+    assert event.failed is True
+    assert sum(1 for e, pending in emissions if e is event and not pending) == 2
+
+
+# ---------------------------------------------------------------------------
+# Host tool calls attributed to a sub-agent span
+# ---------------------------------------------------------------------------
+
+
+def _sub_agent_execution(*, overlap: bool) -> tuple[list[Event], ToolEvent]:
+    """A sub-agent's host tool call, executed after (or finishing after) its span closed.
+
+    The sandbox bridge records the call in the span a ``ModelEventSink`` gave
+    the proposing generation. codex_cli's sink closes that span in a later
+    generation, so an execution can be emitted after the close; with
+    ``overlap`` the call starts while the span is open and completes after.
+    Returns the transcript's events (the host event still pending) and the
+    host event, which the caller completes after the last of them.
+    """
+    proposing = _tool_call_event(_read_call("proposed"))
+    proposing.span_id = "agent-sub"
+    host = _host_tool_event("proposed", proposal_id="proposed", pending=True)
+    host.span_id = "agent-sub"
+    tool_span = SpanBeginEvent(
+        id="tool-span", parent_id="agent-sub", type="tool", name="read_file"
+    )
+    tool_span.span_id = "agent-sub"
+    nested = InfoEvent(data="reading")
+    nested.span_id = "tool-span"
+    close = SpanEndEvent(id="agent-sub")
+    close.span_id = "agent-sub"
+    execution: list[Event] = [tool_span, host, nested]
+    events: list[Event] = [
+        SpanBeginEvent(id="outer", type="agent", name="main"),
+        SpanBeginEvent(id="agent-sub", parent_id="outer", type="agent", name="sub"),
+        proposing,
+    ]
+    events += [*execution, close] if overlap else [close, *execution]
+    return events, host
+
+
+def _complete(event: ToolEvent) -> None:
+    event._set_result(
+        result="contents",
+        truncated=None,
+        error=None,
+        working_time=0,
+        agent=None,
+        failed=None,
+        message_id=None,
+    )
+
+
+def _tool_card_ids(published: list[SessionNotification]) -> list[str]:
+    return [
+        n.update.tool_call_id
+        for n in published
+        if isinstance(n.update, (ToolCallStart, ToolCallProgress))
+    ]
+
+
+@pytest.mark.parametrize("overlap", [False, True], ids=["after-close", "overlap"])
+@pytest.mark.parametrize("filtered", [True, False], ids=["filtered", "unfiltered"])
+def test_live_sub_agent_host_call_follows_its_attributed_span(
+    overlap: bool, filtered: bool
+) -> None:
+    tr = Transcript()
+    token = _transcript.set(tr)
+    try:
+        session = _new_session()
+        session._filter_subagent_events = filtered
+        _, published = _attach_router(session)
+        events, host = _sub_agent_execution(overlap=overlap)
+        for event in events:
+            with (
+                bridge_model_generate()
+                if isinstance(event, ModelEvent)
+                else nullcontext()
+            ):
+                tr._event(event)
+        _complete(host)
+        tr._event_updated(host)
+
+        cards = _tool_card_ids(published)
+        if filtered:
+            assert cards == []
+        else:
+            assert "proposed" in cards
+    finally:
+        _transcript.reset(token)
+
+
+@pytest.mark.parametrize("overlap", [False, True], ids=["after-close", "overlap"])
+@pytest.mark.parametrize("filtered", [True, False], ids=["filtered", "unfiltered"])
+def test_replay_sub_agent_host_call_follows_its_attributed_span(
+    overlap: bool, filtered: bool
+) -> None:
+    events, host = _sub_agent_execution(overlap=overlap)
+    _complete(host)
+    notifs = list(replay_transcript(events, session_id="s", filter_subagents=filtered))
+
+    cards = _tool_card_ids(notifs)
+    if filtered:
+        assert cards == []
+    else:
+        assert "proposed" in cards
+
+
+def test_tracker_forgets_spans_closed_outside_sub_agents() -> None:
+    """Span ancestry does not grow with spans that close at the top level.
+
+    Every host tool call opens its own ``tool`` span; only spans inside a
+    sub-agent are kept, since a late event can still name them.
+    """
+    tracker = SubagentDepthTracker()
+    tracker.process(SpanBeginEvent(id="outer", type="agent", name="main"))
+    for index in range(1000):
+        tracker.process(
+            SpanBeginEvent(id=f"tool-{index}", parent_id="outer", type="tool", name="t")
+        )
+        tracker.process(SpanEndEvent(id=f"tool-{index}"))
+
+    tracker.process(
+        SpanBeginEvent(id="agent-sub", parent_id="outer", type="agent", name="sub")
+    )
+    tracker.process(
+        SpanBeginEvent(id="sub-tool", parent_id="agent-sub", type="tool", name="t")
+    )
+    tracker.process(SpanEndEvent(id="sub-tool"))
+    tracker.process(SpanEndEvent(id="agent-sub"))
+    tracker.process(SpanEndEvent(id="outer"))
+
+    assert set(tracker._span_parents) == {"agent-sub", "sub-tool"}
+    late = InfoEvent(data="late")
+    late.span_id = "sub-tool"
+    assert tracker.process(late) == "skip"
+    top = InfoEvent(data="top")
+    top.span_id = "tool-7"
+    assert tracker.process(top) == "emit"

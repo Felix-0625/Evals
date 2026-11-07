@@ -1,0 +1,50 @@
+import clsx from "clsx";
+import { ButtonHTMLAttributes, FC, forwardRef, ReactNode } from "react";
+
+import { Icon, IconName } from "@tsmono/react/icons";
+
+import styles from "./ColumnHeader.module.css";
+
+interface ColumnHeaderProps {
+  label?: string;
+  actions?: ReactNode;
+}
+
+export const ColumnHeader: FC<ColumnHeaderProps> = ({ label, actions }) => {
+  return (
+    <div className={clsx(styles.header)}>
+      <div
+        className={clsx(
+          "text-size-smallest",
+          "text-style-label",
+          "text-style-secondary"
+        )}
+      >
+        {label}
+      </div>
+      {actions && <div className={styles.actions}>{actions}</div>}
+    </div>
+  );
+};
+
+interface ColumnHeaderButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
+  icon: IconName;
+}
+
+export const ColumnHeaderButton = forwardRef<
+  HTMLButtonElement,
+  ColumnHeaderButtonProps
+>(({ icon, className, ...rest }, ref) => {
+  return (
+    <button
+      ref={ref}
+      type="button"
+      className={clsx(styles.iconButton, className)}
+      {...rest}
+    >
+      <Icon name={icon} />
+    </button>
+  );
+});
+
+ColumnHeaderButton.displayName = "ColumnHeaderButton";

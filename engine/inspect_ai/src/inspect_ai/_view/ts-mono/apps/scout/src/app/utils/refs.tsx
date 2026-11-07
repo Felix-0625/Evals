@@ -1,0 +1,255 @@
+import { FC, ReactNode, useCallback, useMemo } from "react";
+import { useSearchParams } from "react-router";
+
+import type { Event } from "@tsmono/inspect-common/types";
+import { ChatView } from "@tsmono/inspect-components/chat";
+import {
+  kTranscriptCollapseScope,
+  TranscriptViewNodes,
+  useEventNodes,
+} from "@tsmono/inspect-components/transcript";
+import { MarkdownReference } from "@tsmono/react/components";
+import { getOwn } from "@tsmono/util";
+
+import { scanResultRoute } from "../../router/url";
+import { useScanRoute } from "../../router/useScanRoute";
+import { useStore } from "../../state/store";
+import { ScannerInput } from "../../types/api-types";
+import {
+  isEventInput,
+  isEventsInput,
+  isMessageInput,
+  isMessagesInput,
+  isTranscriptInput,
+  ScanResultSummary,
+} from "../types";
+
+export type MakeReferenceUrl = (
+  ref: string,
+  type: "message" | "event"
+) => string | undefined;
+
+export const useMarkdownRefs = (
+  summary?: ScanResultSummary,
+  inputData?: ScannerInput
+) => {
+  const { scansDir, scanPath } = useScanRoute();
+  const [currentSearchParams] = useSearchParams();
+
+  // Build URL to the scan result with the appropriate query parameters
+  // TODO: lint react-hooks/preserve-manual-memoization - the lint seems to be a bug in the rule that doesn't account for the ?
+  // eslint-disable-next-line react-hooks/preserve-manual-memoization
+  const buildUrl = useMemo(() => {
+    if (!summary?.identifier) {
+      return (queryParams: string) => `?${queryParams}`;
+    }
+
+    return (queryParams: string) => {
+      if (!scansDir) {
+        return `?${queryParams}`;
+      }
+      // Start with current search params to preserve validation, etc.
+      const mergedParams = new URLSearchParams(currentSearchParams);
+      // Add/override with new params
+      const newParams = new URLSearchParams(queryParams);
+      for (const [key, value] of newParams) {
+        mergedParams.set(key, value);
+      }
+      return `#${scanResultRoute(scansDir, scanPath, summary.identifier, mergedParams)}`;
+    };
+    // Use .toString() for currentSearchParams since URLSearchParams object reference
+    // may not change when URL changes, causing stale closures
+  }, [summary?.identifier, scanPath, scansDir, currentSearchParams]);
+
+  const refs: MarkdownReference[] = summary
+    ? toMarkdownRefs(
+        summary,
+        (refId: string, type: "message" | "event") => {
+          if (type === "message") {
+            return buildUrl(`message=${encodeURIComponent(refId)}`);
+          } else {
+            return buildUrl(`event=${encodeURIComponent(refId)}`);
+          }
+        },
+        inputData
+      )
+    : [];
+  return refs;
+};
+
+export const toMarkdownRefs = (
+  summary: ScanResultSummary,
+  makeReferenceUrl: MakeReferenceUrl,
+  inputData?: ScannerInput
+) => {
+  const refLookup = referenceTable(inputData);
+
+  const refs: MarkdownReference[] = [];
+  for (const ref of summary.messageReferences) {
+    const renderPreview = getOwn(refLookup, ref.id);
+    const refUrl = makeReferenceUrl(ref.id, "message");
+    if (ref.cite && (renderPreview || refUrl)) {
+      refs.push({
+        id: ref.id,
+        cite: ref.cite,
+        citePreview: renderPreview,
+        citeUrl: refUrl,
+      });
+    }
+  }
+
+  for (const ref of summary.eventReferences) {
+    const renderPreview = getOwn(refLookup, ref.id);
+    const refUrl = makeReferenceUrl(ref.id, "event");
+    if (ref.cite && (renderPreview || refUrl)) {
+      refs.push({
+        id: ref.id,
+        cite: ref.cite,
+        citePreview: renderPreview,
+        citeUrl: refUrl,
+      });
+    }
+  }
+  return refs;
+};
+
+const referenceTable = (
+  inputData?: ScannerInput
+): Record<string, () => ReactNode> => {
+  if (!inputData) {
+    return {};
+  }
+
+  if (isMessageInput(inputData)) {
+    if (!inputData.input.id) {
+      return {};
+    }
+    return {
+      [inputData.input.id]: () => {
+        return (
+          <ChatView
+            id={`ref-preview-${inputData.input.id}`}
+            messages={[inputData.input]}
+            tools={{ collapseToolMessages: false }}
+          />
+        );
+      },
+    };
+  } else if (isMessagesInput(inputData)) {
+    return inputData.input.reduce<Record<string, () => ReactNode>>(
+      (acc, msg) => {
+        if (msg.id) {
+          acc[msg.id] = () => {
+            return (
+              <ChatView
+                id={`ref-preview-${msg.id}`}
+                messages={[msg]}
+                tools={{ collapseToolMessages: false }}
+              />
+            );
+          };
+        }
+        return acc;
+      },
+      {}
+    );
+  } else if (isEventInput(inputData)) {
+    if (!inputData.input.uuid) {
+      return {};
+    }
+
+    return {
+      [inputData.input.uuid]: () => {
+        return (
+          <TranscriptView
+            id={"input-event-preview"}
+            events={[inputData.input]}
+          />
+        );
+      },
+    };
+  } else if (isEventsInput(inputData)) {
+    return inputData.input.reduce<Record<string, () => ReactNode>>(
+      (acc, event, index) => {
+        if (event.uuid) {
+          acc[event.uuid] = () => {
+            return (
+              <TranscriptView
+                id={`input-event-preview-${index}`}
+                events={inputData.input}
+              />
+            );
+          };
+        }
+        return acc;
+      },
+      {}
+    );
+  } else if (isTranscriptInput(inputData)) {
+    const eventRefs = inputData.input.events.reduce<
+      Record<string, () => ReactNode>
+    >((acc, event) => {
+      if (event.uuid) {
+        acc[event.uuid] = () => {
+          return <TranscriptView id={"input-event-preview"} events={[event]} />;
+        };
+      }
+      return acc;
+    }, {});
+
+    const messageRefs = inputData.input.messages.reduce<
+      Record<string, () => ReactNode>
+    >((acc, msg) => {
+      if (msg.id) {
+        acc[msg.id] = () => {
+          return (
+            <ChatView
+              id={`ref-preview-${msg.id}`}
+              messages={[msg]}
+              tools={{ collapseToolMessages: false }}
+            />
+          );
+        };
+      }
+      return acc;
+    }, {});
+    return { ...eventRefs, ...messageRefs };
+  } else {
+    return {};
+  }
+};
+
+// =============================================================================
+// Inline transcript preview component (replaces the old TranscriptView wrapper)
+// =============================================================================
+
+const TranscriptView: FC<{ id: string; events: Event[] }> = ({
+  id,
+  events,
+}) => {
+  const { eventNodes, defaultCollapsedIds } = useEventNodes(events, false);
+  const collapsedEvents = useStore((state) => state.transcriptCollapsedEvents);
+  const setTranscriptCollapsedEvent = useStore(
+    (state) => state.setTranscriptCollapsedEvent
+  );
+
+  const collapsedTranscript = collapsedEvents[kTranscriptCollapseScope];
+
+  const onCollapseTranscript = useCallback(
+    (nodeId: string, collapsed: boolean) => {
+      setTranscriptCollapsedEvent(kTranscriptCollapseScope, nodeId, collapsed);
+    },
+    [setTranscriptCollapsedEvent]
+  );
+
+  return (
+    <TranscriptViewNodes
+      id={id}
+      eventNodes={eventNodes}
+      defaultCollapsedIds={defaultCollapsedIds}
+      collapsedTranscript={collapsedTranscript}
+      onCollapseTranscript={onCollapseTranscript}
+      keyboardNavDisabled={true}
+    />
+  );
+};

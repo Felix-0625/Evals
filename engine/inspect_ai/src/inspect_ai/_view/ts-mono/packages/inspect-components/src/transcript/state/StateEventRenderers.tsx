@@ -1,0 +1,403 @@
+import clsx from "clsx";
+import { FC, Fragment, JSX, ReactNode } from "react";
+
+import type { JsonChange } from "@tsmono/inspect-common/types";
+import { ChatView } from "@tsmono/inspect-components/chat";
+import { HumanBaselineView, SessionLog } from "@tsmono/react/components";
+import { isRecord } from "@tsmono/util";
+
+import { isChatMessage } from "../../chat/types";
+
+import { indexedItems, resolveAfter } from "./changeDiff";
+import styles from "./StateEventRenderers.module.css";
+
+interface Signature {
+  remove: string[];
+  replace: string[];
+  add: string[];
+}
+
+interface ChangeType {
+  type: string;
+  /** Render events matching this signature under the Default event filter
+   *  (rich previews like the human-baseline terminal session). */
+  defaultVisible?: boolean;
+  signature?: Signature;
+  match?: (changes: JsonChange[]) => boolean;
+  render: (changes: JsonChange[], eventNodeId: string) => JSX.Element;
+}
+
+const system_msg_added_sig: ChangeType = {
+  type: "system_message",
+  signature: {
+    remove: ["/messages/0/source"],
+    replace: ["/messages/0/role", "/messages/0/content"],
+    add: ["/messages/1"],
+  },
+  render: (changes) => {
+    const message = resolveAfter(changes, "/messages/0");
+    if (!isChatMessage(message)) {
+      return <></>;
+    }
+    return (
+      <ChatView
+        key="system_msg_event_preview"
+        id="system_msg_event_preview"
+        messages={[message]}
+      />
+    );
+  },
+};
+
+// Every value below is read out of a JSON-patch change — untyped wire data.
+// These keep what matches and drop what doesn't, so a malformed log renders
+// less rather than rendering wrong.
+const readNumber = (value: unknown): number | undefined =>
+  typeof value === "number" ? value : undefined;
+
+const readString = (value: unknown): string | undefined =>
+  typeof value === "string" ? value : undefined;
+
+/** Shallow: Tools renders a name and description, and skips what lacks them. */
+const isToolDefinition = (value: unknown): value is ToolDefinition =>
+  isRecord(value) && typeof value["name"] === "string";
+
+const kToolPattern = "/tools/(\\d+)";
+
+const use_tools: ChangeType = {
+  type: "use_tools",
+  signature: {
+    add: ["/tools/0"],
+    replace: ["/tool_choice"],
+    remove: [],
+  },
+  render: (changes) => {
+    return renderTools(changes);
+  },
+};
+
+const add_tools: ChangeType = {
+  type: "add_tools",
+  signature: {
+    add: [kToolPattern],
+    replace: [],
+    remove: [],
+  },
+  render: (changes) => {
+    return renderTools(changes);
+  },
+};
+
+const messages: ChangeType = {
+  type: "messages",
+  match: (changes: JsonChange[]) => {
+    const allMessages = changes.every((change) => {
+      if (
+        isRecord(change.value) &&
+        change.op === "add" &&
+        change.path.match(/\/messages\/\d+/)
+      ) {
+        return (
+          typeof change.value["role"] === "string" &&
+          ["user", "assistant", "system", "tool"].includes(change.value["role"])
+        );
+      }
+      return false;
+    });
+    return allMessages;
+  },
+  render: (changes) => {
+    const msgs = changes.map((c): unknown => c.value).filter(isChatMessage);
+    return (
+      <ChatView
+        key="system_msg_event_preview"
+        id="system_msg_event_preview"
+        messages={msgs}
+      />
+    );
+  },
+};
+
+const humanAgentKey = (key: string) => {
+  return `HumanAgentState:${key}`;
+};
+const human_baseline_session: ChangeType = {
+  type: "human_baseline_session",
+  defaultVisible: true,
+  signature: {
+    add: ["HumanAgentState:logs"],
+    replace: [],
+    remove: [],
+  },
+  render: (changes, eventNodeId) => {
+    const read = (key: string) =>
+      resolveAfter(changes, `/${humanAgentKey(key)}`);
+    // Read the session values
+    const started = readNumber(read("started_running"));
+    const runtime = readNumber(read("accumulated_time"));
+    const answer = readString(read("answer"));
+    const completed = !!answer;
+    const running = read("running_state") === true;
+    const rawSessions = read("logs");
+
+    // Tweak the date value
+    const startedDate = started ? new Date(started * 1000) : undefined;
+
+    // Collect raw parts keyed by timestamp, then keep only entries with required fields
+    const partial = new Map<string, Partial<SessionLog>>();
+    if (isRecord(rawSessions)) {
+      for (const [key, raw] of Object.entries(rawSessions)) {
+        const value = readString(raw);
+        if (value === undefined) continue;
+        // <user>_<timestamp>.<type>
+        const match = key.match(/(.*)_(\d+_\d+)\.(.*)/);
+        if (!match) continue;
+
+        const [, user, timestamp, type] = match;
+        if (!timestamp) continue;
+
+        const entry = partial.get(timestamp) ?? {};
+        partial.set(timestamp, entry);
+
+        if (
+          type === "input" ||
+          type === "output" ||
+          type === "timing" ||
+          type === "name"
+        ) {
+          entry[type] = value;
+        }
+        if (user) {
+          entry.user = user;
+        }
+      }
+    }
+
+    const sessionLogs = [...partial.values()].filter(
+      (s): s is SessionLog => !!s.input && !!s.output && !!s.timing
+    );
+
+    return (
+      <HumanBaselineView
+        key="human_baseline_view"
+        id={eventNodeId}
+        started={startedDate}
+        running={running}
+        completed={completed}
+        answer={answer}
+        runtime={runtime}
+        sessionLogs={sessionLogs}
+      />
+    );
+  },
+};
+
+const renderTools = (changes: JsonChange[]) => {
+  // Find which tools were added in this change
+  const toolIndexes: string[] = [];
+  for (const change of changes) {
+    const match = change.path.match(kToolPattern);
+    if (match?.[1]) {
+      toolIndexes.push(match[1]);
+    }
+  }
+
+  const toolName = (toolChoice: unknown): string => {
+    if (isRecord(toolChoice)) {
+      return readString(toolChoice["name"]) ?? "";
+    } else {
+      return String(toolChoice);
+    }
+  };
+
+  const toolsInfo: Record<string, ReactNode> = {};
+
+  // Show tool choice if it was changed
+  const hasToolChoice = changes.find((change) => {
+    return change.path.startsWith("/tool_choice");
+  });
+  const toolChoice = resolveAfter(changes, "/tool_choice");
+  if (toolChoice && hasToolChoice) {
+    toolsInfo["Tool Choice"] = (
+      <span className={clsx("text-size-smaller")}>{toolName(toolChoice)}</span>
+    );
+  }
+
+  // Show either all tools or just the specific tools
+  const tools = indexedItems(resolveAfter(changes, "/tools"));
+  if (tools.length > 0) {
+    const shown =
+      toolIndexes.length === 0
+        ? tools
+        : tools.filter(([index]) => toolIndexes.includes(index));
+    toolsInfo["Tools"] = (
+      <Tools
+        toolDefinitions={shown.map(([, tool]) => tool).filter(isToolDefinition)}
+      />
+    );
+  }
+
+  return (
+    <div key={"state-diff-tools"} className={clsx(styles.tools)}>
+      {Object.keys(toolsInfo).map((key) => {
+        return (
+          <Fragment key={key}>
+            <div
+              className={clsx(
+                "text-size-smaller",
+                "text-style-label",
+                "text-style-secondary"
+              )}
+            >
+              {key}
+            </div>
+            {toolsInfo[key]}
+          </Fragment>
+        );
+      })}
+    </div>
+  );
+};
+
+const createMessageRenderer = (name: string, role: string): ChangeType => {
+  return {
+    type: name,
+    match: (changes: JsonChange[]) => {
+      if (changes.length === 1) {
+        const change = changes[0];
+        if (
+          change &&
+          isRecord(change.value) &&
+          change.op === "add" &&
+          change.path.match(/\/messages\/\d+/)
+        ) {
+          return change.value["role"] === role;
+        }
+      }
+      return false;
+    },
+    render: (changes) => {
+      const message = changes[0]?.value;
+      if (!isChatMessage(message)) return <></>;
+      return (
+        <ChatView
+          key="system_msg_event_preview"
+          id="system_msg_event_preview"
+          messages={[message]}
+        />
+      );
+    },
+  };
+};
+
+export const RenderableChangeTypes: ChangeType[] = [
+  system_msg_added_sig,
+  createMessageRenderer("assistant_msg", "assistant"),
+  createMessageRenderer("user_msg", "user"),
+  use_tools,
+  add_tools,
+  messages,
+];
+
+export const StoreSpecificRenderableTypes: ChangeType[] = [
+  human_baseline_session,
+];
+
+/** Whether `changes` satisfy a signature (every add/remove/replace pattern matched). */
+export const matchesChangeSignature = (
+  changes: JsonChange[],
+  signature: Signature
+): boolean => {
+  const required =
+    signature.add.length + signature.remove.length + signature.replace.length;
+  let matching = 0;
+  for (const change of changes) {
+    const patterns =
+      change.op === "add"
+        ? signature.add
+        : change.op === "remove"
+          ? signature.remove
+          : change.op === "replace"
+            ? signature.replace
+            : [];
+    for (const pattern of patterns) {
+      if (change.path.match(pattern)) {
+        matching++;
+      }
+    }
+  }
+  return required > 0 && matching === required;
+};
+
+/** Whether a store event's changes match a renderer marked default-visible
+ *  (e.g. the human-baseline terminal session view). */
+export const storeEventHasDefaultVisiblePreview = (
+  changes: JsonChange[]
+): boolean =>
+  StoreSpecificRenderableTypes.some(
+    (changeType) =>
+      changeType.defaultVisible &&
+      changeType.signature &&
+      matchesChangeSignature(changes, changeType.signature)
+  );
+
+interface ToolParameters {
+  type: string;
+  properties: {
+    code: ToolProperty;
+  };
+  required: string[];
+}
+
+interface ToolProperty {
+  type: string;
+  description: string;
+}
+
+interface ToolDefinition {
+  name: string;
+  description: string;
+  parameters?: ToolParameters;
+}
+
+interface ToolsProps {
+  toolDefinitions: ToolDefinition[];
+}
+/**
+ * Renders a list of tool components based on the provided tool definitions.
+ */
+export const Tools: FC<ToolsProps> = ({ toolDefinitions }) => {
+  return (
+    <div className={styles.toolsGrid}>
+      {toolDefinitions.map((toolDefinition, idx) => {
+        const name = toolDefinition.name;
+        const toolArgs = toolDefinition.parameters?.properties
+          ? Object.keys(toolDefinition.parameters.properties)
+          : [];
+        return (
+          <Tool key={`${name}-${idx}`} toolName={name} toolArgs={toolArgs} />
+        );
+      })}
+    </div>
+  );
+};
+
+interface ToolProps {
+  toolName: string;
+  toolArgs?: string[];
+  toolDesc?: string;
+}
+/**
+ * Renders a single tool component.
+ */
+export const Tool: FC<ToolProps> = ({ toolName, toolArgs }) => {
+  const functionCall =
+    toolArgs && toolArgs.length > 0
+      ? `${toolName}(${toolArgs.join(", ")})`
+      : toolName;
+  return (
+    <code className={clsx("text-size-smallest", styles.tool)}>
+      {functionCall}
+    </code>
+  );
+};

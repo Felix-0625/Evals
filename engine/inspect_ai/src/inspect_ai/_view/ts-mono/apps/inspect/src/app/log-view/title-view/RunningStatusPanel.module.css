@@ -1,0 +1,19 @@
+.statusContainer {
+  display: inline-block;
+  margin-top: 0.3em;
+}
+
+.status {
+  display: grid;
+  grid-template-columns: auto auto;
+}
+
+.statusText {
+  margin-top: 0.2em;
+}
+
+.icon {
+  font-size: var(--inspect-font-size-large);
+  margin-right: 0.3em;
+  margin-top: -0.1em;
+}

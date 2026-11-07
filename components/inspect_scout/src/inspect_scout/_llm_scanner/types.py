@@ -1,0 +1,74 @@
+from collections.abc import Sequence
+from typing import Any, Generic, Literal, TypeAlias, TypeVar
+
+from pydantic import BaseModel
+
+# stdlib NamedTuple only supports Generic from Python 3.11
+from typing_extensions import NamedTuple
+
+StructuredAnswerT = TypeVar(
+    "StructuredAnswerT", bound="BaseModel | Sequence[BaseModel]"
+)
+"""Type of a structured answer: a Pydantic model or a list of Pydantic models."""
+
+
+class AnswerMultiLabel(NamedTuple):
+    """Label descriptions for LLM scanner multi-classification."""
+
+    labels: list[str]
+    """List of label descriptions.
+
+    Label values (e.g. A, B, C) will be provided automatically.
+    """
+
+    allow_none: bool = False
+    """Allow the model to respond with NONE when no labels apply."""
+
+
+class AnswerStructured(NamedTuple, Generic[StructuredAnswerT]):
+    """Answer with structured output.
+
+    Structured answers are objects that conform to a JSON Schema. The answer
+    type parameter flows through to the type of ``Result.parsed`` in
+    ``generate_answer()`` and ``parse_answer()``.
+    """
+
+    type: type[StructuredAnswerT]
+    """Pydantic BaseModel that defines the type of the answer.
+
+    Can be a single Pydantic model result or a list of results.
+
+    See the docs on [Structured Answers](https://meridianlabs-ai.github.io/inspect_scout/llm_scanner.html#structured-answers) for more details on defining types.
+
+    See the docs on [Multiple Results](https://meridianlabs-ai.github.io/inspect_scout/llm_scanner.html#multiple-results) for details on prompting scanners to yield multiple results from a scan.
+    """
+
+    answer_tool: str = "answer"
+    """Customize the name of the answer tool provided to the model."""
+
+    answer_prompt: str = (
+        "Use the {{ answer_tool }}() tool to respond to the following request:"
+    )
+    """Template for prompt that precedes the question posed to the scanner (use the {{ answer_tool }} variable to refer to the name of the answer tool)."""
+
+    answer_format: str = (
+        "You should use the {{ answer_tool }}() tool to provide your final answer."
+    )
+    """Template for instructions on answer format to place at the end of the scanner prompt (use the {{ answer_tool }} variable to refer to the name of the answer tool)."""
+
+    max_attempts: int = 3
+    """Maximum number of times to re-prompt the model to generate the correct schema."""
+
+
+# We construct AnswerSpec this way so that we can prohibit AnswerStructured w/parse: False
+_TextualAnswerSpec: TypeAlias = (
+    Literal["boolean", "numeric", "string"] | list[str] | AnswerMultiLabel
+)
+AnswerSpec: TypeAlias = _TextualAnswerSpec | AnswerStructured[Any]
+"""Specification of the answer format for an LLM scanner.
+
+Pass ``"boolean"``, ``"numeric"``, or ``"string"`` for a simple answer;
+pass ``list[str]`` for a set of labels; pass :class:`AnswerMultiLabel`
+for multi-classification; or pass :class:`AnswerStructured` for
+tool-based structured output.
+"""

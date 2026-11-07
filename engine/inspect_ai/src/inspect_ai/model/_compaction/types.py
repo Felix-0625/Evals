@@ -1,0 +1,187 @@
+import abc
+from typing import Any, Literal, NamedTuple, Protocol
+
+from inspect_ai.model._chat_message import ChatMessage, ChatMessageUser
+from inspect_ai.model._model import Model
+from inspect_ai.model._model_output import ModelOutput
+from inspect_ai.tool._tool_info import ToolInfo
+
+
+class CompactionResult(NamedTuple):
+    """Result of a single `compact()` call.
+
+    `preserve_prefix` and `applied` describe the strategy that actually
+    produced `input`. For a delegating strategy such as `CompactionAuto`
+    that is not the strategy the caller configured, and the orchestrator
+    needs the delegate's values rather than the wrapper's.
+    """
+
+    input: list[ChatMessage]
+    """Input to present to the model."""
+
+    message: ChatMessageUser | None
+    """Optional message to append to the history (e.g. a summarization)."""
+
+    preserve_prefix: bool
+    """`preserve_prefix` of the strategy that produced this result."""
+
+    applied: str
+    """Class name of the strategy that produced this result."""
+
+    fallback_reason: str | None = None
+    """Why a delegating strategy did not use its preferred delegate."""
+
+
+class CompactionStrategy(abc.ABC):
+    """Compaction strategy."""
+
+    def __init__(
+        self,
+        *,
+        type: Literal["summary", "edit", "trim"],
+        threshold: int | float = 0.9,
+        memory: bool = True,
+    ):
+        """Compaction strategy.
+
+        Args:
+            type: Type of compaction performed.
+            threshold: Token count or percent of context window to trigger compaction.
+            memory: Warn the model to save critical content to memory prior
+                to compaction when the memory tool is available.
+        """
+        self.type = type
+        self.threshold = threshold
+        self._memory = memory
+
+    @property
+    def memory(self) -> bool:
+        """Whether to warn the model to save content to memory before compaction."""
+        return self._memory
+
+    def _repr_params_(self) -> dict[str, Any]:
+        return {
+            "type": self.type,
+            "threshold": self.threshold,
+            "memory": self.memory,
+        }
+
+    @property
+    def preserve_prefix(self) -> bool:
+        """Instruction to orchestrator: preserve prefix messages in compacted output.
+
+        When True (default), the orchestration layer will prepend any prefix
+        messages not already in the compacted output.
+
+        When False (native compaction), only system messages are prepended
+        since user content is either preserved by the provider (OpenAI) or
+        semantically encoded in the compaction block (Anthropic).
+        """
+        return True
+
+    @abc.abstractmethod
+    async def compact(
+        self, model: Model, messages: list[ChatMessage], tools: list[ToolInfo]
+    ) -> tuple[list[ChatMessage], ChatMessageUser | None]:
+        """Compact messages.
+
+        Args:
+            model: Target model for compaction.
+            messages: Full message history
+            tools: Available tools
+
+        Returns: Input to present to the model and (optionally) a message to append to the history (e.g. a summarization).
+        """
+        ...
+
+    async def compact_outcome(
+        self, model: Model, messages: list[ChatMessage], tools: list[ToolInfo]
+    ) -> CompactionResult:
+        """Compact messages and report which strategy applied.
+
+        The default implementation calls `compact()` and reports this
+        strategy's own values. Delegating strategies override this to
+        report the delegate that ran, so the orchestrator can apply that
+        delegate's prefix rule.
+
+        Args:
+            model: Target model for compaction.
+            messages: Full message history
+            tools: Available tools
+
+        Returns: The compacted input along with the prefix rule and identity
+            of the strategy that produced it.
+        """
+        input, message = await self.compact(model, messages, tools)
+        return CompactionResult(
+            input=input,
+            message=message,
+            preserve_prefix=self.preserve_prefix,
+            applied=type(self).__name__,
+        )
+
+
+class Compact(Protocol):
+    """Interface for compaction strategies."""
+
+    async def compact_input(
+        self,
+        messages: list[ChatMessage],
+        force: bool = False,
+    ) -> tuple[list[ChatMessage], ChatMessageUser | None]:
+        """Compact messages for input to the model.
+
+        Args:
+            messages: Full message history.
+            force: If True, perform compaction unconditionally (skip the
+                threshold gate). Used by overflow recovery paths after a
+                model_length error. The handler does not check that the
+                result is smaller than the input that overflowed, so a
+                caller that retries after a forced compaction should not
+                force compaction again if the retry also overflows.
+
+        Returns: Input to present to the model and (optionally) a message to append to the history (e.g. a summarization).
+        """
+        ...
+
+    async def record_output(
+        self, input: list[ChatMessage], output: ModelOutput
+    ) -> None:
+        """Record the output from a generate call.
+
+        Calibrates the compaction's token estimation against the actual
+        input token count from `output.input_context_tokens` (or
+        `output.usage` when that is None). This captures API-level
+        overhead (tool definitions, system messages, thinking configuration)
+        that per-message counting cannot.
+
+        `input` must be the messages that were passed to `model.generate`
+        — it determines the baseline message ids that produced
+        that count. This matters when one `Compact` instance is shared
+        across concurrent callers (e.g. via AgentBridge).
+
+        Args:
+            input: The list of messages that was passed to model.generate.
+            output: The ModelOutput from the generate call.
+        """
+        ...
+
+    async def reset(self, prefix: list[ChatMessage]) -> None:
+        """Start again from the next conversation passed to `compact_input()`.
+
+        Call this after the conversation was rewritten (messages changed,
+        removed or reordered), which `compact_input()` does not detect: it
+        adds only messages whose ids it has not seen. Clears the compacted
+        input, the ids folded into it, the token baseline and the memory
+        warning flag, and replaces the prefix.
+
+        It does not remove compaction summaries from your messages. A summary
+        strategy (including `CompactionAuto`'s summary fallback) starts its
+        next compaction from the latest summary in the conversation, so
+        before resetting, remove any summaries that the changed history
+        invalidated from the conversation you pass next.
+
+        Args:
+            prefix: Chat messages to always preserve in compacted conversations.
+        """
+        ...

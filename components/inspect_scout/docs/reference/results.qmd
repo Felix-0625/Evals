@@ -1,0 +1,30 @@
+---
+title: Results
+description: Inspecting scan status, retrieving result data frames, and validating predictions.
+reference: inspect_scout
+---
+
+## Results
+
+### scan_list
+### scan_status
+### Status
+### Summary
+### scan_results_df
+### ScanResultsDF
+### scan_results_arrow
+### ScanResultsArrow
+### scan_results_batches
+### HEAVY_COLUMNS
+
+## Validation
+
+### validation_set
+### validation_predicate
+### ValidationSet
+### ValidationCase
+### PredicateType
+### PredicateFn
+### ValidationPredicate
+
+

@@ -1,0 +1,64 @@
+{
+  "prepared_at": "2026-11-04T10:33:56+08:00",
+  "scope": "Fixed upstream provenance. Maintained imported trees and runtime versions are recorded below; verification scope is in docs/implementation-status.md.",
+  "sources": [
+    {
+      "origin": "https://github.com/UKGovernmentBEIS/inspect_ai.git",
+      "branch": "main",
+      "commit": "8cef181c1f04d3fae70db95c6e7bef5715df7260",
+      "clone_mode": "shallow",
+      "is_shallow": true,
+      "python_requirement": ">=3.11",
+      "license": "MIT",
+      "working_tree_clean": true,
+      "submodules_initialized": false,
+      "reference_directory": "inspect_ai",
+      "directory": "inspect_ai",
+      "imported_directory": "engine/inspect_ai",
+      "distribution_version": "0.3.287+evals.1",
+      "license_path": "engine/inspect_ai/LICENSE",
+      "reference_snapshot_note": "Cleanliness and shallow fields describe the original reference checkout, not the maintained tree."
+    },
+    {
+      "origin": "https://github.com/meridianlabs-ai/inspect_scout.git",
+      "branch": "main",
+      "commit": "4209e81f002b0ac6332a67cbcc1dd536011c682a",
+      "clone_mode": "shallow",
+      "is_shallow": true,
+      "python_requirement": ">=3.11",
+      "license": "MIT",
+      "working_tree_clean": true,
+      "submodules_initialized": false,
+      "reference_directory": "inspect_scout",
+      "directory": "inspect_scout",
+      "imported_directory": "components/inspect_scout",
+      "distribution_version": "0.5.5+evals.1",
+      "license_path": "components/inspect_scout/LICENSE",
+      "reference_snapshot_note": "Cleanliness and shallow fields describe the original reference checkout, not the maintained tree."
+    },
+    {
+      "origin": "https://github.com/gepa-ai/gepa.git",
+      "branch": "main",
+      "commit": "8c7b697a71977980afc7537dac0881e784eef99f",
+      "clone_mode": "shallow",
+      "is_shallow": true,
+      "python_requirement": ">=3.10, <3.15",
+      "license": "MIT",
+      "working_tree_clean": true,
+      "submodules_initialized": false,
+      "reference_directory": "gepa",
+      "directory": "gepa",
+      "imported_directory": "components/gepa",
+      "distribution_version": "0.1.4",
+      "license_path": "components/gepa/LICENSE",
+      "reference_snapshot_note": "Cleanliness and shallow fields describe the original reference checkout, not the maintained tree."
+    }
+  ],
+  "frontend": {
+    "origin": "https://github.com/meridianlabs-ai/ts-mono.git",
+    "commit": "91f2be5875fe2ee1d7201fe2290020c344d9bde7",
+    "imported_directory": "engine/inspect_ai/src/inspect_ai/_view/ts-mono",
+    "license": "MIT",
+    "license_path": "engine/inspect_ai/src/inspect_ai/_view/ts-mono/LICENSE"
+  }
+}

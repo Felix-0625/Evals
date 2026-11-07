@@ -1,0 +1,309 @@
+---
+title: "Inspect Scout"
+description: "Transcript Analysis for AI Agents"
+tbl-colwidths: [30,70]
+lightbox: true
+llms-description: "Installation and tutorial on basic usage"
+margin-footer: |
+  [![](images/meridian-logo-black.svg){width=125}](https://meridianlabs.ai)  \
+---
+
+## Welcome
+
+Welcome to Inspect Scout, a tool for in-depth analysis of AI agent transcripts. With Scout, you can easily:
+
+1.  Detect issues like misconfigured environments, refusals, and evaluation awareness using LLM-based or pattern-based scanners.
+2.  Analyze transcripts from Inspect, Arize Phoenix, LangSmith, Logfire, MLFLow, W&B Weave, Claude Code, Harbor, or custom sources via the capture and import APIs.
+3.  Develop scanners interactively, exploring transcripts and scan results visually in Scout View.
+4.  Validate scanner accuracy against human-labeled examples.
+5.  Handle complex scanning requirements like multi-agent transcripts, compaction, and context-window chunking.
+6.  Scale to thousands of transcripts with parallel processing, batching, and fault tolerance.
+
+
+### Installation
+
+Install the `inspect_scout` package from PyPI with:
+
+``` bash
+pip install inspect-scout
+```
+
+You should also be sure to install the [Inspect AI VS Code Extension](https://inspect.aisi.org.uk/vscode.html) which includes features for viewing and debugging Scout scans.
+
+## Scout Basics
+
+Below we'll provide some simple examples of creating and using Scout scanners. Some core components we'll make use of here include:
+
+-   **Transcript** --- LLM conversation to analyze (e.g. an agent rollout or a sample from an Inspect eval).
+
+-   **Scanner** --- Function that takes an input from a `Transcript` and returns a `Result` (conceptually very similar to an Inspect `Scorer`).
+
+-   **Results** --- Data frame(s) that includes the results of scanners applied to transcripts.
+
+### LLM Scanner
+
+{{< include _llm_scanner.md >}}
+
+
+### Grep Scanner
+
+{{< include _grep_scanner.md >}}
+
+
+### Custom Scanners
+
+{{< include _custom_scanner.md >}}
+
+
+### Running a Scan
+
+Use the `scout scan` command to run one or more scanners on a set of transcripts. The `Scanner` will be called once for each `Transcript`. For example:
+
+``` bash
+scout scan scanner.py -T ./logs --model openai/gpt-5
+```
+
+The `-T` argument indicates which transcripts to scan (in this case a local Inspect log directory). You can also scan from a [transcripts database](transcripts.qmd#transcripts-database) that is either local or on S3. For example, here we scan some W&B Weave transcripts stored on S3:
+
+``` bash
+scout scan scanner.py -T s3://cybench-rollouts --model openai/gpt-5
+```
+
+Note that when we using a model that requires an API  key you'll need to provide it in the enviroment (e.g. `OPENAI_API_KEY`). As with Inspect AI, you can use a [.env file](https://inspect.aisi.org.uk/options.html#env-files) for providing API keys.
+
+
+### Scout View
+
+Scout includes a viewer application for looking at scan results in depth. Run the viewer with:
+
+``` bash
+scout view
+```
+
+![](images/validation.png){.border}
+
+By default this will view the scan results in the `./scans` directory of the current working directory. Specify an alternate results location with:
+
+``` bash
+scout view --scans s3://my-scan-results
+```
+
+You can also list recent scans with the `scout scan list` command:
+
+```bash
+scout scan list
+```
+
+Scans will be listed from most to least recent. If you are running within VS Code you can click the scans in the list to view them in a VS Code editor. The VS Code Scout activity bar also includes a scans pane that lists recent scans.
+
+#### Remote Access
+
+By default, `scout view` binds to `127.0.0.1` on port 7576. For single-user access to a viewer on a remote machine, keep that loopback bind and use SSH port forwarding:
+
+``` bash
+ssh -L 7576:127.0.0.1:7576 user@remote
+```
+
+Run `scout view` normally on the remote machine, then open `http://127.0.0.1:7576` locally.
+
+If you forward to a different local port (for example `ssh -L 8080:127.0.0.1:7576 user@remote`, or VS Code Remote picking another free port), declare the address you open in the browser:
+
+``` bash
+scout view --trusted-origin http://127.0.0.1:8080
+```
+
+The origin must match the browser's address bar exactly. `http://localhost:8080` and `http://127.0.0.1:8080` are different origins, so repeat `--trusted-origin` if you use both. VS Code opens forwarded ports as `http://localhost:<port>`.
+
+If local DNS or a hosts file maps a custom name to loopback, declare that exact browser origin:
+
+``` bash
+scout view --trusted-origin http://my-scout:7576
+```
+
+In Posit Workbench, pass the session proxy URL as the root path. `rserver-url -l` prints the full URL, so Scout also trusts its origin:
+
+``` bash
+scout view --root-path "$(/usr/lib/rstudio-server/bin/rserver-url -l 7576)"
+```
+
+Every app served from the Workbench origin can then call Scout's API.
+
+Inside Jupyter, `jupyter-server-proxy` serves Scout under `proxy/7576/` and forwards the browser's `Host`. Pass the proxied path and the Jupyter origin. Under JupyterHub:
+
+``` bash
+scout view \
+  --root-path "${JUPYTERHUB_SERVICE_PREFIX}proxy/7576" \
+  --trusted-origin https://hub.example.org
+```
+
+For a local Jupyter server at `http://localhost:8888`:
+
+``` bash
+scout view --root-path /proxy/7576 --trusted-origin http://localhost:8888
+```
+
+Binding beyond loopback requires request authorization. For browser access, place Scout View behind an authenticating reverse proxy that injects the configured upstream authorization header:
+
+``` bash
+INSPECT_VIEW_AUTHORIZATION_TOKEN="$UPSTREAM_SECRET" \
+  scout view \
+  --host 0.0.0.0 \
+  --trusted-origin https://scout.example.org \
+  --root-path /scout
+```
+
+Load `UPSTREAM_SECRET` through your normal secret-management mechanism and set it to the complete expected `Authorization` header value (for example, `Bearer ...`). The proxy must authenticate the external user, remove any client-supplied copy of the upstream authorization header, and inject the configured value.
+
+Scout rejects requests whose `Host` header it doesn't trust. Either have the proxy forward the browser's `Host` unchanged (in nginx, `proxy_set_header Host $http_host;`), or add the `Host` the proxy sends with `--trusted-host`.
+
+For compatibility, an absolute `--root-path` such as `https://scout.example.org/scout` supplies its origin when no explicit `--trusted-origin` is provided. An explicit trusted origin is preferred, and a path-only `root_path` does not grant host or origin trust.
+
+Unauthenticated network exposure remains available only through an explicit acknowledgement:
+
+``` bash
+scout view \
+  --host 0.0.0.0 \
+  --trusted-origin "http://$MACHINE_IP:7576" \
+  --unsafe-allow-unauthenticated
+```
+
+This permits any network client that can reach the address to call viewer APIs. Exact Host and browser-origin validation and framing protection remain active. `--trusted-host` may add an exact authority for a non-browser client or health check, but does not authorize a browser origin. Hosting the frontend and API on different origins is not supported.
+
+### Projects
+
+In some cases you'll prefer to define your transcript source, scanning model, and other configuration once for a project rather than each time you run `scout scan`. You can do this with a `scout.yaml` project file. For example, if we have this project file in our working directory:
+
+```{.yaml filename="scout.yaml"}
+transcripts: s3://weave-rollouts/cybench
+model: openai/gpt-5
+```
+
+Then we can run our scan with simply:
+
+``` bash
+scout scan scanner.py 
+```
+
+Use Scout View to explore and manage project settings:
+
+![](images/project.png){.border}
+
+See the [Projects](projects.qmd) article for more details on managing configuration with projects.
+
+## Scan Jobs
+
+{{< include _scan_jobs.md >}}
+
+Note that if you had a scout.yaml [project file](#projects) defining the `transcripts`, `filter`, and `model` for your project, you could exclude them from your scan job as they will be automatically merged from the project.
+
+## Scan Results
+
+By default, the results of scans are written into the `./scans` directory. You can override this using the `--scans` option---both local file paths and remote filesystems (e.g. `s3://`) are supported.
+
+Each scan is stored in its own directory and has both metadata about the scan (configuration, errors, summary of results) as well as parquet files that contain the results. You can read the results as a dict of Pandas data frames using the `scan_results_df()` function:
+
+``` python
+# results as pandas data frames
+results = scan_results_df("scans/scan_id=iGEYSF6N7J3AoxzQmGgrZs")
+deception_df = results.scanners["deception"]
+tool_errors_df = results.scanners["tool_errors"]
+```
+
+See the [Results](results.qmd) article for more details on the columns available in the data frames returned by `scan_results_df()`.
+
+## Validation
+
+When developing scanners, it's often desirable to create a feedback loop based on human labeling of transcripts that indicate expected scanner results. You can do this by creating a validation set and applying it during your scan:
+
+![](images/validation-flow.jpg)
+
+The *validation set* is the set of labeled transcripts that are compared against scan results. Validation sets are typically associated with the domain of a particular scanner type (e.g. "evaluation awareness", "refusal", etc.) so you will likely develop many of them for use with different scanners.
+
+You can create and edit validation sets directly within the transcript or scan results view:
+
+![](images/validation-panel-transcripts.png){.border}
+
+Apply a validation set by passing it to `scan()`. For example:
+
+``` python
+from inspect_scout import scan, transcripts_from
+
+from my_scanners import eval_awareness
+
+scan(
+    scanners=[eval_awareness()],
+    transcripts=transcripts_from("./logs"),
+    validation="eval-awareness.csv"
+)
+```
+
+To learn more about building and using validation sets see the article on [Validation](validation.qmd).
+
+## Handling Errors
+
+If a scan job is interrupted either due to cancellation (Ctrl+C) or a runtime error, you can resume the scan from where it left off using the `scan resume` command. For example:
+
+``` bash
+scout scan resume "scans/scan_id=iGEYSF6N7J3AoxzQmGgrZs"
+```
+
+By default, if errors occur during an individual scan, they are caught and reported. You can then either retry the failed scans with `scan resume` or complete the scan (ignoring errors) with `scan complete`:
+
+![](images/scan-resume.png)
+
+If you prefer to fail immediately when an error occurs rather than capturing errors in results, use the `--fail-on-error` flag:
+
+``` bash
+scout scan scanner.py -T ./logs --fail-on-error
+```
+
+With this flag, any exception will cause the entire scan to terminate immediately. This can be valuable when developing a scanner.
+
+## Transcripts
+
+In the example(s) above we scanned all available transcripts. Often though you'll want to scan only a subset of transcripts. For example, here we filter down to only Cybench logs:
+
+``` python
+from inspect_scout (
+    import scan, transcripts_from, columns as c
+)
+
+from .scanners import deception, tool_errors
+
+transcripts = transcripts_from("s3://weave-rollouts")
+transcripts = transcripts.where(c.task_set == "cybench")
+
+status = scan(
+    scanners = [ctf_environment(), tool_errors()],
+    transcripts = transcripts
+)
+```
+
+The `columns` object (aliased to `c`) provides a convenient way to specify `where()` clauses for filtering transcripts.
+
+Note that doing this query required us to switch to the Python `scan()` API. We can still use the CLI if we wrap our transcript query in a `ScanJob`:
+
+{{< include _scanjob-transcripts.md >}}
+
+See the article on [Transcripts](transcripts.qmd) to learn more about the various ways to create, read, and filter transcripts.
+
+## Parallelism
+
+{{< include _parallelism.md >}}
+
+
+## Learning More
+
+Above we provided a high-level tour of Scout features. See the following articles to learn more about using Scout:
+
+-   [Scanners](scanners.qmd): Basics of using scanners including the high-level [LLM Scanner](llm_scanner.qmd) and [Grep Scanner](grep_scanner.qmd).
+
+-   [Examples](examples.qmd): Example implementations of various types of scanners.
+
+-   [Projects](projects.qmd): Managing scanning configuration using project files.
+
+-   [Transcripts](transcripts.qmd): Reading and filtering transcripts for scanning.
+
+-   [Workflow](workflow.qmd): Workflow for the stages of a transcript analysis project.
+
+There is also more in depth documentation available on [Results](results.qmd), [Validation](validation.qmd) and [Transcript Databases](db_overview.qmd).

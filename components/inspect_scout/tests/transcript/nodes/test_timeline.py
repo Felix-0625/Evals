@@ -1,0 +1,1034 @@
+"""Tests for transcript nodes module.
+
+Uses JSON fixtures for data-driven testing. Each fixture contains
+a minimal event representation and expected node structure.
+"""
+
+import json
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, cast
+
+import pytest
+from inspect_ai.event import (
+    BranchEvent,
+    CompactionEvent,
+    Event,
+    InfoEvent,
+    ModelEvent,
+    SpanBeginEvent,
+    SpanEndEvent,
+    ToolEvent,
+)
+from inspect_ai.model import (
+    ChatMessage,
+    ChatMessageAssistant,
+    ChatMessageSystem,
+    ChatMessageTool,
+    ChatMessageUser,
+    GenerateConfig,
+    ModelOutput,
+    ModelUsage,
+)
+from inspect_ai.tool import ToolCall
+from inspect_scout._transcript.timeline import (
+    Timeline,
+    TimelineEvent,
+    TimelineSpan,
+    timeline_build,
+)
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures" / "events"
+
+
+def load_fixture(name: str) -> dict[str, Any]:
+    """Load a JSON fixture file containing events and expectations.
+
+    Each fixture has:
+    - description: Human-readable test case description
+    - events: List of events in minimal JSON format
+    - expected: Expected structure
+
+    The same fixtures can be used by both Python and TypeScript test suites.
+    """
+    path = FIXTURES_DIR / f"{name}.json"
+    with open(path) as f:
+        return cast(dict[str, Any], json.load(f))
+
+
+def get_fixture_names() -> list[str]:
+    """Get all fixture names from the fixtures directory."""
+    return [p.stem for p in FIXTURES_DIR.glob("*.json")]
+
+
+def parse_timestamp(ts_str: str | None) -> datetime:
+    """Parse ISO timestamp string to datetime."""
+    if ts_str is None:
+        return datetime.now(timezone.utc)
+    # Handle various ISO formats
+    ts_str = ts_str.replace("Z", "+00:00")
+    # Python 3.10 fromisoformat doesn't handle fractional seconds with
+    # fewer than 3 or 6 digits (e.g. ".1"). Pad to 6 digits.
+    ts_str = re.sub(
+        r"\.(\d{1,5})(?=[+-]|$)",
+        lambda m: "." + m.group(1).ljust(6, "0"),
+        ts_str,
+    )
+    return datetime.fromisoformat(ts_str)
+
+
+def _parse_input_messages(input_data: list[dict[str, Any]]) -> list[ChatMessage]:
+    """Parse input messages from fixture JSON into ChatMessage objects."""
+    messages: list[ChatMessage] = []
+    for msg in input_data:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role == "system":
+            messages.append(ChatMessageSystem(content=content))
+        elif role == "user":
+            messages.append(ChatMessageUser(content=content))
+        elif role == "assistant":
+            messages.append(ChatMessageAssistant(content=content))
+        elif role == "tool":
+            tool_kwargs: dict[str, Any] = {
+                "content": content,
+                "tool_call_id": msg.get("tool_call_id", ""),
+            }
+            if "function" in msg:
+                tool_kwargs["function"] = msg["function"]
+            messages.append(ChatMessageTool(**tool_kwargs))
+    return messages
+
+
+def events_from_json(data: dict[str, Any]) -> list[Event]:
+    """Deserialize minimal JSON to full inspect_ai Events.
+
+    Fills in required fields with sensible defaults.
+    """
+    events: list[Event] = []
+
+    for event_data in data.get("events", []):
+        event_type = event_data.get("event")
+        event = _create_event(event_type, event_data)
+        if event is not None:
+            events.append(event)
+
+    return events
+
+
+def _create_event(event_type: str, data: dict[str, Any]) -> Event | None:
+    """Create a specific event type from JSON data."""
+    timestamp = parse_timestamp(data.get("timestamp"))
+    completed = (
+        parse_timestamp(data.get("completed")) if data.get("completed") else None
+    )
+    uuid = data.get("uuid")
+    span_id = data.get("span_id")
+    working_start = data.get("working_start", 0.0)
+
+    if event_type == "model":
+        output_data = data.get("output", {})
+        usage_data = output_data.get("usage", {})
+        usage = ModelUsage(
+            input_tokens=usage_data.get("input_tokens", 0),
+            output_tokens=usage_data.get("output_tokens", 0),
+        )
+        # Build choices with message if provided
+        choices_data = output_data.get("choices", [])
+        choices: list[dict[str, Any]] = []
+        for choice_data in choices_data:
+            msg_data = choice_data.get("message", {})
+            tool_calls = [
+                ToolCall(
+                    id=tc.get("id", "tc-1"),
+                    function=tc.get("function", "tool"),
+                    arguments=tc.get("arguments", {}),
+                )
+                for tc in msg_data.get("tool_calls", [])
+            ]
+            msg = ChatMessageAssistant(
+                content=msg_data.get("content", ""),
+                tool_calls=tool_calls or None,
+            )
+            choices.append(
+                {"message": msg, "stop_reason": choice_data.get("stop_reason", "stop")}
+            )
+        output_kwargs: dict[str, Any] = {
+            "model": data.get("model", "test-model"),
+            "usage": usage,
+        }
+        if choices:
+            output_kwargs["choices"] = choices
+        output = ModelOutput(**output_kwargs)
+        input_messages: list[ChatMessage] = _parse_input_messages(data.get("input", []))
+        return ModelEvent(
+            uuid=uuid,
+            span_id=span_id,
+            timestamp=timestamp,
+            working_start=working_start,
+            pending=False,
+            metadata=None,
+            event="model",
+            model=data.get("model", "test-model"),
+            role=None,
+            input=input_messages,
+            tools=[],
+            tool_choice="auto",
+            config=GenerateConfig(),
+            output=output,
+            retries=None,
+            error=None,
+            cache=None,
+            call=None,
+            completed=completed,
+            working_time=None,
+        )
+
+    elif event_type == "tool":
+        # Handle nested events for tool-spawned agents
+        nested_events: list[Event] = []
+        if "events" in data:
+            for nested_data in data["events"]:
+                nested_event = _create_event(nested_data.get("event"), nested_data)
+                if nested_event is not None:
+                    nested_events.append(nested_event)
+
+        tool_event = ToolEvent(
+            uuid=uuid,
+            span_id=span_id,
+            timestamp=timestamp,
+            working_start=working_start,
+            pending=False,
+            metadata=None,
+            event="tool",
+            type="function",
+            id=data.get("id", "tool-id"),
+            function=data.get("function", "unknown"),
+            arguments={},
+            view=None,
+            result=data.get("result", ""),
+            truncated=None,
+            error=None,
+            events=nested_events,
+            completed=completed,
+            working_time=None,
+            agent=data.get("agent"),
+            failed=None,
+            message_id=data.get("message_id"),
+        )
+        if "agent_span_id" in data:
+            tool_event.agent_span_id = data["agent_span_id"]
+        return tool_event
+
+    elif event_type == "info":
+        return InfoEvent(
+            uuid=uuid,
+            span_id=span_id,
+            timestamp=timestamp,
+            working_start=working_start,
+            pending=False,
+            metadata=None,
+            event="info",
+            source=data.get("source", ""),
+            data=data.get("data"),
+        )
+
+    elif event_type == "span_begin":
+        return SpanBeginEvent(
+            uuid=uuid,
+            span_id=data.get("id"),  # span_id is the span's own id for begin events
+            timestamp=timestamp,
+            working_start=working_start,
+            pending=False,
+            metadata=None,
+            event="span_begin",
+            id=data.get("id", ""),
+            parent_id=data.get("parent_id"),
+            type=data.get("type"),
+            name=data.get("name", ""),
+        )
+
+    elif event_type == "span_end":
+        return SpanEndEvent(
+            uuid=uuid,
+            span_id=data.get("span_id"),
+            timestamp=timestamp,
+            working_start=working_start,
+            pending=False,
+            metadata=None,
+            event="span_end",
+            id=data.get("id", data.get("span_id", "")),
+        )
+
+    elif event_type == "compaction":
+        return CompactionEvent(
+            uuid=uuid,
+            span_id=span_id,
+            timestamp=timestamp,
+            working_start=working_start,
+            pending=False,
+            metadata=None,
+            event="compaction",
+            type=data.get("type", "summary"),
+        )
+
+    elif event_type == "branch":
+        return BranchEvent(
+            uuid=uuid,
+            span_id=span_id,
+            timestamp=timestamp,
+            working_start=working_start,
+            pending=False,
+            metadata=None,
+            event="branch",
+            from_anchor=data.get("from_anchor", ""),
+        )
+
+    return None
+
+
+def get_event_uuids(node: TimelineSpan) -> list[str]:
+    """Extract event UUIDs from a span's content.
+
+    Args:
+        node: The span to extract UUIDs from.
+
+    Returns:
+        List of event UUIDs (not including child spans).
+    """
+    uuids: list[str] = []
+    for item in node.content:
+        if isinstance(item, TimelineEvent):
+            uuid = getattr(item.event, "uuid", None)
+            if uuid:
+                uuids.append(uuid)
+        elif isinstance(item, TimelineSpan):
+            # Don't recurse into child spans for this list
+            pass
+    return uuids
+
+
+def get_child_spans(node: TimelineSpan) -> list[TimelineSpan]:
+    """Get child spans from a span's content.
+
+    Args:
+        node: The span to search.
+
+    Returns:
+        List of child TimelineSpans.
+    """
+    return [item for item in node.content if isinstance(item, TimelineSpan)]
+
+
+def create_model_event(
+    uuid: str = "test",
+    timestamp: datetime | None = None,
+    completed: datetime | None = None,
+    usage: ModelUsage | None = None,
+) -> ModelEvent:
+    """Create a ModelEvent with sensible test defaults.
+
+    Args:
+        uuid: Event UUID.
+        timestamp: Event timestamp (defaults to now).
+        completed: Completion timestamp.
+        usage: Token usage (defaults to no usage).
+
+    Returns:
+        A ModelEvent with the specified values and sensible defaults.
+    """
+    if timestamp is None:
+        timestamp = datetime.now(timezone.utc)
+    output = (
+        ModelOutput(model="test", usage=usage) if usage else ModelOutput(model="test")
+    )
+
+    return ModelEvent(
+        uuid=uuid,
+        span_id=None,
+        timestamp=timestamp,
+        working_start=0.0,
+        pending=False,
+        metadata=None,
+        event="model",
+        model="test",
+        role=None,
+        input=[],
+        tools=[],
+        tool_choice="auto",
+        config=GenerateConfig(),
+        output=output,
+        retries=None,
+        error=None,
+        cache=None,
+        call=None,
+        completed=completed,
+        working_time=None,
+    )
+
+
+def assert_scoring_span_matches(
+    root: TimelineSpan,
+    expected: dict[str, Any] | None,
+) -> None:
+    """Assert a scoring span in the root matches expected structure.
+
+    Scoring is now a TimelineSpan with span_type="scorers" in the root's content.
+    """
+    if expected is None:
+        # No scoring expected — verify no scorer span exists
+        scorer_spans = [
+            item
+            for item in root.content
+            if isinstance(item, TimelineSpan) and item.span_type == "scorers"
+        ]
+        assert len(scorer_spans) == 0, "Expected no scoring span"
+        return
+
+    # Find the scoring span
+    scorer_spans = [
+        item
+        for item in root.content
+        if isinstance(item, TimelineSpan) and item.span_type == "scorers"
+    ]
+    assert len(scorer_spans) == 1, "Expected exactly one scoring span"
+    scoring = scorer_spans[0]
+
+    if "event_uuids" in expected:
+        actual_uuids = get_event_uuids(scoring)
+        assert actual_uuids == expected["event_uuids"], (
+            f"scoring event UUIDs mismatch: "
+            f"got {actual_uuids}, expected {expected['event_uuids']}"
+        )
+
+    if "total_tokens" in expected:
+        assert scoring.total_tokens() == expected["total_tokens"], (
+            f"scoring token count mismatch: "
+            f"got {scoring.total_tokens}, expected {expected['total_tokens']}"
+        )
+
+
+def assert_branch_matches(
+    actual: TimelineSpan,
+    expected: dict[str, Any],
+    branch_name: str = "branch",
+) -> None:
+    """Assert a branch matches expected structure."""
+    assert actual.branched_from == expected["branched_from"], (
+        f"{branch_name} branched_from mismatch: "
+        f"got {actual.branched_from!r}, expected {expected['branched_from']!r}"
+    )
+
+    if "event_uuids" in expected:
+        actual_uuids: list[str] = []
+        for item in actual.content:
+            if isinstance(item, TimelineEvent):
+                uuid = getattr(item.event, "uuid", None)
+                if uuid:
+                    actual_uuids.append(uuid)
+        assert actual_uuids == expected["event_uuids"], (
+            f"{branch_name} event UUIDs mismatch: "
+            f"got {actual_uuids}, expected {expected['event_uuids']}"
+        )
+
+    if "branches" in expected:
+        expected_branches = expected["branches"]
+        assert len(actual.branches) == len(expected_branches), (
+            f"{branch_name} nested branch count mismatch: "
+            f"got {len(actual.branches)}, expected {len(expected_branches)}"
+        )
+        for i, (actual_branch, expected_branch) in enumerate(
+            zip(actual.branches, expected_branches, strict=True)
+        ):
+            assert_branch_matches(
+                actual_branch,
+                expected_branch,
+                f"{branch_name}.branches[{i}]",
+            )
+
+
+def assert_span_matches(
+    actual: TimelineSpan | None,
+    expected: dict[str, Any] | None,
+    span_name: str = "span",
+) -> None:
+    """Assert a span matches expected structure."""
+    if expected is None:
+        assert actual is None, f"Expected {span_name} to be None"
+        return
+
+    assert actual is not None, f"Expected {span_name} to exist"
+    assert actual.id == expected["id"], (
+        f"{span_name} id mismatch: got {actual.id}, expected {expected['id']}"
+    )
+    assert actual.name == expected["name"], (
+        f"{span_name} name mismatch: got {actual.name}, expected {expected['name']}"
+    )
+
+    # Check source/span_type — all agent sources map to span_type="agent"
+    expected_source = expected.get("source", {})
+    if expected_source.get("source") in ("span", "tool"):
+        assert actual.span_type == "agent", (
+            f"{span_name} span_type mismatch: got {actual.span_type}, expected 'agent'"
+        )
+
+    # Check event UUIDs if specified
+    if "event_uuids" in expected:
+        actual_uuids = get_event_uuids(actual)
+        assert actual_uuids == expected["event_uuids"], (
+            f"{span_name} event UUIDs mismatch: "
+            f"got {actual_uuids}, expected {expected['event_uuids']}"
+        )
+
+    # Check total tokens if specified
+    if "total_tokens" in expected:
+        assert actual.total_tokens() == expected["total_tokens"], (
+            f"{span_name} token count mismatch: "
+            f"got {actual.total_tokens}, expected {expected['total_tokens']}"
+        )
+
+    # Check utility if specified
+    if "utility" in expected:
+        assert actual.utility == expected["utility"], (
+            f"{span_name} utility mismatch: "
+            f"got {actual.utility}, expected {expected['utility']}"
+        )
+
+    # Check agent_result if specified
+    if "agent_result" in expected:
+        assert actual.agent_result == expected["agent_result"], (
+            f"{span_name} agent_result mismatch: "
+            f"got {actual.agent_result!r}, expected {expected['agent_result']!r}"
+        )
+
+    # Check branches if specified
+    if "branches" in expected:
+        expected_branches = expected["branches"]
+        assert len(actual.branches) == len(expected_branches), (
+            f"{span_name} branch count mismatch: "
+            f"got {len(actual.branches)}, expected {len(expected_branches)}"
+        )
+        for i, (actual_branch, expected_branch) in enumerate(
+            zip(actual.branches, expected_branches, strict=True)
+        ):
+            assert_branch_matches(
+                actual_branch,
+                expected_branch,
+                f"{span_name}.branches[{i}]",
+            )
+
+    # Check child spans if specified
+    if "children" in expected:
+        actual_children = get_child_spans(actual)
+        expected_children = expected["children"]
+        assert len(actual_children) == len(expected_children), (
+            f"{span_name} child count mismatch: "
+            f"got {len(actual_children)}, expected {len(expected_children)}"
+        )
+        for i, (actual_child, expected_child) in enumerate(
+            zip(actual_children, expected_children, strict=True)
+        ):
+            assert_span_matches(
+                actual_child, expected_child, f"{span_name}.children[{i}]"
+            )
+
+
+def assert_timeline_matches(actual: Timeline, expected: dict[str, Any]) -> None:
+    """Assert timeline matches expected structure.
+
+    The expected structure still uses init/agent/scoring keys for backward
+    compatibility with fixtures. We map these to the new Timeline structure:
+    - init events are folded into root content (not checked separately)
+    - agent maps to root
+    - scoring maps to a child TimelineSpan with span_type="scorer"
+    """
+    root = actual.root
+
+    # Check init: init events are in a TimelineSpan with span_type="init"
+    expected_init = expected.get("init")
+    if expected_init is not None:
+        expected_uuids = expected_init.get("event_uuids", [])
+        if expected_uuids:
+            first_item = root.content[0]
+            assert isinstance(first_item, TimelineSpan), (
+                "Expected first content item to be init span"
+            )
+            assert first_item.span_type == "init"
+            assert first_item.name == "init"
+            actual_uuids = get_event_uuids(first_item)
+            assert actual_uuids == expected_uuids, (
+                f"init event UUIDs mismatch: "
+                f"got {actual_uuids}, expected {expected_uuids}"
+            )
+
+    # Check agent (now root)
+    expected_agent = expected.get("agent")
+    if expected_agent is not None:
+        assert root.id == expected_agent["id"], (
+            f"root id mismatch: got {root.id}, expected {expected_agent['id']}"
+        )
+        # inspect_ai now always names the root span "main" after unwrapping
+        # solver/agent pairs, regardless of the original span name.
+        assert root.name == "main", (
+            f"root name mismatch: got {root.name}, expected 'main'"
+        )
+
+        # Check event UUIDs (excluding init and scoring spans)
+        if "event_uuids" in expected_agent:
+            actual_uuids = get_event_uuids(root)
+            assert actual_uuids == expected_agent["event_uuids"], (
+                f"agent event UUIDs mismatch: "
+                f"got {actual_uuids}, expected {expected_agent['event_uuids']}"
+            )
+
+        # Check total tokens if specified
+        if "total_tokens" in expected_agent:
+            # Total tokens of root includes init and scoring
+            expected_tokens = expected_agent["total_tokens"]
+            if expected_init and "total_tokens" in expected_init:
+                expected_tokens += expected_init["total_tokens"]
+            expected_scoring = expected.get("scoring")
+            if expected_scoring and "total_tokens" in expected_scoring:
+                expected_tokens += expected_scoring["total_tokens"]
+            assert root.total_tokens() == expected_tokens, (
+                f"root token count mismatch: "
+                f"got {root.total_tokens}, expected {expected_tokens}"
+            )
+
+        # Check utility if specified
+        if "utility" in expected_agent:
+            assert root.utility == expected_agent["utility"]
+
+        # Check branches if specified
+        if "branches" in expected_agent:
+            expected_branches = expected_agent["branches"]
+            assert len(root.branches) == len(expected_branches), (
+                f"root branch count mismatch: "
+                f"got {len(root.branches)}, expected {len(expected_branches)}"
+            )
+            for i, (actual_branch, expected_branch) in enumerate(
+                zip(root.branches, expected_branches, strict=True)
+            ):
+                assert_branch_matches(
+                    actual_branch, expected_branch, f"root.branches[{i}]"
+                )
+
+        # Check child spans if specified
+        if "children" in expected_agent:
+            # Filter out scorer spans from children comparison
+            actual_children = [
+                item
+                for item in root.content
+                if isinstance(item, TimelineSpan)
+                and item.span_type != "scorers"
+                and item.span_type != "init"
+            ]
+            expected_children = expected_agent["children"]
+            assert len(actual_children) == len(expected_children), (
+                f"root child count mismatch: "
+                f"got {len(actual_children)}, expected {len(expected_children)}"
+            )
+            for i, (actual_child, expected_child) in enumerate(
+                zip(actual_children, expected_children, strict=True)
+            ):
+                assert_span_matches(actual_child, expected_child, f"root.children[{i}]")
+    else:
+        # No agent expected — root should have no meaningful content
+        pass
+
+    # Check scoring (now a child TimelineSpan with span_type="scorer")
+    assert_scoring_span_matches(root, expected.get("scoring"))
+
+
+# =============================================================================
+# Parametrized Tests
+# =============================================================================
+
+
+@pytest.mark.parametrize("fixture_name", get_fixture_names())
+def test_timeline_build(fixture_name: str) -> None:
+    """Test timeline_build with JSON fixtures.
+
+    Each fixture contains both events and expected results, allowing the same
+    test data to be used by both Python and TypeScript implementations.
+    """
+    fixture = load_fixture(fixture_name)
+    events = events_from_json(fixture)
+    result = timeline_build(events)
+
+    expected = fixture.get("expected", {})
+    assert_timeline_matches(result, expected)
+
+
+# =============================================================================
+# Specific Tests
+# =============================================================================
+
+
+@pytest.mark.parametrize(
+    "ts_str, expected_microsecond",
+    [
+        ("2024-01-01T00:00:00.1Z", 100000),
+        ("2024-01-01T00:00:00.1+05:30", 100000),
+        ("2024-01-01T00:00:00.1", 100000),
+        ("2024-01-01T00:00:00.12+00:00", 120000),
+        ("2024-01-01T00:00:00.123456Z", 123456),
+        ("2024-01-01T00:00:00.000001Z", 1),
+    ],
+    ids=[
+        "short-frac-utc",
+        "short-frac-offset",
+        "short-frac-naive",
+        "two-digit-frac",
+        "full-frac",
+        "microsecond-frac",
+    ],
+)
+def test_parse_timestamp_fractional_seconds(
+    ts_str: str, expected_microsecond: int
+) -> None:
+    """parse_timestamp normalizes short fractional seconds for Python 3.10."""
+    result = parse_timestamp(ts_str)
+    assert result.microsecond == expected_microsecond
+
+
+def test_empty_events_returns_empty_timeline() -> None:
+    """Empty event list should return Timeline with empty root."""
+    result = timeline_build([])
+    assert result.root is not None
+    assert len(result.root.content) == 0
+    assert result.root.total_tokens() == 0
+
+
+def test_timeline_event_extracts_timing_from_event() -> None:
+    """TimelineEvent should extract timing from event."""
+    ts = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    completed = datetime(2024, 1, 1, 12, 0, 5, tzinfo=timezone.utc)
+
+    event = create_model_event(timestamp=ts, completed=completed)
+    node = TimelineEvent(event=event)
+
+    assert node.start_time() == ts
+    assert node.end_time() == completed
+
+
+def test_timeline_event_extracts_tokens_from_model_event() -> None:
+    """TimelineEvent should extract token count from ModelEvent."""
+    usage = ModelUsage(input_tokens=100, output_tokens=50)
+    event = create_model_event(usage=usage)
+    node = TimelineEvent(event=event)
+
+    assert node.total_tokens() == 150
+
+
+def test_timeline_event_returns_zero_tokens_for_non_model_event() -> None:
+    """Non-ModelEvent should have zero tokens."""
+    event = InfoEvent(
+        uuid="test",
+        span_id=None,
+        timestamp=datetime.now(timezone.utc),
+        working_start=0.0,
+        pending=False,
+        metadata=None,
+        event="info",
+        source="test",
+        data=None,
+    )
+
+    node = TimelineEvent(event=event)
+    assert node.total_tokens() == 0
+
+
+def test_timeline_event_idle_time_is_zero() -> None:
+    """TimelineEvent idle_time is always 0."""
+    ts = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    completed = datetime(2024, 1, 1, 12, 0, 5, tzinfo=timezone.utc)
+    event = create_model_event(timestamp=ts, completed=completed)
+    node = TimelineEvent(event=event)
+    assert node.idle_time() == 0.0
+
+
+def test_idle_time_single_event_in_span() -> None:
+    """Span with one event and small gap: no idle (below 5-min threshold)."""
+    ts1 = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    ts2 = datetime(2024, 1, 1, 12, 0, 2, tzinfo=timezone.utc)
+    completed2 = datetime(2024, 1, 1, 12, 0, 5, tzinfo=timezone.utc)
+    # Span starts at ts1 (from a span_begin event), event runs ts2..completed2
+    span_begin_event = InfoEvent(
+        uuid="sb",
+        span_id=None,
+        timestamp=ts1,
+        working_start=0.0,
+        pending=False,
+        metadata=None,
+        event="info",
+        source="test",
+        data=None,
+    )
+    model_event = create_model_event(uuid="m1", timestamp=ts2, completed=completed2)
+    span = TimelineSpan(
+        id="s1",
+        name="test",
+        span_type="agent",
+        content=[
+            TimelineEvent(event=span_begin_event),
+            TimelineEvent(event=model_event),
+        ],
+    )
+    # Gap of 2s is below 5-min threshold → idle = 0
+    assert span.idle_time() == pytest.approx(0.0)
+
+
+def test_idle_time_no_gaps() -> None:
+    """Events fully cover span duration → idle_time ≈ 0."""
+    ts = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    mid = datetime(2024, 1, 1, 12, 0, 5, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 1, 12, 0, 10, tzinfo=timezone.utc)
+    e1 = create_model_event(uuid="e1", timestamp=ts, completed=mid)
+    e2 = create_model_event(uuid="e2", timestamp=mid, completed=end)
+    span = TimelineSpan(
+        id="s1",
+        name="test",
+        span_type="agent",
+        content=[TimelineEvent(event=e1), TimelineEvent(event=e2)],
+    )
+    assert span.idle_time() == pytest.approx(0.0)
+
+
+def test_idle_time_gap_between_events() -> None:
+    """Two events with a small gap → idle = 0 (below 5-min threshold)."""
+    ts1 = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    end1 = datetime(2024, 1, 1, 12, 0, 3, tzinfo=timezone.utc)
+    ts2 = datetime(2024, 1, 1, 12, 0, 7, tzinfo=timezone.utc)
+    end2 = datetime(2024, 1, 1, 12, 0, 10, tzinfo=timezone.utc)
+    e1 = create_model_event(uuid="e1", timestamp=ts1, completed=end1)
+    e2 = create_model_event(uuid="e2", timestamp=ts2, completed=end2)
+    span = TimelineSpan(
+        id="s1",
+        name="test",
+        span_type="agent",
+        content=[TimelineEvent(event=e1), TimelineEvent(event=e2)],
+    )
+    # Gap of 4s is below 5-min threshold → idle = 0
+    assert span.idle_time() == pytest.approx(0.0)
+
+
+def test_idle_time_nested_spans() -> None:
+    """Nested spans with small gaps → idle = 0 (below 5-min threshold)."""
+    ts1 = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    end1 = datetime(2024, 1, 1, 12, 0, 3, tzinfo=timezone.utc)
+    ts2 = datetime(2024, 1, 1, 12, 0, 5, tzinfo=timezone.utc)
+    end2 = datetime(2024, 1, 1, 12, 0, 8, tzinfo=timezone.utc)
+
+    # Child span: gaps are 2s (below threshold) → idle = 0
+    child = TimelineSpan(
+        id="child",
+        name="child",
+        span_type="agent",
+        content=[
+            TimelineEvent(
+                event=create_model_event(uuid="e1", timestamp=ts1, completed=end1)
+            ),
+            TimelineEvent(
+                event=create_model_event(uuid="e2", timestamp=ts2, completed=end2)
+            ),
+        ],
+    )
+    assert child.idle_time() == pytest.approx(0.0)
+
+    # Parent span: gap from child end to info is 2s (below threshold) → idle = 0
+    end_parent = datetime(2024, 1, 1, 12, 0, 10, tzinfo=timezone.utc)
+    info_event = InfoEvent(
+        uuid="info",
+        span_id=None,
+        timestamp=end_parent,
+        working_start=0.0,
+        pending=False,
+        metadata=None,
+        event="info",
+        source="test",
+        data=None,
+    )
+    parent = TimelineSpan(
+        id="parent",
+        name="parent",
+        span_type="agent",
+        content=[child, TimelineEvent(event=info_event)],
+    )
+    assert parent.idle_time() == pytest.approx(0.0)
+
+
+def test_idle_time_branch() -> None:
+    """Branch with small gap → idle = 0 (below 5-min threshold)."""
+    ts1 = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    end1 = datetime(2024, 1, 1, 12, 0, 3, tzinfo=timezone.utc)
+    ts2 = datetime(2024, 1, 1, 12, 0, 7, tzinfo=timezone.utc)
+    end2 = datetime(2024, 1, 1, 12, 0, 10, tzinfo=timezone.utc)
+    branch = TimelineSpan(
+        id="branch-span",
+        name="branch",
+        span_type="branch",
+        branched_from="",
+        content=[
+            TimelineEvent(
+                event=create_model_event(uuid="b1", timestamp=ts1, completed=end1)
+            ),
+            TimelineEvent(
+                event=create_model_event(uuid="b2", timestamp=ts2, completed=end2)
+            ),
+        ],
+    )
+    # Gap of 4s is below 5-min threshold → idle = 0
+    assert branch.idle_time() == pytest.approx(0.0)
+
+
+def test_timeline_span_aggregates_tokens_from_content() -> None:
+    """TimelineSpan should sum tokens from all content."""
+    usage1 = ModelUsage(input_tokens=100, output_tokens=50)
+    usage2 = ModelUsage(input_tokens=200, output_tokens=100)
+
+    event1 = create_model_event(uuid="e1", usage=usage1)
+    event2 = create_model_event(uuid="e2", usage=usage2)
+
+    span = TimelineSpan(
+        id="test",
+        name="test",
+        span_type="agent",
+        content=[TimelineEvent(event=event1), TimelineEvent(event=event2)],
+    )
+
+    assert span.total_tokens() == 450  # 150 + 300
+
+
+def test_idle_time_large_gap_between_events() -> None:
+    """Two events with a 6-min gap → idle = 360s."""
+    ts1 = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    end1 = datetime(2024, 1, 1, 12, 0, 3, tzinfo=timezone.utc)
+    ts2 = datetime(2024, 1, 1, 12, 6, 3, tzinfo=timezone.utc)  # 6 min after end1
+    end2 = datetime(2024, 1, 1, 12, 6, 6, tzinfo=timezone.utc)
+    e1 = create_model_event(uuid="e1", timestamp=ts1, completed=end1)
+    e2 = create_model_event(uuid="e2", timestamp=ts2, completed=end2)
+    span = TimelineSpan(
+        id="s1",
+        name="test",
+        span_type="agent",
+        content=[TimelineEvent(event=e1), TimelineEvent(event=e2)],
+    )
+    # Gap of 360s (6 min) exceeds 5-min threshold → idle = 360
+    assert span.idle_time() == pytest.approx(360.0)
+
+
+def test_idle_time_small_gap_not_counted() -> None:
+    """Two events with a 4-min gap → idle = 0 (below threshold)."""
+    ts1 = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    end1 = datetime(2024, 1, 1, 12, 0, 3, tzinfo=timezone.utc)
+    ts2 = datetime(2024, 1, 1, 12, 4, 3, tzinfo=timezone.utc)  # 4 min after end1
+    end2 = datetime(2024, 1, 1, 12, 4, 6, tzinfo=timezone.utc)
+    e1 = create_model_event(uuid="e1", timestamp=ts1, completed=end1)
+    e2 = create_model_event(uuid="e2", timestamp=ts2, completed=end2)
+    span = TimelineSpan(
+        id="s1",
+        name="test",
+        span_type="agent",
+        content=[TimelineEvent(event=e1), TimelineEvent(event=e2)],
+    )
+    # Gap of 240s (4 min) is below 5-min threshold → idle = 0
+    assert span.idle_time() == pytest.approx(0.0)
+
+
+def test_idle_time_span_boundary_gaps() -> None:
+    """Gaps from span start/end to first/last child > threshold are counted."""
+    # Span starts 6 min before first event, ends 6 min after last event
+    span_start = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    ts1 = datetime(2024, 1, 1, 12, 6, 0, tzinfo=timezone.utc)  # 6 min after span start
+    end1 = datetime(2024, 1, 1, 12, 6, 3, tzinfo=timezone.utc)
+    span_end = datetime(2024, 1, 1, 12, 12, 3, tzinfo=timezone.utc)  # 6 min after end1
+
+    e1 = create_model_event(uuid="e1", timestamp=ts1, completed=end1)
+    # Use a marker event at span_start to anchor the span boundaries
+    info_start = InfoEvent(
+        uuid="info_start",
+        span_id=None,
+        timestamp=span_start,
+        working_start=0.0,
+        pending=False,
+        metadata=None,
+        event="info",
+        source="test",
+        data=None,
+    )
+    info_end = InfoEvent(
+        uuid="info_end",
+        span_id=None,
+        timestamp=span_end,
+        working_start=0.0,
+        pending=False,
+        metadata=None,
+        event="info",
+        source="test",
+        data=None,
+    )
+    span = TimelineSpan(
+        id="s1",
+        name="test",
+        span_type="agent",
+        content=[
+            TimelineEvent(event=info_start),
+            TimelineEvent(event=e1),
+            TimelineEvent(event=info_end),
+        ],
+    )
+    # Gap: span_start→info_start = 0s (same time)
+    # Gap: info_start→e1 = 360s (> threshold, counted)
+    # Gap: e1→info_end = 360s (> threshold, counted)
+    # Gap: info_end→span_end = 0s (same time)
+    assert span.idle_time() == pytest.approx(720.0)
+
+
+def test_idle_time_nested_with_large_gaps() -> None:
+    """Nested spans with large gaps propagate correctly."""
+    ts1 = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    end1 = datetime(2024, 1, 1, 12, 0, 3, tzinfo=timezone.utc)
+    ts2 = datetime(2024, 1, 1, 12, 6, 3, tzinfo=timezone.utc)  # 6 min gap
+    end2 = datetime(2024, 1, 1, 12, 6, 6, tzinfo=timezone.utc)
+
+    # Child span: gap of 360s between events → child idle = 360
+    child = TimelineSpan(
+        id="child",
+        name="child",
+        span_type="agent",
+        content=[
+            TimelineEvent(
+                event=create_model_event(uuid="e1", timestamp=ts1, completed=end1)
+            ),
+            TimelineEvent(
+                event=create_model_event(uuid="e2", timestamp=ts2, completed=end2)
+            ),
+        ],
+    )
+    assert child.idle_time() == pytest.approx(360.0)
+
+    # Parent span ends 7 min after child (> threshold)
+    end_parent = datetime(2024, 1, 1, 12, 13, 6, tzinfo=timezone.utc)
+    info_event = InfoEvent(
+        uuid="info",
+        span_id=None,
+        timestamp=end_parent,
+        working_start=0.0,
+        pending=False,
+        metadata=None,
+        event="info",
+        source="test",
+        data=None,
+    )
+    parent = TimelineSpan(
+        id="parent",
+        name="parent",
+        span_type="agent",
+        content=[child, TimelineEvent(event=info_event)],
+    )
+    # Child idle = 360s (propagated)
+    # Gap: child end (12:06:06) → info (12:13:06) = 420s (> threshold, counted)
+    # Total parent idle = 360 + 420 = 780
+    assert parent.idle_time() == pytest.approx(780.0)

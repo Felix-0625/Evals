@@ -1,0 +1,62 @@
+from typing import Callable
+
+from jsonpath_ng import JSONPath  # type: ignore
+
+from inspect_ai.log._log import EvalSample, EvalSampleSummary
+
+from ..columns import JsonLike
+from ..extract import auto_id, messages_as_str
+
+
+def sample_input_as_str(sample: EvalSample) -> str:
+    return messages_as_str(sample.input)
+
+
+def sample_total_tokens(sample: EvalSampleSummary) -> int:
+    total_tokens = 0
+    for usage in sample.model_usage.values():
+        total_tokens += usage.total_tokens
+    return total_tokens
+
+
+def sample_total_fallbacks(sample: EvalSampleSummary) -> int:
+    return sum(fallback.count for fallback in sample.model_fallbacks or [])
+
+
+def sample_messages_as_str(sample: EvalSample) -> str:
+    return messages_as_str(sample.messages)
+
+
+def sample_path_requires_full(
+    path: str | JSONPath | Callable[..., JsonLike],
+) -> bool:
+    if callable(path):
+        return False
+    else:
+        path = str(path)
+        return any(
+            [
+                path.startswith(prefix)
+                for prefix in [
+                    "choices",
+                    "sandbox",
+                    "files",
+                    "setup",
+                    "messages",
+                    "output",
+                    "store",
+                    "events",
+                    "uuid",
+                    "error_retries",
+                    "attachments",
+                ]
+            ]
+        )
+
+
+def auto_sample_id(eval_id: str, sample: EvalSample | EvalSampleSummary) -> str:
+    return auto_id(eval_id, f"{sample.id}_{sample.epoch}")
+
+
+def auto_detail_id(sample_id: str, name: str, index: int) -> str:
+    return auto_id(sample_id, f"{name}_{index}")

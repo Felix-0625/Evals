@@ -1,0 +1,26 @@
+// Public surface of the app-configuration subsystem (see
+// apps/inspect/design/domain-ownership.md). Everything not exported here is
+// subsystem-private; external modules must import from this barrel.
+export type { AppConfig } from "./appConfig";
+export {
+  getAppConfig,
+  getBootstrap,
+  initAppConfig, // TODO: Exported for tests?! review
+  resolveRouteLogFile,
+  setLogRoot,
+} from "./appConfig";
+export { AppConfigGate } from "./AppConfigGate";
+export { LogLocationGate } from "./LogLocationGate";
+export { setApiFactory } from "./resolveBackend";
+export {
+  readEmbeddedStartupState, // TODO: This should be private/encapsulated
+  resolveEmbeddedLogDir, // TODO: This should be private/encapsulated
+} from "./singleFileMode";
+export {
+  APP_CONFIG_KEY, // TODO: Exported for tests?! review
+  getApi,
+  useAppConfig,
+  useAppConfigAsync,
+  useAbsLogDir,
+  useLogDir,
+} from "./hooks";

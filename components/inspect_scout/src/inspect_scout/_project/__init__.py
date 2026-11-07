@@ -1,0 +1,24 @@
+"""Scout project configuration system.
+
+Provides project-level defaults via scout.yaml files that are merged with
+individual scan job configurations. Local overrides can be provided via
+scout.local.yaml files (not checked into version control).
+"""
+
+from ._project import (
+    create_default_project,
+    find_local_project_file,
+    load_project_config,
+    read_project,
+)
+from .merge import merge_configs
+from .types import ProjectConfig
+
+__all__ = [
+    "ProjectConfig",
+    "read_project",
+    "merge_configs",
+    "find_local_project_file",
+    "load_project_config",
+    "create_default_project",
+]

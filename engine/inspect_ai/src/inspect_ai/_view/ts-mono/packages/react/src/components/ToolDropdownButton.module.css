@@ -1,0 +1,121 @@
+:global(.btn).toolButton {
+  background-color: var(--bs-light-border-subtle);
+}
+
+:global(.btn).toolButton.bodyColor {
+  background-color: var(--bs-light);
+}
+
+.toolButton {
+  white-space: nowrap;
+}
+
+.toolButton i {
+  margin-right: 0.5em;
+}
+
+.toolButton .chevron {
+  margin-left: 0.5em;
+  margin-right: 0;
+  font-size: 0.75em;
+}
+
+.toolButton:focus {
+  outline: none;
+  box-shadow:
+    0 0 0 2px rgba(var(--bs-primary-rgb), 0.5),
+    inset 0 2px 4px rgba(0, 0, 0, 0.15),
+    inset 0 1px 2px rgba(0, 0, 0, 0.1);
+}
+
+.backdrop {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  /* Above Bootstrap's sticky-top (1020) so sticky bars don't occlude the menu. */
+  z-index: 1049;
+}
+
+.dropdownMenu {
+  position: fixed;
+  background: var(--bs-body-bg);
+  border: 1px solid var(--bs-border-color);
+  border-radius: 0.25rem;
+  box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.15);
+  /* Above Bootstrap's sticky-top (1020) so sticky bars don't occlude the menu. */
+  z-index: 1050;
+  overflow: hidden;
+}
+
+.dropdownItem {
+  display: block;
+  width: 100%;
+  padding: 0.25rem 0.75rem;
+  background: none;
+  border: none;
+  text-align: left;
+  cursor: pointer;
+  color: var(--bs-body-color);
+  white-space: nowrap;
+  transition: background-color 0.15s ease-in-out;
+}
+
+.dropdownItem:hover {
+  background-color: var(--bs-tertiary-bg);
+}
+
+.dropdownItem:active {
+  background-color: var(--bs-secondary-bg);
+}
+
+.dropdownItemSelected,
+.dropdownItemSelected:hover {
+  background-color: var(--bs-primary-bg-subtle);
+}
+
+.dropdownHeading {
+  padding: 0.15rem 0.75rem 0.1rem;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--bs-secondary-color);
+  white-space: nowrap;
+}
+
+.dropdownDivider {
+  border-top: 1px solid var(--bs-border-color);
+  margin: 0.25rem 0;
+}
+
+.dropdownFooter {
+  display: flex;
+  align-items: center;
+  gap: 0.5em;
+  color: var(--bs-secondary-color);
+}
+
+.dropdownFooter i {
+  font-size: 0.85em;
+}
+
+.toolButton .noMargin {
+  margin-right: 0;
+}
+
+.collapsibleLabel {
+  margin-left: 0.5em;
+}
+
+/* Below this width the label is visually hidden but stays the accessible name. */
+@media (max-width: 1300px) {
+  .collapsibleLabel {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}

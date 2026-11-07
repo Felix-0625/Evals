@@ -1,0 +1,11 @@
+.wordBreak {
+  word-break: break-word;
+}
+
+.scoreCard {
+  padding-top: 0.5em;
+}
+
+.scores {
+  padding-top: 1em;
+}

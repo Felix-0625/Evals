@@ -1,0 +1,28 @@
+import { FC, useCallback } from "react";
+
+import { TextInput, type TextInputChange } from "@tsmono/react/components";
+
+import { useStore } from "../../../../state/store";
+
+import styles from "./ScannerResultsSearch.module.css";
+
+export const ScannerResultsSearch: FC = () => {
+  const scansSearchText = useStore((state) => state.scansSearchText);
+  const setScansSearchText = useStore((state) => state.setScansSearchText);
+
+  const handleChange = useCallback((e: TextInputChange) => {
+    setScansSearchText(e.target.value);
+    // TODO: lint react-hooks/exhaustive-deps - refactor to avoid the lint
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return (
+    <TextInput
+      icon="search"
+      value={scansSearchText ?? ""}
+      onChange={handleChange}
+      placeholder={"Search"}
+      className={styles.searchBox}
+    />
+  );
+};

@@ -1,0 +1,164 @@
+import { isRecord } from "@tsmono/util";
+
+import { sampleHandlesEqual } from "../app/shared/sample";
+import { FilterError, LogState, ScoreLabel } from "../app/types";
+
+import { StoreState } from "./store";
+
+export interface LogSlice {
+  log: LogState;
+  logActions: {
+    highlightSample: (
+      sampleId: string | number,
+      epoch: number,
+      logFile: string
+    ) => void;
+
+    // Reset the per-log score selection (on log load/refresh).
+    clearSelectedScores: () => void;
+
+    // Set filter criteria
+    setFilter: (filter: string) => void;
+
+    // Set the filter error
+    setFilterError: (error: FilterError) => void;
+
+    // Clear the filter error
+    clearFilterError: () => void;
+
+    // Set score labels
+    setSelectedScores: (scores: ScoreLabel[]) => void;
+
+    // Set available scores
+    setScores: (scores: ScoreLabel[]) => void;
+
+    // Reset filter state to defaults
+    resetFiltering: () => void;
+
+    setFilteredSampleCount: (count: number) => void;
+    clearFilteredSampleCount: () => void;
+  };
+}
+
+// Initial state
+const initialState = {
+  // Log state
+
+  // Filter state
+  filter: "",
+  filterError: undefined,
+
+  selectedScores: undefined,
+  scores: undefined,
+};
+
+// Create the app slice using StoreState directly
+export const createLogSlice = (
+  set: (fn: (state: StoreState) => void) => void,
+  get: () => StoreState,
+  _store: unknown
+): LogSlice => {
+  const slice = {
+    // State
+    log: initialState,
+
+    // Actions
+    logActions: {
+      highlightSample: (
+        sampleId: string | number,
+        epoch: number,
+        logFile: string
+      ) => {
+        // Ignore if already selected
+        const currentSample = get().log.highlightedSample;
+        if (
+          sampleHandlesEqual(currentSample, {
+            id: sampleId,
+            epoch,
+            logFile,
+          })
+        ) {
+          return;
+        }
+
+        set((state) => {
+          state.log.highlightedSample = { id: sampleId, epoch, logFile };
+        });
+      },
+      clearSelectedScores: () => {
+        set((state) => {
+          state.log.selectedScores = undefined;
+        });
+      },
+      setFilter: (filter: string) =>
+        set((state) => {
+          state.log.filter = filter;
+        }),
+      setFilterError: (error: FilterError) =>
+        set((state) => {
+          state.log.filterError = error;
+        }),
+      clearFilterError: () => {
+        set((state) => {
+          state.log.filterError = undefined;
+        });
+      },
+      setSelectedScores: (scores: ScoreLabel[]) =>
+        set((state) => {
+          state.log.selectedScores = scores;
+        }),
+      setScores: (scores: ScoreLabel[]) =>
+        set((state) => {
+          state.log.scores = scores;
+        }),
+      resetFiltering: () =>
+        set((state) => {
+          state.log.filter = "";
+          state.log.filterError = undefined;
+          state.log.selectedScores = state.log.scores?.slice(0, 1);
+        }),
+
+      setFilteredSampleCount: (count: number) => {
+        set((state) => {
+          state.log.filteredSampleCount = count;
+        });
+      },
+      clearFilteredSampleCount: () => {
+        set((state) => {
+          state.log.filteredSampleCount = undefined;
+        });
+      },
+    },
+  } as const;
+
+  return slice;
+};
+
+// Initialize app slice with StoreState
+export const initalializeLogSlice = (
+  set: (fn: (state: StoreState) => void) => void
+) => {
+  set((state) => {
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+    if (!state.log) {
+      state.log = initialState;
+    }
+    if ("selectedSampleHandle" in state.log) {
+      const legacy: unknown = state.log.selectedSampleHandle;
+      if (
+        isRecord(legacy) &&
+        (typeof legacy.id === "string" || typeof legacy.id === "number") &&
+        typeof legacy.epoch === "number" &&
+        typeof legacy.logFile === "string"
+      ) {
+        state.log.highlightedSample ??= {
+          id: legacy.id,
+          epoch: legacy.epoch,
+          logFile: legacy.logFile,
+        };
+      }
+      delete state.log.selectedSampleHandle;
+    }
+    if ("loadedLog" in state.log) delete state.log.loadedLog;
+  });
+};

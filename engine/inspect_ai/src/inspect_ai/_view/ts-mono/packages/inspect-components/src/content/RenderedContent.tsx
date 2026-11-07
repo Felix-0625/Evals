@@ -1,0 +1,385 @@
+// TODO: lint strict type safety (eliminate any)
+/* eslint-disable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unused-vars, @typescript-eslint/no-base-to-string, @typescript-eslint/unbound-method */
+import clsx from "clsx";
+import JSON5 from "json5";
+import { FC, Fragment, isValidElement, JSX, ReactNode } from "react";
+
+import {
+  ANSIDisplay,
+  ContentText,
+  JSONPanel,
+  MarkdownReference,
+  RequireMedia,
+} from "@tsmono/react/components";
+import { Icon } from "@tsmono/react/icons";
+import {
+  formatNumber,
+  isJson,
+  isRecord,
+  isRenderableImageSource,
+} from "@tsmono/util";
+
+import { ExternalLink } from "./ExternalLink";
+import { isHtmlEscape } from "./htmlEscape";
+import { MetaDataGrid } from "./MetaDataGrid";
+import styles from "./RenderedContent.module.css";
+import { RenderedText } from "./RenderedText";
+import { Buckets, ContentRenderer, RenderOptions } from "./types";
+
+interface RenderedContentProps {
+  id: string;
+  entry: { name: string; value: unknown };
+  references?: MarkdownReference[];
+  renderOptions?: RenderOptions;
+  renderObject?(entry: any): ReactNode;
+}
+
+interface WebSearchResult {
+  url: string;
+  summary?: string | null;
+}
+
+interface WebSearchValue {
+  query?: string | null;
+  results: WebSearchResult[];
+}
+
+// The Model, Html and web_search renderers are selected by a property or
+// entry name on plain objects, and those objects can come straight from an
+// eval log (sample metadata, store, score values). Each guard checks the
+// exact shape its renderer emits so any other object falls through to the
+// generic record renderer instead of throwing mid-render.
+const isModelValue = (v: unknown): v is { _model: string | number } =>
+  isRecord(v) && (typeof v._model === "string" || typeof v._model === "number");
+
+// Optional fields arrive as `null` from pydantic, not as missing keys.
+const isOptionalString = (v: unknown): v is string | null | undefined =>
+  v == null || typeof v === "string";
+
+const isWebSearchResult = (v: unknown): v is WebSearchResult =>
+  isRecord(v) && typeof v.url === "string" && isOptionalString(v.summary);
+
+const isWebSearchValue = (v: unknown): v is WebSearchValue =>
+  isRecord(v) &&
+  isOptionalString(v.query) &&
+  Array.isArray(v.results) &&
+  v.results.every(isWebSearchResult);
+
+/**
+ * Renders content based on its type using registered content renderers.
+ */
+export const RenderedContent: FC<RenderedContentProps> = ({
+  id,
+  entry,
+  references,
+  renderOptions = { renderString: "markdown" },
+  renderObject,
+}): JSX.Element => {
+  // Explicitly specify return type
+  if (entry.value === null) {
+    return (
+      <span>
+        <pre>
+          <code>[null]</code>
+        </pre>
+      </span>
+    );
+  }
+  const renderers = contentRenderers(renderObject);
+  const renderer = Object.keys(renderers)
+    .map((key) => {
+      return renderers[key];
+    })
+    .sort((a, b) => {
+      if (!a || !b) {
+        return 0;
+      }
+      return a.bucket - b.bucket;
+    })
+    .find((renderer) => {
+      return renderer?.canRender(entry);
+    });
+
+  if (renderer) {
+    const { rendered } = renderer.render(id, entry, renderOptions, references);
+    if (rendered !== undefined && isValidElement(rendered)) {
+      return rendered;
+    }
+  }
+
+  // Safely convert any value to a string representation
+  const displayValue = (() => {
+    try {
+      if (typeof entry.value === "object") {
+        return JSON.stringify(entry.value);
+      }
+      return String(entry.value).trim();
+    } catch (e) {
+      return "[Unable to display value]";
+    }
+  })();
+
+  return (
+    <span>
+      <ContentText text={displayValue} />
+    </span>
+  );
+};
+
+/**
+ * Object containing different content renderers.
+ * Each renderer is responsible for rendering a specific type of content.
+ */
+const contentRenderers: (
+  renderObject?: (object: any) => ReactNode
+) => Record<string, ContentRenderer> = (renderObject) => {
+  const contentRenderers: Record<string, ContentRenderer> = {
+    AnsiString: {
+      bucket: Buckets.first,
+      canRender: (entry) => {
+        return (
+          typeof entry.value === "string" && entry.value.indexOf("\u001b") > -1
+        );
+      },
+      render: (_id, entry, _options) => {
+        return {
+          rendered: <ANSIDisplay output={entry.value} />,
+        };
+      },
+    },
+    JsonString: {
+      bucket: Buckets.first,
+      canRender: (entry) => {
+        if (typeof entry.value === "string") {
+          const trimmed = entry.value.trim();
+          return isJson(trimmed);
+        }
+        return false;
+      },
+      render: (_id, entry, _options) => {
+        const obj: unknown = JSON5.parse(entry.value);
+        return {
+          rendered: <JSONPanel data={isRecord(obj) ? obj : {}} />,
+        };
+      },
+    },
+
+    Model: {
+      bucket: Buckets.intermediate,
+      canRender: (entry) => isModelValue(entry.value),
+      render: (_id, entry, _options) => {
+        const value: unknown = entry.value;
+        if (!isModelValue(value)) {
+          return { rendered: undefined };
+        }
+        return {
+          rendered: (
+            <Fragment>
+              <Icon name="model" /> {value._model}
+            </Fragment>
+          ),
+        };
+      },
+    },
+    Boolean: {
+      bucket: Buckets.intermediate,
+      canRender: (entry) => {
+        return typeof entry.value === "boolean";
+      },
+      render: (id, entry, options) => {
+        entry.value = entry.value.toString();
+        return (
+          contentRenderers.String?.render(id, entry, options) || {
+            rendered: <span>{entry.value}</span>,
+          }
+        );
+      },
+    },
+    Number: {
+      bucket: Buckets.intermediate,
+      canRender: (entry) => {
+        return typeof entry.value === "number";
+      },
+      render: (id, entry, options) => {
+        entry.value = formatNumber(entry.value);
+        return (
+          contentRenderers.String?.render(id, entry, options) || {
+            rendered: <span>{entry.value}</span>,
+          }
+        );
+      },
+    },
+    String: {
+      bucket: Buckets.final,
+      canRender: (entry) => {
+        return typeof entry.value === "string";
+      },
+      render: (_id, entry, options, references) => {
+        const rendered = entry.value.trim();
+        if (options.renderString === "markdown") {
+          return {
+            rendered: (
+              <RenderedText
+                markdown={rendered}
+                references={references}
+                options={{ previewRefsOnHover: options.previewRefsOnHover }}
+              />
+            ),
+          };
+        } else {
+          return {
+            rendered: (
+              <pre className={clsx(styles.preWrap, styles.preCompact)}>
+                <ContentText text={rendered} />
+              </pre>
+            ),
+          };
+        }
+      },
+    },
+    Array: {
+      bucket: Buckets.intermediate,
+      canRender: (entry) => {
+        const isArray = Array.isArray(entry.value);
+        if (isArray) {
+          if (entry.value.length === 0 || entry.value.length === 1) {
+            return true;
+          }
+          const types = new Set(
+            entry.value
+              .filter((e: unknown) => e !== null)
+              .map((e: unknown) => {
+                return typeof e;
+              })
+          );
+          return types.size === 1;
+        } else {
+          return false;
+        }
+      },
+      render: (id, entry, _options) => {
+        const arrayMap: Record<string, unknown> = {};
+        entry.value.forEach((e: unknown, index: number) => {
+          arrayMap[`[${index}]`] = e;
+        });
+
+        const arrayRendered = renderObject ? (
+          renderObject(arrayMap)
+        ) : (
+          <MetaDataGrid
+            id={id}
+            className={"font-size-small"}
+            entries={arrayMap}
+            options={{ plain: true }}
+          />
+        );
+        return { rendered: arrayRendered };
+      },
+    },
+    web_search: {
+      bucket: Buckets.intermediate,
+      canRender: (entry) =>
+        entry.name === "web_search" && isWebSearchValue(entry.value),
+      render: (_id, entry, _options) => {
+        const value: unknown = entry.value;
+        if (!isWebSearchValue(value)) {
+          return { rendered: undefined };
+        }
+        const results: ReactNode[] = [];
+        results.push(
+          <div key="query" className={styles.query}>
+            <Icon name="search" /> <ContentText text={value.query ?? ""} />
+          </div>
+        );
+        value.results.forEach((result, index) => {
+          results.push(
+            <div key={`url-${index}`}>
+              <ExternalLink href={result.url}>{result.url}</ExternalLink>
+            </div>
+          );
+          results.push(
+            <div
+              key={`summary-${index}`}
+              className={clsx("text-size-smaller", styles.summary)}
+            >
+              <ContentText text={result.summary ?? ""} />
+            </div>
+          );
+        });
+        // The caller keeps only a valid element; a bare array falls through
+        // to the JSON fallback.
+        return {
+          rendered: <Fragment>{results}</Fragment>,
+        };
+      },
+    },
+    web_browser: {
+      bucket: Buckets.intermediate,
+      canRender: (entry) => {
+        return (
+          typeof entry.value === "string" &&
+          entry.name?.startsWith("web_browser")
+        );
+      },
+      render: (_id, entry, _options) => {
+        return {
+          rendered: (
+            <pre className={styles.preWrap}>
+              <ContentText text={String(entry.value)} />
+            </pre>
+          ),
+        };
+      },
+    },
+    Html: {
+      bucket: Buckets.intermediate,
+      canRender: (entry) => isHtmlEscape(entry.value),
+      render: (_id, entry, _options) => {
+        return {
+          rendered: entry.value._html,
+        };
+      },
+    },
+    Image: {
+      bucket: Buckets.intermediate,
+      canRender: (entry) => {
+        return (
+          typeof entry.value === "string" &&
+          isRenderableImageSource(entry.value)
+        );
+      },
+      render: (_id, entry, _options) => {
+        return {
+          rendered: (
+            <RequireMedia kind="image">
+              <img src={entry.value} alt="Attachment" />
+            </RequireMedia>
+          ),
+        };
+      },
+    },
+    Object: {
+      bucket: Buckets.intermediate,
+      canRender: (entry) => {
+        return typeof entry.value === "object";
+      },
+      render: (id, entry, _options) => {
+        if (renderObject) {
+          return { rendered: renderObject(entry.value) };
+        } else {
+          return {
+            rendered: (
+              <MetaDataGrid
+                id={id}
+                className={"font-size-small"}
+                entries={isRecord(entry.value) ? entry.value : {}}
+                options={{ plain: true }}
+              />
+            ),
+          };
+        }
+      },
+    },
+  };
+  return contentRenderers;
+};

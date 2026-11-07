@@ -1,0 +1,416 @@
+/**
+ * Pure functions for the markdown rendering pipeline.
+ * Extracted for testability (no CSS/React imports).
+ */
+
+import markdownit, { type MarkdownIt } from "markdown-it";
+
+import {
+  canonicalImageSource,
+  parseAbsoluteHttpUrl,
+  parseDataUri,
+} from "@tsmono/util";
+
+import {
+  defaultMarkdownRenderer,
+  escapeHtmlCharacters,
+  type MarkdownRenderer,
+} from "./markdownText";
+
+type MarkdownItPlugin = (md: MarkdownIt) => void;
+
+let mathjaxPluginPromise: Promise<MarkdownItPlugin> | null = null;
+export const getMathjaxPlugin = (): Promise<MarkdownItPlugin> => {
+  if (!mathjaxPluginPromise) {
+    const loading = import("markdown-it-mathjax3").then(
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- untyped dependency: markdown-it-mathjax3 ships no types, so its default export arrives as any
+      (m) => m.default as MarkdownItPlugin
+    );
+    // Reset on rejection so a transient chunk-load failure (network blip,
+    // redeploy invalidating the hashed chunk) retries on the next math render
+    // instead of disabling math for the rest of the session.
+    loading.catch(() => {
+      if (mathjaxPluginPromise === loading) {
+        mathjaxPluginPromise = null;
+      }
+    });
+    mathjaxPluginPromise = loading;
+  }
+  return mathjaxPluginPromise;
+};
+
+// markdown-it-mathjax3 opens each formula with its own <style>. The viewer
+// loads those rules from mathjax.css instead, and the sheet is dropped here,
+// before any parse: even an inert parse of an inline <style> (the sanitizer's
+// DOMParser) is reported as a CSP violation.
+const MATHJAX_STYLE =
+  /^(\s*<span id="mjx-[a-f0-9]+">\s*)<style>[\s\S]*?<\/style>/i;
+
+const withoutMathJaxStyle = (html: string): string =>
+  html.replace(MATHJAX_STYLE, "$1");
+
+export const hasMathContent = (text: string): boolean =>
+  text.includes("$") || text.includes("\\(") || text.includes("\\[");
+
+// Module-level cache for lazy-initialized markdown-it instances
+const mdInstanceCache: Record<string, MarkdownIt> = {};
+
+/** Unescape HTML entities within math token content before MathJax processing.
+ *  This is safe because MathJax renders TeX to SVG/MathML, not raw HTML. */
+export const unescapeHtmlForMath = (content: string): string => {
+  return content
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&")
+    .replace(/&apos;/g, "'")
+    .replace(/&quot;/g, '"');
+};
+
+export const getMarkdownInstance = async (
+  renderer: MarkdownRenderer,
+  contentHasMath?: boolean
+): Promise<MarkdownIt> => {
+  const useMath =
+    (renderer === "full" || renderer === "fragment") && !!contentHasMath;
+  const cacheKey = `${renderer}:${useMath ? "1" : "0"}`;
+
+  const cached = mdInstanceCache[cacheKey];
+  if (cached) {
+    return cached;
+  }
+
+  if (renderer === "textOnly") {
+    const md = new markdownit("zero", { breaks: true, html: false }).enable([
+      "emphasis",
+      "newline",
+    ]);
+    mdInstanceCache[cacheKey] = md;
+    return md;
+  }
+
+  const md = new markdownit({ breaks: true, html: true });
+  md.renderer.rules.image = (tokens, idx) => {
+    const token = tokens[idx];
+    if (!token) {
+      return "";
+    }
+
+    // attrGet returns string | number as of markdown-it 15
+    const source = String(token.attrGet("src") ?? "");
+    const alt = token.content.trim();
+
+    // Base64 raster data URIs issue no network request, so rendering them
+    // inline cannot leak a fetch to an attacker-controlled host. Emit the
+    // canonical form, not the raw source — see canonicalImageSource.
+    const canonicalSource = canonicalImageSource(source);
+    if (canonicalSource !== undefined) {
+      const title = token.attrGet("title");
+      const titleAttr = title
+        ? ` title="${md.utils.escapeHtml(String(title))}"`
+        : "";
+      return `<img src="${md.utils.escapeHtml(canonicalSource)}" alt="${md.utils.escapeHtml(alt)}"${titleAttr}>`;
+    }
+
+    const href = parseAbsoluteHttpUrl(source);
+    const dataUri = parseDataUri(source);
+    const visibleSource =
+      href ??
+      (dataUri
+        ? `data:${dataUri.mimeType}${dataUri.base64 ? ";base64" : ""},...`
+        : source);
+    const label = alt ? `${alt} (${visibleSource})` : visibleSource;
+    const escapedLabel = md.utils.escapeHtml(label);
+
+    if (!href) {
+      return escapedLabel;
+    }
+
+    return `<a href="${md.utils.escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${escapedLabel}</a>`;
+  };
+
+  if (useMath) {
+    const mathjaxPlugin = await getMathjaxPlugin();
+    md.use(mathjaxPlugin);
+
+    // Wrap math renderers to unescape HTML entities in TeX content
+    // before MathJax processes them. HTML chars in LaTeX blocks are
+    // entity-encoded by the pipeline for XSS safety, but MathJax needs
+    // the raw characters (e.g. < for \lt comparisons). This is safe
+    // because MathJax renders to SVG, not to injectable HTML.
+    const origInline = md.renderer.rules.math_inline;
+    const origBlock = md.renderer.rules.math_block;
+
+    if (origInline) {
+      md.renderer.rules.math_inline = (tokens, idx, options, env, self) => {
+        const token = tokens[idx];
+        if (token) {
+          token.content = unescapeHtmlForMath(token.content);
+        }
+        return withoutMathJaxStyle(origInline(tokens, idx, options, env, self));
+      };
+    }
+    if (origBlock) {
+      md.renderer.rules.math_block = (tokens, idx, options, env, self) => {
+        const token = tokens[idx];
+        if (token) {
+          token.content = unescapeHtmlForMath(token.content);
+        }
+        return withoutMathJaxStyle(origBlock(tokens, idx, options, env, self));
+      };
+    }
+  }
+  mdInstanceCache[cacheKey] = md;
+
+  return md;
+};
+
+export const protectBackslashesInLatex = (content: string): string => {
+  if (!content) return content;
+
+  try {
+    // Match inline math: $...$
+    const inlineRegex = /\$(.*?)\$/g;
+
+    // Match block math: $$...$$
+    const blockRegex = /\$\$([\s\S]*?)\$\$/g;
+
+    // Replace backslashes in LaTeX blocks with placeholders to protect them
+    // from HTML escaping. Only backslashes need protection — other characters
+    // (<, >, &, ', ") are left for escapeHtmlCharacters to handle, and then
+    // unescaped specifically within MathJax token rendering (see getMarkdownInstance).
+    let result = content.replace(
+      inlineRegex,
+      (_match: string, latex: string) => {
+        const protectedTex = latex.replace(/\\/g, "___LATEX_BACKSLASH___");
+        return `$${protectedTex}$`;
+      }
+    );
+
+    result = result.replace(blockRegex, (_match: string, latex: string) => {
+      const protectedTex = latex.replace(/\\/g, "___LATEX_BACKSLASH___");
+      return `$$${protectedTex}$$`;
+    });
+
+    return result;
+  } catch (error) {
+    console.error("Error protecting LaTeX content:", error);
+    return content;
+  }
+};
+
+export const restoreBackslashesForLatex = (content: string): string => {
+  if (!content) {
+    return content;
+  }
+
+  try {
+    // Restore only backslash placeholders — other characters (<, >, &, ', ")
+    // are kept as HTML entities and unescaped within MathJax token rendering.
+    let result = content.replace(/___LATEX_BACKSLASH___/g, "\\");
+
+    // Then fix dots notation for better MathJax compatibility
+    // This replaces \dots with \ldots which has better support
+    result = fixDotsNotation(result);
+
+    return result;
+  } catch (error) {
+    console.error("Error restoring LaTeX content:", error);
+    return content; // Return input content if something goes wrong
+  }
+};
+
+// Replaces the first `\dots` inside each delimited math run with `\ldots`
+// (MathJax supports the latter more reliably). Equivalent to the regex
+// /(<delim>[^$]*?)\\dots([^$]*?<delim>)/g, but driven by indexOf: with the
+// regex, an unclosed delimiter rescanned to end-of-input from every `\dots`.
+const replaceDotsBetween = (content: string, delim: "$" | "$$"): string => {
+  let out = "";
+  let emitted = 0;
+  let search = 0;
+  let nextDots = content.indexOf("\\dots");
+  while (nextDots !== -1) {
+    const open = content.indexOf(delim, search);
+    if (open === -1) break;
+    const bodyStart = open + delim.length;
+    const close = content.indexOf("$", bodyStart);
+    if (close === -1) break;
+    if (nextDots < bodyStart) {
+      nextDots = content.indexOf("\\dots", bodyStart);
+      if (nextDots === -1) break;
+    }
+    if (nextDots < close && content.startsWith(delim, close)) {
+      out += `${content.slice(emitted, nextDots)}\\ldots`;
+      emitted = nextDots + "\\dots".length;
+      search = close + delim.length;
+    } else {
+      search = open + 1;
+    }
+  }
+  return emitted === 0 ? content : out + content.slice(emitted);
+};
+
+const fixDotsNotation = (content: string): string => {
+  if (!content) return content;
+  return replaceDotsBetween(replaceDotsBetween(content, "$"), "$$");
+};
+
+const kLetterListPattern = /^([a-zA-Z][).]\s.*?)$/gm;
+
+export const preRenderText = (txt: string): string => {
+  if (!txt) return txt;
+
+  // eslint-disable-next-line no-misleading-character-class
+  txt = txt.replace(/^[\u200B\u200C\u200D\u200E\u200F\uFEFF]/, "");
+
+  // Special handling for ordered lists that look like
+  // multiple choice (e.g. a), b), c), d) etc..)
+  return txt.replaceAll(
+    kLetterListPattern,
+    "<p class='markdown-ordered-list-item'>$1</p>"
+  );
+};
+
+// Line terminators are the characters an unflagged regex `.` refuses to match.
+const isLineTerminator = (code: number): boolean =>
+  code === 0x0a || code === 0x0d || code === 0x2028 || code === 0x2029;
+
+// Hides `[label]: text` spans from markdown-it's reference-definition rule.
+// Equivalent to replacing /\[([^\]]*)\]: (?!http)(.*)/g with
+// "(open:767A125E)$1(close:767A125E) $2 ", but driven by indexOf: every `[`
+// ahead of a given `]` pairs with that same `]`, so a failed pair skips past
+// it instead of rescanning from each `[` (quadratic on a run of `[`).
+export const protectMarkdown = (txt: string): string => {
+  if (!txt) return txt;
+
+  let out = "";
+  let emitted = 0;
+  let search = 0;
+  for (;;) {
+    const open = txt.indexOf("[", search);
+    if (open === -1) break;
+    const close = txt.indexOf("]", open + 1);
+    if (close === -1) break;
+    if (!txt.startsWith("]: ", close) || txt.startsWith("http", close + 3)) {
+      search = close + 1;
+      continue;
+    }
+    const bodyStart = close + 3;
+    let lineEnd = bodyStart;
+    while (lineEnd < txt.length && !isLineTerminator(txt.charCodeAt(lineEnd))) {
+      lineEnd++;
+    }
+    out += `${txt.slice(emitted, open)}(open:767A125E)${txt.slice(open + 1, close)}(close:767A125E) ${txt.slice(bodyStart, lineEnd)} `;
+    emitted = lineEnd;
+    search = lineEnd;
+  }
+  return emitted === 0 ? txt : out + txt.slice(emitted);
+};
+
+export const unprotectMarkdown = (txt: string): string => {
+  if (!txt) return txt;
+
+  txt = txt.replaceAll("(open:767A125E)", "[");
+  txt = txt.replaceAll("(close:767A125E)", "]");
+  return txt;
+};
+
+export function unescapeSupHtmlEntities(str: string): string {
+  if (!str) {
+    return str;
+  }
+  return str
+    .replace(/&lt;sup&gt;/g, "<sup>")
+    .replace(/&lt;\/sup&gt;/g, "</sup>");
+}
+
+export function unescapeCodeHtmlEntities(str: string): string {
+  if (!str) return str;
+
+  const htmlEntities: Record<string, string> = {
+    "&lt;": "<",
+    "&gt;": ">",
+    "&amp;": "&",
+    "&#x5C;": "\\",
+    "&quot;": '"',
+  };
+
+  return str.replace(
+    /(<code[^>]*>)([\s\S]*?)(<\/code>)/gi,
+    (
+      _match: string,
+      starttag: string,
+      content: string,
+      endtag: string
+    ): string => {
+      return (
+        starttag +
+        content.replace(
+          /&(?:amp|lt|gt|quot|#39|#x2F|#x5C|#96);/g,
+          (entity: string): string => htmlEntities[entity] || entity
+        ) +
+        endtag
+      );
+    }
+  );
+}
+
+type MarkdownRenderFunction = (markdown: string) => Promise<string>;
+
+const renderFullPipelineMarkdown = async (
+  markdown: string,
+  renderer: "full" | "fragment"
+): Promise<string> => {
+  // Protect backslashes in LaTeX expressions
+  const protectedContent = protectBackslashesInLatex(markdown);
+
+  // Escape all tags
+  const escaped = escapeHtmlCharacters(protectedContent);
+
+  // Pre-render any text that isn't handled by markdown
+  const preRendered = preRenderText(escaped);
+
+  const protectedText = protectMarkdown(preRendered);
+
+  // Restore backslashes for LaTeX processing
+  const preparedForMarkdown = restoreBackslashesForLatex(protectedText);
+
+  let html = preparedForMarkdown;
+  try {
+    const md = await getMarkdownInstance(renderer, hasMathContent(markdown));
+    html = md.render(preparedForMarkdown);
+  } catch (ex) {
+    console.log("Unable to markdown render content");
+    console.error(ex);
+  }
+
+  const unescaped = unprotectMarkdown(html);
+
+  // For `code` tags, reverse the escaping if we can
+  const withCode = unescapeCodeHtmlEntities(unescaped);
+
+  // For `sup` tags, reverse the escaping if we can
+  const withSup = unescapeSupHtmlEntities(withCode);
+
+  return withSup;
+};
+
+const renderTextOnlyMarkdown = async (markdown: string): Promise<string> => {
+  try {
+    return (await getMarkdownInstance("textOnly")).render(markdown);
+  } catch (ex) {
+    console.log("Unable to markdown render content");
+    console.error(ex);
+    return escapeHtmlCharacters(markdown).replace(/\n/g, "<br/>");
+  }
+};
+
+const markdownRenderers: Record<MarkdownRenderer, MarkdownRenderFunction> = {
+  full: (markdown) => renderFullPipelineMarkdown(markdown, "full"),
+  fragment: (markdown) => renderFullPipelineMarkdown(markdown, "fragment"),
+  textOnly: renderTextOnlyMarkdown,
+};
+
+export const renderMarkdown = (
+  markdown: string,
+  renderer: MarkdownRenderer = defaultMarkdownRenderer
+): Promise<string> => markdownRenderers[renderer](markdown);

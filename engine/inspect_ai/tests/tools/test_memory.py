@@ -1,0 +1,659 @@
+"""Tests for memory tool."""
+
+import pytest
+
+from inspect_ai.tool import ToolError, memory
+from inspect_ai.util import Store, store, tool_state_scope
+from inspect_ai.util._store import init_subtask_store
+
+
+@pytest.fixture(autouse=True)
+def reset_store() -> None:
+    """Reset store between tests to ensure isolation."""
+    init_subtask_store(Store())
+
+
+async def test_create_file() -> None:
+    """Test basic file creation."""
+    tool = memory()
+    result = await tool(command="create", path="/memories/test.txt", file_text="hello")
+    assert isinstance(result, str)
+    assert "created" in result.lower() or "test.txt" in result
+
+
+async def test_view_nonexistent_path() -> None:
+    """Test viewing a path that doesn't exist."""
+    tool = memory()
+    with pytest.raises(ToolError, match="does not exist"):
+        await tool(command="view", path="/memories/nonexistent.txt")
+
+
+async def test_view_file_basic() -> None:
+    """Test viewing a created file."""
+    tool = memory()
+    await tool(
+        command="create", path="/memories/test.txt", file_text="line1\nline2\nline3"
+    )
+    result = await tool(command="view", path="/memories/test.txt")
+    assert isinstance(result, str)
+    assert "line1" in result
+    assert "line2" in result
+    assert "line3" in result
+
+
+async def test_view_file_with_range() -> None:
+    """Test viewing file with line range."""
+    tool = memory()
+    await tool(
+        command="create",
+        path="/memories/test.txt",
+        file_text="line1\nline2\nline3\nline4",
+    )
+    result = await tool(command="view", path="/memories/test.txt", view_range=[2, 3])
+    assert isinstance(result, str)
+    assert "line2" in result
+    assert "line3" in result
+    assert "line1" not in result
+    assert "line4" not in result
+
+
+async def test_str_replace_basic() -> None:
+    """Test basic string replacement."""
+    tool = memory()
+    await tool(command="create", path="/memories/test.txt", file_text="hello world")
+    result = await tool(
+        command="str_replace",
+        path="/memories/test.txt",
+        old_str="hello",
+        new_str="goodbye",
+    )
+    assert isinstance(result, str)
+    assert "edited" in result.lower()
+    # Verify change
+    content = await tool(command="view", path="/memories/test.txt")
+    assert isinstance(content, str)
+    assert "goodbye" in content
+    assert "hello" not in content
+
+
+@pytest.mark.parametrize(
+    "file_text,old_str,match",
+    [
+        ("hello world", "foo", "did not appear"),
+        ("hello hello", "hello", "Multiple occurrences"),
+    ],
+)
+async def test_str_replace_errors(file_text: str, old_str: str, match: str) -> None:
+    """Test str_replace error cases."""
+    tool = memory()
+    await tool(command="create", path="/memories/test.txt", file_text=file_text)
+    with pytest.raises(ToolError, match=match):
+        await tool(
+            command="str_replace",
+            path="/memories/test.txt",
+            old_str=old_str,
+            new_str="bar",
+        )
+
+
+async def test_insert_basic() -> None:
+    """Test inserting text at line number."""
+    tool = memory()
+    await tool(command="create", path="/memories/test.txt", file_text="line1\nline2")
+    result = await tool(
+        command="insert",
+        path="/memories/test.txt",
+        insert_line=1,
+        insert_text="inserted",
+    )
+    assert isinstance(result, str)
+    assert "edited" in result.lower()
+    # Verify insertion
+    content = await tool(command="view", path="/memories/test.txt")
+    assert isinstance(content, str)
+    assert "line1" in content and "inserted" in content and "line2" in content
+    # Check order by line numbers
+    assert content.index("line1") < content.index("inserted") < content.index("line2")
+
+
+async def test_delete_file() -> None:
+    """Test deleting a file."""
+    tool = memory()
+    await tool(command="create", path="/memories/test.txt", file_text="hello")
+    result = await tool(command="delete", path="/memories/test.txt")
+    assert isinstance(result, str)
+    assert "deleted" in result.lower() or "removed" in result.lower()
+    # Verify deletion
+    with pytest.raises(ToolError, match="does not exist"):
+        await tool(command="view", path="/memories/test.txt")
+
+
+async def test_rename_file() -> None:
+    """Test renaming a file."""
+    tool = memory()
+    await tool(command="create", path="/memories/old.txt", file_text="content")
+    result = await tool(
+        command="rename", old_path="/memories/old.txt", new_path="/memories/new.txt"
+    )
+    assert isinstance(result, str)
+    assert "renamed" in result.lower() or "moved" in result.lower()
+    # Verify rename
+    with pytest.raises(ToolError, match="does not exist"):
+        await tool(command="view", path="/memories/old.txt")
+    content = await tool(command="view", path="/memories/new.txt")
+    assert isinstance(content, str)
+    assert "content" in content
+
+
+async def test_view_directory() -> None:
+    """Test viewing directory contents."""
+    tool = memory()
+    await tool(command="create", path="/memories/dir/test.txt", file_text="hello")
+    result = await tool(command="view", path="/memories/dir")
+    assert isinstance(result, str)
+    assert "test.txt" in result
+
+
+@pytest.mark.parametrize(
+    "path,match",
+    [
+        ("/tmp/test.txt", "/memories"),
+        ("/memories/../etc/passwd", "Invalid path|traversal"),
+        ("/memories_secret/x.txt", "Invalid path"),
+        ("/memories/\x00.txt", "null byte"),
+        ("memories/relative.txt", "must start with /memories"),
+    ],
+)
+async def test_path_validation(path: str, match: str) -> None:
+    """Test path validation."""
+    tool = memory()
+    with pytest.raises(ToolError, match=match):
+        await tool(command="create", path=path, file_text="bad")
+
+
+async def test_path_canonicalization_single_key() -> None:
+    """`..` segments collapse so two spellings map to one stored file."""
+    tool = memory()
+    await tool(command="create", path="/memories/a/../b.txt", file_text="canon")
+    content = await tool(command="view", path="/memories/b.txt")
+    assert isinstance(content, str) and "canon" in content
+
+
+async def test_instance_isolates_memory_stores() -> None:
+    """Two memory tools with distinct instances seed independently."""
+    tool_a = memory(initial_data={"/memories/a.txt": "A"}, instance="a")
+    tool_b = memory(initial_data={"/memories/b.txt": "B"}, instance="b")
+    a = await tool_a(command="view", path="/memories/a.txt")
+    b = await tool_b(command="view", path="/memories/b.txt")
+    assert isinstance(a, str) and "A" in a
+    assert isinstance(b, str) and "B" in b
+    with pytest.raises(ToolError, match="does not exist"):
+        await tool_a(command="view", path="/memories/b.txt")
+
+
+async def test_create_with_parent_dirs() -> None:
+    """Test that parent directories are created automatically."""
+    tool = memory()
+    result = await tool(
+        command="create", path="/memories/a/b/c/test.txt", file_text="nested"
+    )
+    assert isinstance(result, str)
+    assert "created" in result.lower()
+    # Verify file exists
+    content = await tool(command="view", path="/memories/a/b/c/test.txt")
+    assert isinstance(content, str)
+    assert "nested" in content
+
+
+async def test_delete_directory_recursive() -> None:
+    """Test recursive directory deletion."""
+    tool = memory()
+    await tool(command="create", path="/memories/dir/test.txt", file_text="hello")
+    result = await tool(command="delete", path="/memories/dir")
+    assert isinstance(result, str)
+    assert "deleted" in result.lower() or "removed" in result.lower()
+    # Verify deletion
+    with pytest.raises(ToolError, match="does not exist"):
+        await tool(command="view", path="/memories/dir")
+
+
+async def test_initial_data_single_file() -> None:
+    """Test seeding with a single file."""
+    tool = memory(initial_data={"/memories/seeded.txt": "initial content"})
+    content = await tool(command="view", path="/memories/seeded.txt")
+    assert isinstance(content, str)
+    assert "initial content" in content
+
+
+async def test_initial_data_multiple_files() -> None:
+    """Test seeding with multiple files."""
+    tool = memory(
+        initial_data={
+            "/memories/file1.txt": "content1",
+            "/memories/file2.txt": "content2",
+            "/memories/file3.txt": "content3",
+        }
+    )
+    for path, expected in [
+        ("/memories/file1.txt", "content1"),
+        ("/memories/file2.txt", "content2"),
+        ("/memories/file3.txt", "content3"),
+    ]:
+        content = await tool(command="view", path=path)
+        assert isinstance(content, str)
+        assert expected in content
+
+
+async def test_initial_data_nested_paths() -> None:
+    """Test seeding with nested paths creates parent dirs."""
+    tool = memory(
+        initial_data={
+            "/memories/a/b/c.txt": "nested1",
+            "/memories/x/y/z.txt": "nested2",
+        }
+    )
+    for path, expected in [
+        ("/memories/a/b/c.txt", "nested1"),
+        ("/memories/x/y/z.txt", "nested2"),
+    ]:
+        content = await tool(command="view", path=path)
+        assert isinstance(content, str)
+        assert expected in content
+
+
+async def test_initial_data_empty_dict() -> None:
+    """Test empty initial_data works."""
+    tool = memory(initial_data={})
+    # Should be able to create files normally
+    result = await tool(
+        command="create", path="/memories/test.txt", file_text="created"
+    )
+    assert isinstance(result, str)
+    assert "created" in result.lower()
+
+
+async def test_initial_data_seeding_once() -> None:
+    """Test that seeding only happens on first call."""
+    tool = memory(initial_data={"/memories/seed.txt": "original"})
+    # First call triggers seeding
+    await tool(command="view", path="/memories/seed.txt")
+    # Modify the file
+    await tool(
+        command="str_replace",
+        path="/memories/seed.txt",
+        old_str="original",
+        new_str="modified",
+    )
+    # Verify modification persists (seeding doesn't happen again)
+    content = await tool(command="view", path="/memories/seed.txt")
+    assert isinstance(content, str)
+    assert "modified" in content
+    assert "original" not in content
+
+
+async def test_initial_data_none() -> None:
+    """Test default case with initial_data=None."""
+    tool = memory(initial_data=None)
+    # Create file normally
+    result = await tool(
+        command="create", path="/memories/test.txt", file_text="normal create"
+    )
+    assert isinstance(result, str)
+    assert "created" in result.lower()
+    # Verify file exists
+    content = await tool(command="view", path="/memories/test.txt")
+    assert isinstance(content, str)
+    assert "normal create" in content
+
+
+async def test_initial_data_then_modify() -> None:
+    """Test modifying seeded files with str_replace."""
+    tool = memory(initial_data={"/memories/modify.txt": "line1\nline2\nline3"})
+    # Modify seeded file
+    result = await tool(
+        command="str_replace",
+        path="/memories/modify.txt",
+        old_str="line2",
+        new_str="CHANGED",
+    )
+    assert isinstance(result, str)
+    assert "edited" in result.lower()
+    # Verify change
+    content = await tool(command="view", path="/memories/modify.txt")
+    assert isinstance(content, str)
+    assert "CHANGED" in content
+    assert "line2" not in content
+
+
+async def test_initial_data_view_with_range() -> None:
+    """Test viewing seeded files with line range."""
+    tool = memory(initial_data={"/memories/lines.txt": "line1\nline2\nline3\nline4"})
+    # View with range
+    content = await tool(command="view", path="/memories/lines.txt", view_range=[2, 3])
+    assert isinstance(content, str)
+    assert "line2" in content
+    assert "line3" in content
+    assert "line1" not in content
+    assert "line4" not in content
+
+
+@pytest.mark.parametrize(
+    "invalid_path,match",
+    [
+        ("/tmp/bad.txt", "/memories"),
+        ("/memories/../etc/passwd", "Invalid path|outside"),
+    ],
+)
+async def test_initial_data_invalid_paths(invalid_path: str, match: str) -> None:
+    """Test that invalid paths in initial_data raise errors."""
+    tool = memory(initial_data={invalid_path: "content"})
+    # Seeding happens on first execute call
+    with pytest.raises(ToolError, match=match):
+        await tool(command="view", path="/memories")
+
+
+async def test_memory_readonly_view() -> None:
+    """Test that readonly memory can view seeded data."""
+    tool = memory(
+        initial_data={"/memories/notes.txt": "important info"},
+        readonly=True,
+    )
+    result = await tool(command="view", path="/memories/notes.txt")
+    assert isinstance(result, str) and "important info" in result
+
+
+async def test_memory_readonly_view_directory() -> None:
+    """Test that readonly memory can list directories."""
+    tool = memory(
+        initial_data={"/memories/sub/notes.txt": "content"},
+        readonly=True,
+    )
+    result = await tool(command="view", path="/memories")
+    assert isinstance(result, str) and "notes.txt" in result
+
+
+async def test_memory_readonly_no_write_params() -> None:
+    """Test that readonly memory only exposes view parameters."""
+    ro_tool = memory(readonly=True)
+    # The readonly execute function only accepts command, path, view_range.
+    # Passing write-specific params like file_text raises TypeError.
+    with pytest.raises(TypeError):
+        await ro_tool(command="view", path="/memories", file_text="nope")
+
+
+async def test_approval_sees_canonical_path() -> None:
+    """A `..` path is approved as the path the command acts on."""
+    from inspect_ai.approval import Approval, ApprovalPolicy, Approver, auto_approver
+    from inspect_ai.approval._registry import approver
+    from inspect_ai.model._call_tools import execute_tools
+    from inspect_ai.model._chat_message import (
+        ChatMessage,
+        ChatMessageAssistant,
+        ChatMessageTool,
+    )
+    from inspect_ai.tool._tool_call import ToolCall, ToolCallView
+
+    approved_paths: list[str] = []
+
+    @approver
+    def recording() -> Approver:
+        async def approve(
+            message: str,
+            call: ToolCall,
+            view: ToolCallView,
+            history: list[ChatMessage],
+        ) -> Approval:
+            approved_paths.append(call.arguments["path"])
+            return Approval(decision="approve")
+
+        return approve
+
+    policies = [
+        ApprovalPolicy(recording(), "memory", arguments={"path": "/memories/public/*"}),
+        ApprovalPolicy(auto_approver("reject"), "*"),
+    ]
+    tool = memory()
+
+    async def create(path: str) -> ChatMessageTool:
+        call = ToolCall(
+            id="1",
+            function="memory",
+            arguments={"path": path, "command": "create", "file_text": "x"},
+        )
+        messages, _ = await execute_tools(
+            [ChatMessageAssistant(content=[], tool_calls=[call])],
+            [tool],
+            approval=policies,
+        )
+        assert isinstance(messages[-1], ChatMessageTool)
+        return messages[-1]
+
+    # matches the public policy as written, but acts outside it
+    escaped = await create("/memories/public/../secret.txt")
+    assert escaped.error is not None
+    assert escaped.error.type == "approval"
+    assert approved_paths == []
+
+    # stays inside the public subtree once canonical
+    inside = await create("/memories/other/../public/note.txt")
+    assert inside.error is None
+    assert approved_paths == ["/memories/public/note.txt"]
+    result = await tool(command="view", path="/memories/public/note.txt")
+    assert isinstance(result, str)
+    assert "x" in result
+
+
+async def test_approval_sees_canonical_readonly_and_rename_paths() -> None:
+    """Readonly memory and rename's two paths are approved in canonical form."""
+    from inspect_ai.approval import Approval, ApprovalPolicy, Approver
+    from inspect_ai.approval._registry import approver
+    from inspect_ai.model._call_tools import execute_tools
+    from inspect_ai.model._chat_message import (
+        ChatMessage,
+        ChatMessageAssistant,
+        ChatMessageTool,
+    )
+    from inspect_ai.tool._tool import Tool
+    from inspect_ai.tool._tool_call import ToolCall, ToolCallView
+
+    approved: list[dict[str, object]] = []
+
+    @approver
+    def recording() -> Approver:
+        async def approve(
+            message: str,
+            call: ToolCall,
+            view: ToolCallView,
+            history: list[ChatMessage],
+        ) -> Approval:
+            approved.append(call.arguments)
+            return Approval(decision="approve")
+
+        return approve
+
+    async def run(tool: Tool, arguments: dict[str, object]) -> ChatMessageTool:
+        call = ToolCall(id="1", function="memory", arguments=arguments)
+        messages, _ = await execute_tools(
+            [ChatMessageAssistant(content=[], tool_calls=[call])],
+            [tool],
+            approval=[ApprovalPolicy(recording(), "*")],
+        )
+        assert isinstance(messages[-1], ChatMessageTool)
+        return messages[-1]
+
+    reader = memory(initial_data={"/memories/seed.txt": "seed"}, readonly=True)
+    viewed = await run(reader, {"command": "view", "path": "/memories/x/../seed.txt"})
+    assert viewed.error is None
+    assert "seed" in viewed.text
+    assert approved[-1] == {"command": "view", "path": "/memories/seed.txt"}
+
+    tool = memory()
+    await tool(command="create", path="/memories/old.txt", file_text="x")
+    renamed = await run(
+        tool,
+        {
+            "command": "rename",
+            "old_path": "/memories/a/../old.txt",
+            "new_path": "/memories/b/../new.txt",
+        },
+    )
+    assert renamed.error is None
+    assert approved[-1] == {
+        "command": "rename",
+        "old_path": "/memories/old.txt",
+        "new_path": "/memories/new.txt",
+    }
+    result = await tool(command="view", path="/memories/new.txt")
+    assert isinstance(result, str)
+    assert "x" in result
+
+
+@pytest.mark.parametrize("oversight", [False, True], ids=["no-approval", "approval"])
+async def test_tool_event_records_canonical_paths_with_or_without_oversight(
+    oversight: bool,
+) -> None:
+    """The event records the paths the tool acts on, with or without oversight."""
+    from pydantic import JsonValue
+
+    from inspect_ai.approval import ApprovalPolicy, auto_approver
+    from inspect_ai.event._tool import ToolEvent
+    from inspect_ai.log._transcript import Transcript, init_transcript, transcript
+    from inspect_ai.model._call_tools import execute_tools
+    from inspect_ai.model._chat_message import ChatMessageAssistant, ChatMessageTool
+    from inspect_ai.tool._tool import Tool
+    from inspect_ai.tool._tool_call import ToolCall
+
+    async def run(tool: Tool, arguments: dict[str, str]) -> dict[str, JsonValue]:
+        init_transcript(Transcript())
+        call = ToolCall(id="1", function="memory", arguments=arguments)
+        messages, _ = await execute_tools(
+            [ChatMessageAssistant(content=[], tool_calls=[call])],
+            [tool],
+            approval=[ApprovalPolicy(auto_approver(), "*")] if oversight else None,
+        )
+        assert isinstance(messages[-1], ChatMessageTool)
+        assert messages[-1].error is None
+        [event] = [e for e in transcript().events if isinstance(e, ToolEvent)]
+        return ToolEvent.model_validate_json(event.model_dump_json()).arguments
+
+    reader = memory(initial_data={"/memories/seed.txt": "seed"}, readonly=True)
+    viewed = {"command": "view", "path": "/memories/x/../seed.txt"}
+    assert await run(reader, viewed) == {**viewed, "path": "/memories/seed.txt"}
+
+    tool = memory()
+    created = {"command": "create", "path": "/memories/a/../b.txt", "file_text": "x"}
+    assert await run(tool, created) == {**created, "path": "/memories/b.txt"}
+
+    renamed = {
+        "command": "rename",
+        "old_path": "/memories/a/../b.txt",
+        "new_path": "/memories/c/../d.txt",
+    }
+    assert await run(tool, renamed) == {
+        **renamed,
+        "old_path": "/memories/b.txt",
+        "new_path": "/memories/d.txt",
+    }
+    result = await tool(command="view", path="/memories/d.txt")
+    assert isinstance(result, str)
+    assert "x" in result
+
+
+async def test_tool_state_scopes_keep_separate_memory() -> None:
+    """Default-instance memory tools in two scopes keep separate files."""
+    tool = memory()
+    with tool_state_scope("w-1"):
+        await tool(command="create", path="/memories/a.txt", file_text="from w-1")
+    with tool_state_scope("w-2"):
+        with pytest.raises(ToolError, match="does not exist"):
+            await tool(command="view", path="/memories/a.txt")
+        await tool(command="create", path="/memories/a.txt", file_text="from w-2")
+    with tool_state_scope("w-1"):
+        content = await tool(command="view", path="/memories/a.txt")
+        assert isinstance(content, str) and "from w-1" in content
+    assert "MemoryStore:files" not in store()
+    assert "/memories/a.txt" in store().get("MemoryStore:@w-1:files")
+    assert "/memories/a.txt" in store().get("MemoryStore:@w-2:files")
+
+
+async def test_tool_state_scopes_keep_separate_readonly_memory() -> None:
+    """Readonly memory reads and seeds the files of its own scope."""
+    writer = memory()
+    reader = memory(initial_data={"/memories/seed.txt": "seed"}, readonly=True)
+    with tool_state_scope("w-1"):
+        await writer(command="create", path="/memories/a.txt", file_text="w-1")
+        content = await reader(command="view", path="/memories/a.txt")
+        assert isinstance(content, str) and "w-1" in content
+    with tool_state_scope("w-2"):
+        with pytest.raises(ToolError, match="does not exist"):
+            await reader(command="view", path="/memories/a.txt")
+        content = await reader(command="view", path="/memories/seed.txt")
+        assert isinstance(content, str) and "seed" in content
+    assert "MemoryStore:files" not in store()
+
+
+async def test_tool_state_scope_keeps_explicit_instance_shared() -> None:
+    """An explicit instance is shared across scopes."""
+    tool = memory(instance="team")
+    with tool_state_scope("w-1"):
+        await tool(command="create", path="/memories/a.txt", file_text="board")
+    with tool_state_scope("w-2"):
+        content = await tool(command="view", path="/memories/a.txt")
+        assert isinstance(content, str) and "board" in content
+
+
+async def test_tool_state_scope_does_not_share_with_explicit_instance() -> None:
+    """A scope named like an explicit instance keeps its own memory."""
+    with tool_state_scope("team"):
+        await memory()(command="create", path="/memories/a.txt", file_text="w")
+    with pytest.raises(ToolError, match="does not exist"):
+        await memory(instance="team")(command="view", path="/memories/a.txt")
+
+
+async def test_no_tool_state_scope_keeps_default_keys() -> None:
+    """Outside a scope the default instance keeps today's store keys."""
+    await memory()(command="create", path="/memories/a.txt", file_text="x")
+    assert "/memories/a.txt" in store().get("MemoryStore:files")
+
+
+async def test_rename_refuses_existing_file_destination() -> None:
+    """Rename onto an existing file must refuse, not replace its content."""
+    tool = memory()
+    await tool(command="create", path="/memories/old.txt", file_text="old content")
+    await tool(command="create", path="/memories/new.txt", file_text="precious")
+    with pytest.raises(ToolError, match="already exists"):
+        await tool(
+            command="rename", old_path="/memories/old.txt", new_path="/memories/new.txt"
+        )
+    # Destination content survives the refused rename.
+    content = await tool(command="view", path="/memories/new.txt")
+    assert isinstance(content, str)
+    assert "precious" in content
+
+
+async def test_rename_refuses_existing_directory_destination() -> None:
+    """Rename onto an existing directory must refuse, not fork the store."""
+    tool = memory()
+    await tool(command="create", path="/memories/old.txt", file_text="content")
+    await tool(command="create", path="/memories/dir/keep.txt", file_text="keep")
+    with pytest.raises(ToolError, match="already exists"):
+        await tool(
+            command="rename", old_path="/memories/old.txt", new_path="/memories/dir"
+        )
+    content = await tool(command="view", path="/memories/dir/keep.txt")
+    assert isinstance(content, str)
+    assert "keep" in content
+
+
+async def test_rename_directory_refuses_existing_file_destination() -> None:
+    """Renaming a directory onto an existing file must refuse."""
+    tool = memory()
+    await tool(command="create", path="/memories/dir/a.txt", file_text="a")
+    await tool(command="create", path="/memories/blocker.txt", file_text="blocker")
+    with pytest.raises(ToolError, match="already exists"):
+        await tool(
+            command="rename", old_path="/memories/dir", new_path="/memories/blocker.txt"
+        )
+    content = await tool(command="view", path="/memories/dir/a.txt")
+    assert isinstance(content, str)
+    assert "a" in content

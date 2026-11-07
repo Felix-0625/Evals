@@ -1,0 +1,162 @@
+import clsx from "clsx";
+import { FC, useCallback, useMemo, useState } from "react";
+
+import { PopOver, ToolButton } from "@tsmono/react/components";
+
+import { ScoreLabel } from "../../../app/types";
+
+import styles from "./SelectScorer.module.css";
+
+interface SelectScorerProps {
+  scores: ScoreLabel[];
+  selectedScores?: ScoreLabel[];
+  setSelectedScores: (scores: ScoreLabel[]) => void;
+}
+
+export const SelectScorer: FC<SelectScorerProps> = ({
+  scores,
+  selectedScores,
+  setSelectedScores,
+}) => {
+  const [showing, setShowing] = useState(false);
+  const [buttonEl, setButtonEl] = useState<HTMLButtonElement | null>(null);
+
+  const selectedKeys = useMemo(() => {
+    return new Set(selectedScores?.map((s) => `${s.scorer}.${s.name}`));
+  }, [selectedScores]);
+
+  const selectedCount = selectedKeys.size;
+  const label =
+    selectedCount === 0
+      ? "Score"
+      : selectedCount === 1
+        ? selectedScores?.[0]?.name || "Score"
+        : `${selectedCount} Scores`;
+
+  const allScoresSelected = selectedCount === scores.length;
+  const noneSelected = selectedCount === 0;
+
+  return (
+    <div style={{ display: "flex" }}>
+      <span
+        className={clsx(
+          "sample-filter-label",
+          "text-size-smaller",
+          "text-style-label",
+          "text-style-secondary",
+          styles.label
+        )}
+      >
+        Scorers:
+      </span>
+      <ToolButton
+        label={label}
+        icon="metrics"
+        onClick={() => setShowing(!showing)}
+        ref={setButtonEl}
+        className={clsx(styles.bodyColorButton)}
+      />
+      <PopOver
+        id="score-selector-popover"
+        positionEl={buttonEl}
+        isOpen={showing}
+        setIsOpen={setShowing}
+        placement="bottom-start"
+        hoverDelay={-1}
+        styles={{
+          padding: "3px 5px",
+        }}
+      >
+        <div className={clsx(styles.links, "text-size-smaller")}>
+          <button
+            type="button"
+            className={clsx(!allScoresSelected ? styles.selected : undefined)}
+            onClick={() => {
+              const firstScore = scores[0];
+              if (firstScore !== undefined) {
+                setSelectedScores([firstScore]);
+              }
+            }}
+          >
+            Default
+          </button>
+          |
+          <button
+            type="button"
+            className={clsx(allScoresSelected ? styles.selected : undefined)}
+            onClick={() => {
+              setSelectedScores(scores);
+            }}
+          >
+            All
+          </button>
+          |
+          <button
+            type="button"
+            className={clsx(noneSelected ? styles.selected : undefined)}
+            onClick={() => {
+              setSelectedScores([]);
+            }}
+          >
+            None
+          </button>
+        </div>
+        <div className={styles.container}>
+          <ScoreCheckboxes
+            scores={scores}
+            selectedKeys={selectedKeys}
+            setSelectedScores={setSelectedScores}
+          />
+        </div>
+      </PopOver>
+    </div>
+  );
+};
+
+interface ScoreCheckboxesProps {
+  scores: ScoreLabel[];
+  selectedKeys?: Set<string>;
+  setSelectedScores: (scores: ScoreLabel[]) => void;
+}
+
+const ScoreCheckboxes: FC<ScoreCheckboxesProps> = ({
+  scores,
+  selectedKeys,
+  setSelectedScores,
+}) => {
+  const handleToggle = useCallback(
+    (scoreToToggle: ScoreLabel, currentlyChecked: boolean) => {
+      const key = `${scoreToToggle.scorer}.${scoreToToggle.name}`;
+      const current = new Set(selectedKeys);
+
+      if (currentlyChecked) {
+        current.delete(key);
+      } else {
+        current.add(key);
+      }
+
+      const next = scores.filter((s) => current.has(`${s.scorer}.${s.name}`));
+      setSelectedScores(next);
+    },
+    [setSelectedScores, scores, selectedKeys]
+  );
+
+  return (
+    <div className={clsx(styles.grid, "text-size-smaller")}>
+      {scores.map((sc) => {
+        const key = `${sc.scorer}.${sc.name}`;
+        const isChecked = selectedKeys ? selectedKeys.has(key) : false;
+        return (
+          <label key={key} className={clsx(styles.row)}>
+            <input
+              type="checkbox"
+              checked={isChecked}
+              onChange={() => handleToggle(sc, isChecked)}
+            />
+            {sc.name}
+          </label>
+        );
+      })}
+    </div>
+  );
+};

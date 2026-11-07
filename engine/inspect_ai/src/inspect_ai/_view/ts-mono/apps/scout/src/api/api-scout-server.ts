@@ -1,0 +1,622 @@
+import { decompress as decompressZstd } from "fzstd";
+
+import { normalizeEvents } from "@tsmono/inspect-common/normalize";
+import {
+  ApiError,
+  asyncJsonParse,
+  encodeBase64Url,
+  isRecord,
+} from "@tsmono/util";
+
+import type { Condition, OrderByModel } from "../query";
+import {
+  ActiveScansResponse,
+  AppConfig,
+  CreateValidationSetRequest,
+  InvalidationTopic,
+  Pagination,
+  ProjectConfig,
+  ProjectConfigInput,
+  RawEncoding,
+  Result,
+  ScanJobConfig,
+  ScannerInputResponse,
+  ScannersResponse,
+  ScansResponse,
+  SearchInputListResponse,
+  SearchRequest,
+  SearchResponse,
+  Status,
+  Transcript,
+  TranscriptsResponse,
+  ValidationCase,
+  ValidationCaseRequest,
+} from "../types/api-types";
+
+import {
+  NoPersistence,
+  ScalarValue,
+  ScanResultDetail,
+  ScoutApiV2,
+  SearchResultScope,
+  TopicVersions,
+} from "./api";
+import { resolveAttachments } from "./attachmentsHelpers";
+import { expandInputEvents } from "./expandInputEvents";
+import {
+  normalizeActiveScans,
+  normalizeStatus,
+  normalizeTranscript,
+  type WireActiveScansResponse,
+  type WireMessagesEvents,
+  type WireStatus,
+  type WireTranscriptInfo,
+} from "./normalize";
+import { serverRequestApi } from "./request";
+
+export type HeaderProvider = () => Promise<Record<string, string>>;
+
+type TopicUpdateCallback = (topVersions: TopicVersions) => void;
+
+// `satisfies` ties this to the generated union: regenerating the API types
+// with a new invalidation topic errors here until the topic is added, so new
+// topics can't be silently stripped from invalidation frames.
+const kInvalidationTopics = {
+  "project-config": true,
+  scans: true,
+  transcripts: true,
+} satisfies Record<InvalidationTopic, true>;
+
+const isInvalidationTopic = (key: string): key is InvalidationTopic =>
+  Object.hasOwn(kInvalidationTopics, key);
+
+/**
+ * Topic versions arrive as wire text on both the polling and SSE paths.
+ * Unrecognized keys and non-string versions are dropped, but any parseable
+ * JSON frame still counts as an update (it marks the connection live);
+ * only unparseable text isn't an update at all.
+ */
+const parseTopicVersions = (text: string): TopicVersions | undefined => {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  const versions: TopicVersions = {};
+  if (isRecord(parsed)) {
+    for (const [key, version] of Object.entries(parsed)) {
+      if (isInvalidationTopic(key) && typeof version === "string") {
+        versions[key] = version;
+      }
+    }
+  }
+  return versions;
+};
+
+const ENCODING_ZSTD: RawEncoding = "zstd";
+
+/**
+ * Fetch messages-events JSON for a transcript.
+ * Requests raw zstd-compressed bytes and decompresses client-side.
+ * Falls back to uncompressed JSON if server doesn't support zstd.
+ */
+async function fetchMessagesEvents(
+  requestApi: ReturnType<typeof serverRequestApi>,
+  encodedDir: string,
+  encodedId: string
+): Promise<string> {
+  const url = `/transcripts/${encodedDir}/${encodedId}/messages-events`;
+
+  const result = await requestApi.fetchBytes(
+    "GET",
+    url,
+    { "X-Accept-Raw-Encoding": ENCODING_ZSTD },
+    // Server returns application/json when transcoding to deflate
+    "application/json"
+  );
+
+  const encoding = result.headers.get("X-Content-Encoding");
+
+  if (encoding === ENCODING_ZSTD) {
+    return new TextDecoder().decode(
+      decompressZstd(new Uint8Array(result.data))
+    );
+  }
+
+  if (encoding !== null) {
+    throw new Error(`Unsupported X-Content-Encoding: ${encoding}`);
+  }
+
+  // No X-Content-Encoding header means uncompressed (or browser-handled compression)
+  return new TextDecoder().decode(result.data);
+}
+
+export const apiScoutServer = (
+  options: {
+    apiBaseUrl?: string;
+    headerProvider?: HeaderProvider;
+    customFetch?: typeof fetch;
+    disableSSE?: boolean;
+  } = {}
+): ScoutApiV2 => {
+  const {
+    apiBaseUrl = "/api/v2",
+    headerProvider,
+    customFetch,
+    disableSSE,
+  } = options;
+  const requestApi = serverRequestApi(apiBaseUrl, headerProvider, customFetch);
+
+  return {
+    capability: "workbench",
+    getConfig: async (): Promise<AppConfig> => {
+      const result = await requestApi.fetchString("GET", `/app-config`);
+      return asyncJsonParse<AppConfig>(result.raw);
+    },
+    getTranscripts: async (
+      transcriptsDir: string,
+      filter?: Condition,
+      orderBy?: OrderByModel | OrderByModel[],
+      pagination?: Pagination
+    ): Promise<TranscriptsResponse> => {
+      const result = await requestApi.fetchString(
+        "POST",
+        `/transcripts/${encodeBase64Url(transcriptsDir)}`,
+        {},
+        JSON.stringify({
+          filter: filter ?? null,
+          order_by: orderBy ?? null,
+          pagination: pagination ?? null,
+        })
+      );
+
+      const parsedResult = await asyncJsonParse<TranscriptsResponse>(
+        result.raw
+      );
+      return parsedResult;
+    },
+    hasTranscript: async (
+      transcriptsDir: string,
+      id: string
+    ): Promise<boolean> => {
+      try {
+        await requestApi.fetchVoid(
+          "HEAD",
+          `/transcripts/${encodeBase64Url(transcriptsDir)}/${encodeURIComponent(id)}/info`
+        );
+        return true;
+      } catch (error) {
+        if (error instanceof Error && error.message.includes("404")) {
+          return false;
+        }
+        throw error;
+      }
+    },
+    getTranscript: async (
+      transcriptsDir: string,
+      id: string
+    ): Promise<Transcript> => {
+      const encodedDir = encodeBase64Url(transcriptsDir);
+      const encodedId = encodeURIComponent(id);
+
+      const [infoResult, messagesEventsJson] = await Promise.all([
+        requestApi.fetchString(
+          "GET",
+          `/transcripts/${encodedDir}/${encodedId}/info`
+        ),
+        fetchMessagesEvents(requestApi, encodedDir, encodedId),
+      ]);
+
+      const [info, parsed] = await Promise.all([
+        asyncJsonParse<WireTranscriptInfo>(infoResult.raw),
+        asyncJsonParse<WireMessagesEvents>(messagesEventsJson),
+      ]);
+
+      // Boundary normalization (#555): transcripts can come from old logs
+      // that omit fields the types declare required.
+      const transcript = normalizeTranscript(
+        {
+          ...info,
+          messages: parsed.messages,
+          events: parsed.events,
+          timelines: parsed.timelines,
+        },
+        parsed.events_data
+      );
+
+      const { attachments } = parsed;
+      return attachments && Object.keys(attachments).length > 0
+        ? {
+            ...transcript,
+            messages: resolveAttachments(transcript.messages, attachments),
+            events: resolveAttachments(transcript.events, attachments),
+          }
+        : transcript;
+    },
+    getTranscriptsColumnValues: async (
+      transcriptsDir: string,
+      column: string,
+      filter: Condition | undefined
+    ): Promise<ScalarValue[]> => {
+      const result = await requestApi.fetchString(
+        "POST",
+        `/transcripts/${encodeBase64Url(transcriptsDir)}/distinct`,
+        {},
+        JSON.stringify({ column, filter: filter ?? null })
+      );
+      return asyncJsonParse<ScalarValue[]>(result.raw);
+    },
+    getScan: async (scansDir: string, scanPath: string): Promise<Status> => {
+      const result = await requestApi.fetchString(
+        "GET",
+        `/scans/${encodeBase64Url(scansDir)}/${encodeBase64Url(scanPath)}`
+      );
+
+      // Boundary normalization (#555): status is read back from scan files
+      // written by many inspect_scout versions.
+      return normalizeStatus(await asyncJsonParse<WireStatus>(result.raw));
+    },
+    downloadScan: async (scansDir: string, scanPath: string): Promise<Blob> => {
+      const result = await requestApi.fetchBytes(
+        "GET",
+        `/scans/${encodeBase64Url(scansDir)}/${encodeBase64Url(scanPath)}`,
+        { Accept: "application/zip" }
+      );
+      return new Blob([result.data], { type: "application/zip" });
+    },
+
+    getScans: async (
+      scansDir: string,
+      filter?: Condition,
+      orderBy?: OrderByModel | OrderByModel[],
+      pagination?: Pagination
+    ): Promise<ScansResponse> => {
+      const result = await requestApi.fetchString(
+        "POST",
+        `/scans/${encodeBase64Url(scansDir)}`,
+        {},
+        JSON.stringify({
+          filter: filter ?? null,
+          order_by: orderBy ?? null,
+          pagination: pagination ?? null,
+        })
+      );
+      return asyncJsonParse<ScansResponse>(result.raw);
+    },
+    getScansColumnValues: async (
+      scansDir: string,
+      column: string,
+      filter: Condition | undefined
+    ): Promise<ScalarValue[]> => {
+      const result = await requestApi.fetchString(
+        "POST",
+        `/scans/${encodeBase64Url(scansDir)}/distinct`,
+        {},
+        JSON.stringify({ column, filter: filter ?? null })
+      );
+      return asyncJsonParse<ScalarValue[]>(result.raw);
+    },
+    getScannerDataframe: async (
+      scansDir: string,
+      scanPath: string,
+      scanner: string,
+      excludeColumns?: string[]
+    ): Promise<ArrayBuffer> => {
+      const params = new URLSearchParams();
+      for (const col of excludeColumns ?? []) {
+        params.append("exclude_column", col);
+      }
+      const query = params.size ? `?${params}` : "";
+      const result = await requestApi.fetchBytes(
+        "GET",
+        `/scans/${encodeBase64Url(scansDir)}/${encodeBase64Url(scanPath)}/${encodeURIComponent(scanner)}${query}`
+      );
+      return result.data;
+    },
+    getScannerDataframeDetail: async (
+      scansDir: string,
+      scanPath: string,
+      scanner: string,
+      uuid: string
+    ): Promise<ScanResultDetail> => {
+      const { raw } = await requestApi.fetchString(
+        "GET",
+        `/scans/${encodeBase64Url(scansDir)}/${encodeBase64Url(scanPath)}/${encodeURIComponent(scanner)}/${encodeURIComponent(uuid)}?column=input&column=input_type&column=input_data&column=scan_events`
+      );
+      const parsed = await asyncJsonParse<
+        ScannerInputResponse & { scan_events?: unknown }
+      >(raw);
+
+      return {
+        input: {
+          input_type: parsed.input_type,
+          input: expandInputEvents(
+            parsed.input,
+            parsed.input_type,
+            parsed.input_data
+          ),
+        },
+        // Boundary normalization (#555): scan events are written by many
+        // inspect_scout versions and can omit required-with-default fields.
+        scanEvents: normalizeEvents(parsed.scan_events),
+      };
+    },
+    getActiveScans: async (): Promise<ActiveScansResponse> =>
+      normalizeActiveScans(
+        await asyncJsonParse<WireActiveScansResponse>(
+          (await requestApi.fetchString("GET", `/scans/active`)).raw
+        )
+      ),
+    postSearch: async (
+      transcriptDir: string,
+      transcriptId: string,
+      request: SearchRequest
+    ): Promise<SearchResponse> =>
+      asyncJsonParse<SearchResponse>(
+        (
+          await requestApi.fetchString(
+            "POST",
+            `/transcripts/${encodeBase64Url(transcriptDir)}/${encodeURIComponent(transcriptId)}/search`,
+            {},
+            JSON.stringify(request)
+          )
+        ).raw
+      ),
+    getSearches: async (
+      searchType: SearchRequest["type"],
+      count: number
+    ): Promise<SearchInputListResponse> =>
+      asyncJsonParse<SearchInputListResponse>(
+        (
+          await requestApi.fetchString(
+            "GET",
+            `/searches?type=${encodeURIComponent(searchType)}&count=${count}`
+          )
+        ).raw
+      ),
+    getSearchResult: async (
+      transcriptDir: string,
+      transcriptId: string,
+      searchId: string,
+      scope: SearchResultScope
+    ): Promise<Result | null> => {
+      const params = new URLSearchParams();
+      if (scope.messages) {
+        params.set("messages", scope.messages);
+      }
+      if (scope.events) {
+        params.set("events", scope.events);
+      }
+      const query = params.toString();
+      const path =
+        `/transcripts/${encodeBase64Url(transcriptDir)}/${encodeURIComponent(transcriptId)}` +
+        `/searches/${encodeURIComponent(searchId)}${query ? `?${query}` : ""}`;
+      try {
+        return await asyncJsonParse<Result>(
+          (await requestApi.fetchString("GET", path)).raw
+        );
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 404) {
+          return null;
+        }
+        throw error;
+      }
+    },
+    postCode: async (condition: Condition): Promise<Record<string, string>> =>
+      asyncJsonParse<Record<string, string>>(
+        (
+          await requestApi.fetchString(
+            "POST",
+            `/code`,
+            {},
+            JSON.stringify(condition)
+          )
+        ).raw
+      ),
+    getProjectConfig: async (): Promise<{
+      config: ProjectConfig;
+      etag: string;
+    }> => {
+      const response = await requestApi.fetchType<ProjectConfig>(
+        "GET",
+        `/project/config`
+      );
+      const etag = response.headers.get("ETag")?.replace(/"/g, "") ?? "";
+      return { config: response.parsed, etag };
+    },
+    updateProjectConfig: async (
+      config: ProjectConfigInput,
+      etag: string | null
+    ): Promise<{ config: ProjectConfig; etag: string }> => {
+      const headers: Record<string, string> = {};
+      if (etag) {
+        headers["If-Match"] = `"${etag}"`;
+      }
+      const response = await requestApi.fetchType<ProjectConfig>(
+        "PUT",
+        `/project/config`,
+        {
+          headers,
+          body: JSON.stringify(config),
+        }
+      );
+      const newEtag = response.headers.get("ETag")?.replace(/"/g, "") ?? "";
+      return { config: response.parsed, etag: newEtag };
+    },
+    startScan: async (config: ScanJobConfig): Promise<Status> =>
+      normalizeStatus(
+        await asyncJsonParse<WireStatus>(
+          (
+            await requestApi.fetchString(
+              "POST",
+              `/startscan`,
+              {},
+              JSON.stringify(config)
+            )
+          ).raw
+        )
+      ),
+    getScanners: async (): Promise<ScannersResponse> => {
+      const result = await requestApi.fetchString("GET", `/scanners`);
+      return asyncJsonParse<ScannersResponse>(result.raw);
+    },
+
+    // Validation API
+    getValidationSets: async (): Promise<string[]> => {
+      const result = await requestApi.fetchString("GET", `/validations`);
+      return asyncJsonParse<string[]>(result.raw);
+    },
+    getValidationCases: async (uri: string): Promise<ValidationCase[]> => {
+      const result = await requestApi.fetchString(
+        "GET",
+        `/validations/${encodeBase64Url(uri)}`
+      );
+      return asyncJsonParse<ValidationCase[]>(result.raw);
+    },
+    getValidationCase: async (
+      uri: string,
+      caseId: string
+    ): Promise<ValidationCase> => {
+      const result = await requestApi.fetchString(
+        "GET",
+        `/validations/${encodeBase64Url(uri)}/${encodeBase64Url(caseId)}`
+      );
+      return asyncJsonParse<ValidationCase>(result.raw);
+    },
+    createValidationSet: async (
+      request: CreateValidationSetRequest
+    ): Promise<string> => {
+      const result = await requestApi.fetchString(
+        "POST",
+        `/validations`,
+        {},
+        JSON.stringify(request)
+      );
+      return asyncJsonParse<string>(result.raw);
+    },
+    upsertValidationCase: async (
+      uri: string,
+      caseId: string,
+      data: ValidationCaseRequest
+    ): Promise<ValidationCase> => {
+      const result = await requestApi.fetchString(
+        "POST",
+        `/validations/${encodeBase64Url(uri)}/${encodeBase64Url(caseId)}`,
+        {},
+        JSON.stringify(data)
+      );
+      return asyncJsonParse<ValidationCase>(result.raw);
+    },
+    deleteValidationCase: async (
+      uri: string,
+      caseId: string
+    ): Promise<void> => {
+      await requestApi.fetchVoid(
+        "DELETE",
+        `/validations/${encodeBase64Url(uri)}/${encodeBase64Url(caseId)}`
+      );
+    },
+    deleteValidationSet: async (uri: string): Promise<void> => {
+      await requestApi.fetchVoid(
+        "DELETE",
+        `/validations/${encodeBase64Url(uri)}`
+      );
+    },
+    renameValidationSet: async (
+      uri: string,
+      newName: string
+    ): Promise<string> => {
+      const result = await requestApi.fetchString(
+        "PUT",
+        `/validations/${encodeBase64Url(uri)}/rename`,
+        {},
+        JSON.stringify({ name: newName })
+      );
+      return asyncJsonParse<string>(result.raw);
+    },
+
+    connectTopicUpdates: (
+      onUpdate: (topVersions: TopicVersions) => void
+    ): (() => void) =>
+      disableSSE
+        ? connectTopicUpdatesViaPolling(apiBaseUrl, onUpdate, customFetch)
+        : connectTopicUpdatesViaSSE(apiBaseUrl, onUpdate),
+    storage: NoPersistence,
+  };
+};
+
+const connectTopicUpdatesViaPolling = (
+  apiBaseUrl: string,
+  onUpdate: TopicUpdateCallback,
+  customFetch?: typeof fetch
+): (() => void) => {
+  const controller = new AbortController();
+
+  const poll = (): void => {
+    (customFetch ?? fetch)(`${apiBaseUrl}/topics`, {
+      signal: controller.signal,
+    })
+      .then((res) => {
+        // An error response's body (often parseable JSON like {"detail":...})
+        // must not count as a topic update and mark the connection live.
+        if (!res.ok) {
+          throw new Error(`unexpected status ${res.status}`);
+        }
+        return res.text();
+      })
+      .then((text) => {
+        const versions = parseTopicVersions(text);
+        if (versions) {
+          onUpdate(versions);
+        }
+      })
+      .catch((error: unknown) => {
+        const name =
+          error && typeof error === "object" && "name" in error
+            ? error.name
+            : undefined;
+        if (name !== "AbortError") {
+          console.error("Topic polling failed:", error);
+        }
+      });
+  };
+
+  poll();
+  const intervalId = setInterval(poll, 10000);
+
+  return () => {
+    controller.abort();
+    clearInterval(intervalId);
+  };
+};
+
+const connectTopicUpdatesViaSSE = (
+  apiBaseUrl: string,
+  onUpdate: TopicUpdateCallback
+): (() => void) => {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  let eventSource: EventSource | undefined;
+
+  const connect = () => {
+    eventSource = new EventSource(`${apiBaseUrl}/topics/stream`);
+    eventSource.onmessage = (e) => {
+      const data: unknown = e.data;
+      const versions =
+        typeof data === "string" ? parseTopicVersions(data) : undefined;
+      if (versions) {
+        onUpdate(versions);
+      }
+    };
+    eventSource.onerror = () => {
+      eventSource?.close();
+      timeoutId = setTimeout(connect, 5000);
+    };
+  };
+
+  connect();
+  return () => {
+    clearTimeout(timeoutId);
+    eventSource?.close();
+  };
+};

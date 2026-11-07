@@ -1,0 +1,8 @@
+lib/
+dist/
+dist-e2e/
+src/types/generated.ts
+playwright-report/
+test-results/
+*.md
+*.module.css.d.ts

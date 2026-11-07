@@ -1,0 +1,1542 @@
+"""Tests for load_filtered_transcript function."""
+
+from __future__ import annotations
+
+import io
+import json
+import math
+from collections import Counter
+from collections.abc import AsyncIterable, AsyncIterator
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, Literal, cast
+
+import pytest
+
+if TYPE_CHECKING:
+    from tests.conftest import CallTracker
+
+from inspect_ai._util.async_bytes_reader import adapt_to_reader
+from inspect_ai._util.async_zip import AsyncZipReader
+from inspect_ai._util.asyncfiles import AsyncFilesystem
+from inspect_ai.event import InfoEvent, Timeline, TimelineEvent, TimelineSpan, ToolEvent
+from inspect_ai.event._model import ModelEvent
+from inspect_scout import Transcript, TranscriptInfo
+from inspect_scout._transcript.json.load_filtered import (
+    _parse_and_filter,
+    load_filtered_transcript,
+)
+from inspect_scout._transcript.types import EventFilter, MessageFilter
+from inspect_scout._transcript.util import LazyJSONDict
+
+
+def create_json_stream(data: dict[str, Any]) -> io.BytesIO:
+    """Create an async-compatible BytesIO stream from dictionary data."""
+    return io.BytesIO(json.dumps(data).encode())
+
+
+@pytest.mark.asyncio
+async def test_basic_loading() -> None:
+    """Test basic transcript loading."""
+    result = await load_filtered_transcript(
+        create_json_stream(
+            {
+                "id": "test-001",
+                "metadata": {
+                    "eval_name": "diffecient",
+                    "eval_file_path": "some_path",
+                    "variant_name": "hard",
+                    "first_solve_time": 454,
+                    "category": "cryptography",
+                    "competition": "Sekai-2022",
+                    "some_object": {"hi": "there"},
+                },
+                "messages": [
+                    {"id": "m1", "role": "user", "content": "Hello"},
+                    {"id": "m2", "role": "assistant", "content": "Hi"},
+                ],
+                "events": [
+                    {
+                        "span_id": "s1",
+                        "timestamp": 1640995200.123,
+                        "event": "score",
+                        "score": {"value": 0.85},
+                    }
+                ],
+                "attachments": {},
+            }
+        ),
+        TranscriptInfo(
+            transcript_id="test-001",
+            source_type="test",
+            source_id="source-001",
+            source_uri="/test.json",
+            metadata={"test": True},
+        ),
+        "all",
+        "all",
+    )
+
+    assert isinstance(result, Transcript)
+    assert result.transcript_id == "test-001"
+    assert result.source_uri == "/test.json"
+    assert result.metadata == {
+        "test": True,
+        "sample_metadata": {
+            "eval_name": "diffecient",
+            "eval_file_path": "some_path",
+            "variant_name": "hard",
+            "first_solve_time": 454,
+            "category": "cryptography",
+            "competition": "Sekai-2022",
+            "some_object": {"hi": "there"},
+        },
+    }
+    assert len(result.messages) == 2
+    assert len(result.events) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message_filter,expected_count,expected_roles",
+    [
+        (None, 0, []),
+        (["user"], 1, ["user"]),
+        (["user", "assistant"], 2, ["user", "assistant"]),
+        ("all", 3, ["user", "assistant", "system"]),
+    ],
+)
+async def test_message_filtering(
+    message_filter: MessageFilter, expected_count: int, expected_roles: list[str]
+) -> None:
+    """Test message filtering with different filter configurations."""
+    result = await load_filtered_transcript(
+        create_json_stream(
+            {
+                "id": "test",
+                "messages": [
+                    {"role": "user", "content": "User message"},
+                    {"role": "assistant", "content": "Assistant message"},
+                    {"role": "system", "content": "System message"},
+                ],
+                "events": [],
+                "attachments": {},
+            }
+        ),
+        TranscriptInfo(
+            transcript_id="test",
+            source_type="test",
+            source_id="42",
+            source_uri="/test.json",
+        ),
+        message_filter,
+        "all",
+    )
+
+    assert len(result.messages) == expected_count
+    actual_roles = [msg.role for msg in result.messages]
+    assert set(actual_roles) == set(expected_roles)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event_filter,expected_count,expected_types",
+    [
+        (None, 0, []),
+        (["score"], 1, ["score"]),
+        (["span_begin", "score"], 2, ["span_begin", "score"]),
+        ("all", 3, ["span_begin", "score", "span_end"]),
+    ],
+)
+async def test_event_filtering(
+    event_filter: EventFilter, expected_count: int, expected_types: list[str]
+) -> None:
+    """Test event filtering with different filter configurations."""
+    result = await load_filtered_transcript(
+        create_json_stream(
+            {
+                "id": "test",
+                "messages": [],
+                "events": [
+                    {
+                        "span_id": "s1",
+                        "timestamp": 1.0,
+                        "event": "span_begin",
+                        "id": "s1",
+                        "name": "test_span",
+                    },
+                    {
+                        "span_id": "s2",
+                        "timestamp": 2.0,
+                        "event": "score",
+                        "score": {"value": 0.85},
+                    },
+                    {
+                        "span_id": "s3",
+                        "timestamp": 3.0,
+                        "event": "span_end",
+                        "id": "s1",
+                    },
+                ],
+                "attachments": {},
+            }
+        ),
+        TranscriptInfo(
+            transcript_id="test",
+            source_type="test",
+            source_id="42",
+            source_uri="/test.json",
+        ),
+        "all",
+        event_filter,
+    )
+
+    assert len(result.events) == expected_count
+    actual_types = [evt.event for evt in result.events]
+    assert set(actual_types) == set(expected_types)
+
+
+@pytest.mark.asyncio
+async def test_combined_filtering() -> None:
+    """Test filtering both messages and events simultaneously."""
+    result = await load_filtered_transcript(
+        create_json_stream(
+            {
+                "id": "test",
+                "messages": [
+                    {"role": "user", "content": "Q"},
+                    {"role": "assistant", "content": "A"},
+                    {"role": "system", "content": "S"},
+                ],
+                "events": [
+                    {
+                        "span_id": "s1",
+                        "timestamp": 1.0,
+                        "event": "score",
+                        "score": {"value": 0.9},
+                    },
+                    {
+                        "span_id": "s2",
+                        "timestamp": 2.0,
+                        "event": "error",
+                        "error": "Test",
+                    },
+                ],
+                "attachments": {},
+            }
+        ),
+        TranscriptInfo(
+            transcript_id="test",
+            source_type="test",
+            source_id="42",
+            source_uri="/test.json",
+        ),
+        ["user"],
+        ["score"],
+    )
+
+    assert len(result.messages) == 1
+    assert result.messages[0].role == "user"
+    assert len(result.events) == 1
+    assert result.events[0].event == "score"
+
+
+@pytest.mark.asyncio
+async def test_attachment_resolution() -> None:
+    """Test resolution of attachment references."""
+    result = await load_filtered_transcript(
+        create_json_stream(
+            {
+                "id": "test",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "attachment://a1b2c3d4e5f678901234567890123456",
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "attachment://b2c3d4e5f67890123456789012345678",
+                            }
+                        ],
+                    },
+                ],
+                "events": [
+                    {
+                        "span_id": "s1",
+                        "timestamp": 1.0,
+                        "event": "tool",
+                        "id": "tool1",
+                        "function": "test_function",
+                        "arguments": {},
+                        "result": "attachment://c3d4e5f6789012345678901234567890",
+                    }
+                ],
+                "attachments": {
+                    "a1b2c3d4e5f678901234567890123456": "Content A",
+                    "b2c3d4e5f67890123456789012345678": "Content B",
+                    "c3d4e5f6789012345678901234567890": "Content C",
+                },
+            }
+        ),
+        TranscriptInfo(
+            transcript_id="test",
+            source_type="test",
+            source_id="42",
+            source_uri="/test.json",
+        ),
+        "all",
+        "all",
+    )
+
+    assert result.messages[0].content == "Content A"
+    assert result.messages[1].text == "Content B"
+    assert isinstance(result.events[0], ToolEvent)
+    assert result.events[0].result == "Content C"
+
+
+@pytest.mark.asyncio
+async def test_embedded_attachment_ref_is_not_a_ref() -> None:
+    """An id that merely appears inside a larger string is not a reference.
+
+    `create_attachment` returns `attachment://<hash>` as an entire field value
+    and inspect_ai reads refs back with `startswith`, so mid-string text is
+    author-written: it must neither retain its attachment nor be substituted.
+    """
+    attachment_id = "a1b2c3d4e5f678901234567890123456"
+    embedded = f"see attachment://{attachment_id} for details"
+    info = TranscriptInfo(
+        transcript_id="test",
+        source_type="test",
+        source_id="42",
+        source_uri="/test.json",
+    )
+    messages: list[dict[str, Any]] = [{"role": "user", "content": embedded}]
+    table = {attachment_id: "SECRET"}
+    event: dict[str, Any] = {
+        "span_id": "s1",
+        "timestamp": 1.0,
+        "event": "info",
+        "data": {},
+    }
+
+    # Events first and not collected, so the ref filter is what bounds the
+    # table: an embedded id must not put its attachment in it.
+    async with adapt_to_reader(
+        create_json_stream(
+            {
+                "id": "test",
+                "messages": messages,
+                "events": [event],
+                "attachments": table,
+            }
+        )
+    ) as reader:
+        _, attachments = await _parse_and_filter(reader, info, "all", None)
+    assert attachments == {}
+
+    # Attachments first with events collected latches `retain_all`, so the
+    # whole table is held and only the resolution rule keeps the text intact.
+    result = await load_filtered_transcript(
+        create_json_stream(
+            {
+                "id": "test",
+                "messages": messages,
+                "attachments": table,
+                "events": [event],
+            }
+        ),
+        info,
+        "all",
+        "all",
+    )
+    assert result.messages[0].content == embedded
+
+
+@pytest.mark.parametrize(
+    "attachments_first",
+    [False, True],
+    ids=["events-before-attachments", "attachments-before-events"],
+)
+@pytest.mark.asyncio
+async def test_pool_ref_resolves_regardless_of_section_order(
+    attachments_first: bool,
+) -> None:
+    """A pool-entry ref resolves whichever order the JSON sections come in.
+
+    `events_data` is parsed after `attachments`, so its pool refs are unknown
+    while attachments stream past. Each ordering pins a different disjunct of
+    `retain_all`: events-first (what real eval logs do) reaches
+    `_event_has_pool_refs`; attachments-first -- legal, JSON key order is not
+    guaranteed -- reaches `not state.events_seen`.
+    """
+    attachment_id = "b1c2d3e4f5a678901234567890123456"
+    attachments = {attachment_id: "VALUE"}
+    event: dict[str, Any] = {
+        "span_id": "s1",
+        "timestamp": "2022-01-01T00:00:00+00:00",
+        "event": "model",
+        "model": "test-model",
+        "input": [],
+        "output": {"model": "test-model", "choices": []},
+        "tools": [],
+        "tool_choice": "auto",
+        "config": {},
+        "input_refs": [[0, 1]],
+    }
+    events_data: dict[str, Any] = {
+        "messages": [{"role": "user", "content": f"attachment://{attachment_id}"}],
+        "calls": [],
+    }
+
+    ordered_sections: dict[str, Any] = (
+        {"attachments": attachments, "events": [event]}
+        if attachments_first
+        else {"events": [event], "attachments": attachments}
+    )
+
+    result = await load_filtered_transcript(
+        create_json_stream(
+            {
+                "id": "test",
+                "messages": [],
+                **ordered_sections,
+                "events_data": events_data,
+            }
+        ),
+        TranscriptInfo(
+            transcript_id="test",
+            source_type="test",
+            source_id="42",
+            source_uri="/test.json",
+        ),
+        "all",
+        "all",
+    )
+
+    model_event = result.events[0]
+    assert isinstance(model_event, ModelEvent)
+    assert model_event.input[0].content == "VALUE"
+
+
+@pytest.mark.parametrize(
+    "events_filter,events_first",
+    [
+        pytest.param(None, False, id="events-not-collected"),
+        pytest.param("all", True, id="events-section-empty"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_attachments_bounded_when_no_pool_refs_retained(
+    events_filter: EventFilter, events_first: bool
+) -> None:
+    """Only referenced attachments are retained when no pool entry can be needed.
+
+    Each row leaves exactly one arm of `retain_all` holding retention down.
+    `events-not-collected` puts attachments first, so `not state.events_seen`
+    is true as they stream and only the `collecting_events` gate bounds the
+    table. `events-section-empty` collects events from an empty section, which
+    only its own `start_array` can mark seen (`events.item` never fires) --
+    "seen and empty" must not read as "not streamed yet", which legitimately
+    retains everything.
+    """
+    referenced_id = "a1b2c3d4e5f678901234567890123456"
+    unrelated_id = "b2c3d4e5f67890123456789012345678"
+    table = {referenced_id: "REFERENCED", unrelated_id: "UNRELATED"}
+    ordered_sections: dict[str, Any] = (
+        {"events": [], "attachments": table}
+        if events_first
+        else {"attachments": table, "events": []}
+    )
+
+    async with adapt_to_reader(
+        create_json_stream(
+            {
+                "id": "test",
+                "messages": [
+                    {"role": "user", "content": f"attachment://{referenced_id}"},
+                ],
+                **ordered_sections,
+            }
+        )
+    ) as reader:
+        _, attachments = await _parse_and_filter(
+            reader,
+            TranscriptInfo(
+                transcript_id="test",
+                source_type="test",
+                source_id="42",
+                source_uri="/test.json",
+            ),
+            "all",
+            events_filter,
+        )
+
+    assert set(attachments) == {referenced_id}
+
+
+@pytest.mark.asyncio
+async def test_missing_attachments() -> None:
+    """Test handling of missing attachment references."""
+    result = await load_filtered_transcript(
+        create_json_stream(
+            {
+                "id": "test",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "attachment://missingabcdef1234567890123456",
+                    }
+                ],
+                "events": [],
+                "attachments": {},
+            }
+        ),
+        TranscriptInfo(
+            transcript_id="test",
+            source_type="test",
+            source_id="42",
+            source_uri="/test.json",
+        ),
+        "all",
+        "all",
+    )
+
+    # Missing attachment should remain as reference
+    assert "attachment://missingabcdef1234567890123456" in result.messages[0].content
+
+
+@pytest.mark.asyncio
+async def test_malformed_attachments() -> None:
+    """Test handling of malformed attachment references."""
+    result = await load_filtered_transcript(
+        create_json_stream(
+            {
+                "id": "test",
+                "messages": [
+                    {"role": "user", "content": "attachment://short"},
+                    {
+                        "role": "user",
+                        "content": "attachment://toolong123456789012345678901234567890",
+                    },
+                    {"role": "user", "content": "Regular text without attachments"},
+                ],
+                "events": [],
+                "attachments": {},
+            }
+        ),
+        TranscriptInfo(
+            transcript_id="test",
+            source_type="test",
+            source_id="42",
+            source_uri="/test.json",
+        ),
+        "all",
+        "all",
+    )
+
+    # Malformed references should remain unchanged
+    assert result.messages[0].content == "attachment://short"
+    assert (
+        result.messages[1].content
+        == "attachment://toolong123456789012345678901234567890"
+    )
+    assert result.messages[2].content == "Regular text without attachments"
+
+
+@pytest.mark.asyncio
+async def test_unicode_and_special_chars() -> None:
+    """Test handling of unicode and special characters in attachments."""
+    result = await load_filtered_transcript(
+        create_json_stream(
+            {
+                "id": "test",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "attachment://a1b2c3d4e5f678901234567890123456",
+                    }
+                ],
+                "events": [],
+                "attachments": {
+                    "a1b2c3d4e5f678901234567890123456": "Unicode: éñ中文🌟\nSpecial: @#$%"
+                },
+            }
+        ),
+        TranscriptInfo(
+            transcript_id="test",
+            source_type="test",
+            source_id="42",
+            source_uri="/test.json",
+        ),
+        "all",
+        "all",
+    )
+
+    assert result.messages[0].content == "Unicode: éñ中文🌟\nSpecial: @#$%"
+
+
+@pytest.mark.asyncio
+async def test_empty_transcript() -> None:
+    """Test handling of empty transcript."""
+    result = await load_filtered_transcript(
+        create_json_stream(
+            {"id": "empty", "messages": [], "events": [], "attachments": {}}
+        ),
+        TranscriptInfo(
+            transcript_id="empty",
+            source_type="test",
+            source_id="42",
+            source_uri="/test.json",
+        ),
+        "all",
+        "all",
+    )
+
+    assert len(result.messages) == 0
+    assert len(result.events) == 0
+
+
+class _AsyncChunkedBytes:
+    """AsyncIterable that yields data in chunks, can be iterated multiple times."""
+
+    def __init__(self, data: bytes, chunk_size: int = 64) -> None:
+        self._data = data
+        self._chunk_size = chunk_size
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for i in range(0, len(self._data), self._chunk_size):
+            yield self._data[i : i + self._chunk_size]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("data_type", ["io", "iterable"])
+async def test_json5_nan_inf_fallback(data_type: Literal["io", "iterable"]) -> None:
+    """Test fallback to json5 parser for NaN and Infinity values."""
+    # JSON5 with NaN and Infinity - ijson can't parse this, so fallback triggers
+    json5_content = b"""{
+        "id": "json5-test",
+        "metadata": {"score": NaN, "limit": Infinity, "negative": -Infinity},
+        "messages": [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there"}
+        ],
+        "events": [
+            {"span_id": "s1", "timestamp": 1.0, "event": "score", "score": {"value": NaN}}
+        ],
+        "attachments": {}
+    }"""
+
+    source: io.BytesIO | AsyncIterable[bytes] = (
+        _AsyncChunkedBytes(json5_content)
+        if data_type == "iterable"
+        else io.BytesIO(json5_content)
+    )
+
+    result = await load_filtered_transcript(
+        source,
+        TranscriptInfo(
+            transcript_id="json5-test",
+            source_type="test",
+            source_id="42",
+            source_uri="/test.json",
+            metadata={"original": "metadata"},
+        ),
+        "all",
+        "all",
+    )
+
+    assert result.transcript_id == "json5-test"
+    assert len(result.messages) == 2
+    assert len(result.events) == 1
+    # Verify NaN/Inf values are parsed (they become Python float nan/inf)
+    sample_meta = result.metadata["sample_metadata"]
+    assert math.isnan(sample_meta["score"])
+    assert math.isinf(sample_meta["limit"]) and sample_meta["limit"] > 0
+    assert math.isinf(sample_meta["negative"]) and sample_meta["negative"] < 0
+
+
+@pytest.mark.asyncio
+async def test_json5_fallback_with_filtering() -> None:
+    """Test that json5 fallback applies filtering correctly."""
+    result = await load_filtered_transcript(
+        io.BytesIO(
+            b"""{
+        "id": "filter-test",
+        "metadata": {},
+        "messages": [
+            {"role": "user", "content": "User msg"},
+            {"role": "assistant", "content": "Assistant msg"},
+            {"role": "system", "content": "System msg"}
+        ],
+        "events": [
+            {"span_id": "s1", "timestamp": 1.0, "event": "score", "score": {"value": NaN}},
+            {"span_id": "s2", "timestamp": 2.0, "event": "info", "data": {"key": "value"}}
+        ],
+        "attachments": {}
+    }"""
+        ),
+        TranscriptInfo(
+            transcript_id="filter-test",
+            source_type="test",
+            source_id="42",
+            source_uri="/test.json",
+        ),
+        ["user"],
+        ["score"],
+    )
+
+    assert len(result.messages) == 1
+    assert result.messages[0].role == "user"
+    assert len(result.events) == 1
+    assert result.events[0].event == "score"
+
+
+@pytest.mark.asyncio
+async def test_attachment_resolution_in_nested_structures() -> None:
+    """Test attachment resolution in deeply nested structures (lists and dicts)."""
+    result = await load_filtered_transcript(
+        create_json_stream(
+            {
+                "id": "test",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "attachment://a1b2c3d4e5f678901234567890123456",
+                            },
+                        ],
+                    }
+                ],
+                "events": [
+                    {
+                        "span_id": "s1",
+                        "timestamp": 1.0,
+                        "event": "tool",
+                        "id": "tool1",
+                        "function": "test_function",
+                        "arguments": {
+                            "list_input": [
+                                "attachment://b2c3d4e5f67890123456789012345678",
+                                {
+                                    "nested_key": "attachment://c3d4e5f6789012345678901234567890"
+                                },
+                            ],
+                            "dict_input": {
+                                "key1": "attachment://d4e5f67890123456789012345678901a",
+                                "nested": {
+                                    "key2": "attachment://e5f67890123456789012345678901ab2"
+                                },
+                            },
+                        },
+                        "result": "test result",
+                    }
+                ],
+                "attachments": {
+                    "a1b2c3d4e5f678901234567890123456": "Resolved A",
+                    "b2c3d4e5f67890123456789012345678": "Resolved B",
+                    "c3d4e5f6789012345678901234567890": "Resolved C",
+                    "d4e5f67890123456789012345678901a": "Resolved D",
+                    "e5f67890123456789012345678901ab2": "Resolved E",
+                },
+            }
+        ),
+        TranscriptInfo(
+            transcript_id="test",
+            source_type="test",
+            source_id="42",
+            source_uri="/test.json",
+        ),
+        "all",
+        "all",
+    )
+
+    # Check message content array resolution
+    assert result.messages[0].text == "Resolved A"
+
+    # Check event arguments resolution with lists
+    assert isinstance(result.events[0], ToolEvent)
+    assert cast(list[Any], result.events[0].arguments["list_input"])[0] == "Resolved B"
+    assert (
+        cast(
+            dict[str, Any], cast(list[Any], result.events[0].arguments["list_input"])[1]
+        )["nested_key"]
+        == "Resolved C"
+    )
+
+    # Check event arguments resolution with nested dicts
+    assert (
+        cast(dict[str, Any], result.events[0].arguments["dict_input"])["key1"]
+        == "Resolved D"
+    )
+    assert (
+        cast(
+            dict[str, Any],
+            cast(dict[str, Any], result.events[0].arguments["dict_input"])["nested"],
+        )["key2"]
+        == "Resolved E"
+    )
+
+
+@pytest.mark.asyncio
+async def test_early_exit_when_no_events_no_attachment_refs(
+    call_tracker: CallTracker,
+) -> None:
+    """Early exit fires when events=None and messages have no attachment refs."""
+    result = await load_filtered_transcript(
+        create_json_stream(
+            {
+                "id": "test",
+                "target": "the answer",
+                "messages": [
+                    {"role": "user", "content": "Hello"},
+                    {"role": "assistant", "content": "Hi"},
+                ],
+                "output": {},
+                "scores": {"accuracy": {"value": "C", "answer": "C"}},
+                "metadata": {"key": "value"},
+                "events": [
+                    {"span_id": "s1", "timestamp": 1.0, "event": "info", "data": {}},
+                ],
+                "attachments": {},
+            }
+        ),
+        TranscriptInfo(
+            transcript_id="test",
+            source_type="test",
+            source_id="42",
+            source_uri="/test.json",
+        ),
+        "all",
+        None,
+        on_early_exit=call_tracker,
+    )
+
+    assert call_tracker.called
+    assert len(result.messages) == 2
+    assert not result.events
+    assert result.metadata["scores"] == {"accuracy": {"value": "C", "answer": "C"}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late_field", ["messages", "target", "scores", "metadata"])
+async def test_field_order_preserves_content(late_field: str) -> None:
+    fields: dict[str, Any] = {
+        "target": "full target",
+        "messages": [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi"},
+        ],
+        "scores": {"accuracy": {"value": "C"}},
+        "metadata": {"marker": "full metadata"},
+        "events": [],
+    }
+    sample: dict[str, Any] = {
+        "store": {
+            "target": "nested target",
+            "messages": [],
+            "scores": {},
+            "metadata": {},
+        }
+    }
+    sample.update(fields)
+    sample[late_field] = sample.pop(late_field)
+    result = await load_filtered_transcript(
+        create_json_stream(sample),
+        TranscriptInfo(
+            transcript_id="field-order",
+            metadata={
+                "existing": "kept",
+                "target": "thinned target",
+                "scores": {"stale": True},
+                "sample_metadata": {"thinned": True},
+            },
+        ),
+        "all",
+        None,
+    )
+    assert [message.text for message in result.messages] == ["Hello", "Hi"]
+    assert result.metadata == {
+        "existing": "kept",
+        "target": fields["target"],
+        "scores": fields["scores"],
+        "sample_metadata": fields["metadata"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_messages_after_events_resolve_attachments() -> None:
+    attachment_id = "a" * 32
+    result = await load_filtered_transcript(
+        create_json_stream(
+            {
+                "target": "",
+                "scores": {},
+                "metadata": {},
+                "events": [],
+                "messages": [
+                    {"role": "user", "content": f"attachment://{attachment_id}"}
+                ],
+                "attachments": {attachment_id: "Resolved content"},
+            }
+        ),
+        TranscriptInfo(transcript_id="reordered-attachment"),
+        "all",
+        None,
+    )
+    assert [message.text for message in result.messages] == ["Resolved content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("events_filter", [None, ["model"], "all"])
+@pytest.mark.parametrize("nan_in_body", [False, True], ids=["ijson", "json5-fallback"])
+async def test_stored_timelines_load_only_with_all_events(
+    events_filter: EventFilter, nan_in_body: bool
+) -> None:
+    """Stored timelines come back only when every event they may reference is loaded.
+
+    A timeline node referencing an event the filter dropped fails validation, which
+    failed every scan of a Petri log (which stores timelines) when a scanner set
+    `events=[...]`.
+    """
+    timestamp = datetime(2026, 9, 11, tzinfo=timezone.utc)
+    event = InfoEvent(data="example", uuid="example-event", timestamp=timestamp)
+    timeline = Timeline(
+        name="Custom",
+        description="",
+        root=TimelineSpan(
+            id="root",
+            name="root",
+            content=[TimelineEvent(event=event)],
+        ),
+    )
+    # No "scores" key forces the reader past "events" to reach "timelines".
+    # inspect_ai always writes "scores" ({} when unscored); the trigger is synthetic.
+    sample: dict[str, Any] = {
+        "target": "",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "metadata": {},
+        "output": {},
+        "events": [event.model_dump(mode="json")],
+        "timelines": [timeline.model_dump(mode="json")],
+    }
+    body = json.dumps(sample)
+    if nan_in_body:
+        # ijson rejects NaN, so this routes through the json5 fallback.
+        body = body.replace('"output": {}', '"output": {"x": NaN}')
+    result = await load_filtered_transcript(
+        io.BytesIO(body.encode()),
+        TranscriptInfo(transcript_id="timeline-repro"),
+        "all",
+        events_filter,
+    )
+    assert [message.text for message in result.messages] == ["Hello"]
+    if events_filter == "all":
+        assert result.events == [event]
+        assert result.timelines == [timeline]
+    else:
+        assert result.events == []
+        assert result.timelines == []
+
+
+@pytest.mark.asyncio
+async def test_early_exit_suppressed_by_attachment_refs(
+    call_tracker: CallTracker,
+) -> None:
+    """Early exit does NOT fire when messages contain attachment refs."""
+    attachment_id = "a1b2c3d4e5f678901234567890123456"
+
+    result = await load_filtered_transcript(
+        create_json_stream(
+            {
+                "id": "test",
+                "target": "the answer",
+                "messages": [
+                    {"role": "user", "content": f"attachment://{attachment_id}"},
+                    {"role": "assistant", "content": "Hi"},
+                ],
+                "output": {},
+                "scores": {"accuracy": {"value": "C", "answer": "C"}},
+                "metadata": {"key": "value"},
+                "events": [],
+                "attachments": {attachment_id: "Resolved content"},
+            }
+        ),
+        TranscriptInfo(
+            transcript_id="test",
+            source_type="test",
+            source_id="42",
+            source_uri="/test.json",
+        ),
+        "all",
+        None,
+        on_early_exit=call_tracker,
+    )
+
+    assert not call_tracker.called
+    assert len(result.messages) == 2
+    assert result.messages[0].content == "Resolved content"
+    assert result.metadata["scores"] == {"accuracy": {"value": "C", "answer": "C"}}
+
+
+@pytest.mark.asyncio
+async def test_early_exit_preserves_sample_metadata(
+    call_tracker: CallTracker,
+) -> None:
+    """sample_metadata must be unthinned even when early exit fires (events=None)."""
+    result = await load_filtered_transcript(
+        create_json_stream(
+            {
+                "id": "test",
+                "target": "the answer",
+                "messages": [
+                    {"role": "user", "content": "Hello"},
+                ],
+                "output": {},
+                "scores": {"accuracy": {"value": "C", "answer": "C"}},
+                "metadata": {"full_key": "full_value", "nested": {"a": 1}},
+                "events": [],
+                "attachments": {},
+            }
+        ),
+        TranscriptInfo(
+            transcript_id="test",
+            source_type="test",
+            source_id="42",
+            source_uri="/test.json",
+            metadata={"existing": "kept"},
+        ),
+        "all",
+        None,
+        on_early_exit=call_tracker,
+    )
+
+    assert call_tracker.called
+    assert result.metadata["existing"] == "kept"
+    assert result.metadata["sample_metadata"] == {
+        "full_key": "full_value",
+        "nested": {"a": 1},
+    }
+    assert result.metadata["scores"] == {"accuracy": {"value": "C", "answer": "C"}}
+
+
+@pytest.mark.asyncio
+async def test_target_unthinned_string() -> None:
+    """`target` (string) from sample JSON replaces thinned index value in metadata."""
+    result = await load_filtered_transcript(
+        create_json_stream(
+            {
+                "id": "test",
+                "target": "the full answer",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "output": {},
+                "scores": {"accuracy": {"value": "C", "answer": "C"}},
+                "metadata": {},
+                "events": [],
+                "attachments": {},
+            }
+        ),
+        TranscriptInfo(
+            transcript_id="test",
+            source_type="test",
+            source_id="42",
+            source_uri="/test.json",
+            metadata={"target": "thinned"},
+        ),
+        "all",
+        None,
+    )
+
+    assert result.metadata["target"] == "the full answer"
+    assert result.metadata["scores"] == {"accuracy": {"value": "C", "answer": "C"}}
+
+
+@pytest.mark.asyncio
+async def test_target_unthinned_list() -> None:
+    """`target` (list) from sample JSON replaces thinned index value in metadata."""
+    result = await load_filtered_transcript(
+        create_json_stream(
+            {
+                "id": "test",
+                "target": ["answer A", "answer B"],
+                "messages": [{"role": "user", "content": "Hello"}],
+                "output": {},
+                "scores": {"accuracy": {"value": "C", "answer": "C"}},
+                "metadata": {},
+                "events": [],
+                "attachments": {},
+            }
+        ),
+        TranscriptInfo(
+            transcript_id="test",
+            source_type="test",
+            source_id="42",
+            source_uri="/test.json",
+            metadata={"target": "thinned"},
+        ),
+        "all",
+        None,
+    )
+
+    assert result.metadata["target"] == ["answer A", "answer B"]
+    assert result.metadata["scores"] == {"accuracy": {"value": "C", "answer": "C"}}
+
+
+@pytest.mark.asyncio
+async def test_scores_unthinned() -> None:
+    """`scores` from sample JSON available in metadata after loading."""
+    scores = {
+        "accuracy": {"value": "C", "answer": "C", "explanation": "Correct"},
+        "relevance": {"value": "I", "answer": "B"},
+    }
+    result = await load_filtered_transcript(
+        create_json_stream(
+            {
+                "id": "test",
+                "target": "the answer",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "output": {},
+                "scores": scores,
+                "metadata": {},
+                "events": [],
+                "attachments": {},
+            }
+        ),
+        TranscriptInfo(
+            transcript_id="test",
+            source_type="test",
+            source_id="42",
+            source_uri="/test.json",
+        ),
+        "all",
+        None,
+    )
+
+    assert result.metadata["scores"] == scores
+
+
+@pytest.mark.slow
+@pytest.mark.asyncio
+async def test_s3_eval_assistant_tool_filter() -> None:
+    s3_path = "s3://slow-tests/swe_bench.eval"
+    member_name = "samples/astropy__astropy-14309_epoch_1.json"
+
+    info = TranscriptInfo(
+        transcript_id="what id?",
+        source_type="test",
+        source_id="vend_fat_eval",
+        source_uri=s3_path,
+        metadata={"test": True},
+    )
+
+    async with AsyncFilesystem() as fs:
+        async with await AsyncZipReader(fs, s3_path).open_member(member_name) as stream:
+            result = await load_filtered_transcript(
+                stream,
+                info,
+                ["assistant", "tool"],  # Filter for assistant and tool messages
+                None,
+            )
+
+    assert (
+        result.metadata["sample_metadata"]["hints_text"] == "cc @nstarman from #14274"
+    )
+    assert isinstance(result, Transcript)
+    assert result.transcript_id == "what id?"
+    assert result.source_uri == s3_path
+    # Check that we got what we asked for and only what we asked for
+    role_counts = Counter(msg.role for msg in result.messages)
+    assert len(role_counts) == 2
+    assert role_counts["assistant"] == 40
+    assert role_counts["tool"] == 38
+    assert not result.events
+
+
+@pytest.mark.asyncio
+async def test_pool_resolution() -> None:
+    """Eval files with message/call pools are resolved correctly."""
+    sample_data = {
+        "id": "test-pool",
+        "target": "expected",
+        "messages": [
+            {"id": "m1", "role": "user", "content": "Hello"},
+        ],
+        "scores": {},
+        "metadata": {},
+        "events": [
+            {
+                "span_id": "s1",
+                "timestamp": "2022-01-01T00:00:00+00:00",
+                "event": "model",
+                "model": "test-model",
+                "input": [],
+                "input_refs": [[0, 2]],
+                "output": {"model": "test-model", "choices": []},
+                "tools": [],
+                "tool_choice": "auto",
+                "config": {},
+            },
+        ],
+        "attachments": {},
+        "message_pool": [
+            {"role": "system", "content": "You are helpful"},
+            {"role": "user", "content": "Solve this"},
+        ],
+        "call_pool": [],
+    }
+    result = await load_filtered_transcript(
+        create_json_stream(sample_data),
+        TranscriptInfo(
+            transcript_id="test-pool",
+            source_type="test",
+            source_id="source-pool",
+            source_uri="/test-pool.json",
+            metadata={},
+        ),
+        "all",
+        "all",
+    )
+    # Verify pool was resolved: event should have input populated
+    assert len(result.events) == 1
+    model_event = result.events[0]
+    assert isinstance(model_event, ModelEvent)
+    assert len(model_event.input) == 2
+    assert model_event.input[0].role == "system"
+    assert model_event.input[1].content == "Solve this"
+
+
+@pytest.mark.asyncio
+async def test_v2_backwards_compatible() -> None:
+    """v2 files without pools still work correctly."""
+    sample_data = {
+        "id": "test-v2",
+        "target": "expected",
+        "messages": [
+            {"id": "m1", "role": "user", "content": "Hello"},
+        ],
+        "scores": {},
+        "metadata": {},
+        "events": [
+            {
+                "span_id": "s1",
+                "timestamp": "2022-01-01T00:00:00+00:00",
+                "event": "model",
+                "model": "test-model",
+                "input": [
+                    {"role": "user", "content": "Inline input"},
+                ],
+                "output": {"model": "test-model", "choices": []},
+                "tools": [],
+                "tool_choice": "auto",
+                "config": {},
+            },
+        ],
+        "attachments": {},
+    }
+    result = await load_filtered_transcript(
+        create_json_stream(sample_data),
+        TranscriptInfo(
+            transcript_id="test-v2",
+            source_type="test",
+            source_id="source-v2",
+            source_uri="/test-v2.json",
+            metadata={},
+        ),
+        "all",
+        "all",
+    )
+    assert len(result.events) == 1
+    model_event = result.events[0]
+    assert isinstance(model_event, ModelEvent)
+    assert len(model_event.input) == 1
+    assert model_event.input[0].content == "Inline input"
+
+
+@pytest.mark.asyncio
+async def test_pool_resolution_json5_fallback() -> None:
+    """Pool resolution works through the json5 fallback path."""
+    # Use NaN in metadata to trigger json5 fallback
+    sample_json = json.dumps(
+        {
+            "id": "test-pool-j5",
+            "target": "expected",
+            "messages": [],
+            "scores": {},
+            "metadata": {"nan_value": 0.0},
+            "events": [
+                {
+                    "span_id": "s1",
+                    "timestamp": "2022-01-01T00:00:00+00:00",
+                    "event": "model",
+                    "model": "test-model",
+                    "input": [],
+                    "input_refs": [[0, 1]],
+                    "output": {"model": "test-model", "choices": []},
+                    "tools": [],
+                    "tool_choice": "auto",
+                    "config": {},
+                },
+            ],
+            "attachments": {},
+            "message_pool": [
+                {"id": "p1", "role": "user", "content": "From pool"},
+            ],
+            "call_pool": [],
+        }
+    ).replace('"nan_value": 0.0', '"nan_value": NaN')
+    result = await load_filtered_transcript(
+        io.BytesIO(sample_json.encode()),
+        TranscriptInfo(
+            transcript_id="test-pool-j5",
+            source_type="test",
+            source_id="s",
+            source_uri="/test.json",
+            metadata={},
+        ),
+        "all",
+        "all",
+    )
+    model_event = result.events[0]
+    assert isinstance(model_event, ModelEvent)
+    assert len(model_event.input) == 1
+    assert model_event.input[0].content == "From pool"
+
+
+@pytest.mark.asyncio
+async def test_call_pool_resolution() -> None:
+    """call_pool refs are resolved through the full streaming pipeline."""
+    sample_data = {
+        "id": "test-pool-call",
+        "target": "expected",
+        "messages": [],
+        "scores": {},
+        "metadata": {},
+        "events": [
+            {
+                "span_id": "s1",
+                "timestamp": "2022-01-01T00:00:00+00:00",
+                "event": "model",
+                "model": "test-model",
+                "input": [{"role": "user", "content": "hi"}],
+                "output": {"model": "test-model", "choices": []},
+                "call": {
+                    "request": {"model": "test-model"},
+                    "response": {},
+                    "call_refs": [[0, 1]],
+                    "call_key": "messages",
+                },
+                "tools": [],
+                "tool_choice": "auto",
+                "config": {},
+            },
+        ],
+        "attachments": {},
+        "message_pool": [],
+        "call_pool": [
+            {"role": "user", "content": "pooled call msg"},
+        ],
+    }
+    result = await load_filtered_transcript(
+        create_json_stream(sample_data),
+        TranscriptInfo(
+            transcript_id="test-pool-call",
+            source_type="test",
+            source_id="source-pool-call",
+            source_uri="/test-pool-call.json",
+            metadata={},
+        ),
+        "all",
+        "all",
+    )
+    assert len(result.events) == 1
+    model_event = result.events[0]
+    assert isinstance(model_event, ModelEvent)
+    assert model_event.call is not None
+    assert model_event.call.request["messages"] == [
+        {"role": "user", "content": "pooled call msg"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pool_resolution_events_data_schema() -> None:
+    """Pools written under the consolidated events_data schema are resolved.
+
+    Inspect AI PR #3519 (March 2026) replaced the top-level message_pool /
+    call_pool arrays with a single ``events_data`` object holding
+    ``messages`` and ``calls``. Logs produced after that change must still
+    have ModelEvent.input populated.
+    """
+    sample_data = {
+        "id": "test-pool-ed",
+        "target": "expected",
+        "messages": [],
+        "scores": {},
+        "metadata": {},
+        "events": [
+            {
+                "span_id": "s1",
+                "timestamp": "2022-01-01T00:00:00+00:00",
+                "event": "model",
+                "model": "test-model",
+                "input": [],
+                "input_refs": [[0, 2]],
+                "output": {"model": "test-model", "choices": []},
+                "call": {
+                    "request": {"model": "test-model"},
+                    "response": {},
+                    "call_refs": [[0, 1]],
+                    "call_key": "messages",
+                },
+                "tools": [],
+                "tool_choice": "auto",
+                "config": {},
+            },
+        ],
+        "attachments": {},
+        "events_data": {
+            "messages": [
+                {"role": "system", "content": "You are helpful"},
+                {"role": "user", "content": "Solve this"},
+            ],
+            "calls": [
+                {"role": "user", "content": "pooled call msg"},
+            ],
+        },
+    }
+    result = await load_filtered_transcript(
+        create_json_stream(sample_data),
+        TranscriptInfo(
+            transcript_id="test-pool-ed",
+            source_type="test",
+            source_id="source-pool-ed",
+            source_uri="/test-pool-ed.json",
+            metadata={},
+        ),
+        "all",
+        "all",
+    )
+    assert len(result.events) == 1
+    model_event = result.events[0]
+    assert isinstance(model_event, ModelEvent)
+    assert len(model_event.input) == 2
+    assert model_event.input[0].role == "system"
+    assert model_event.input[1].content == "Solve this"
+    assert model_event.call is not None
+    assert model_event.call.request["messages"] == [
+        {"role": "user", "content": "pooled call msg"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pool_resolution_events_data_json5_fallback() -> None:
+    """events_data pools resolve through the json5 fallback path too."""
+    # A bare NaN value is invalid JSON but accepted by the json5 fallback,
+    # so passing one through json.dumps (allow_nan=True is the default)
+    # forces the streaming parser to error out and triggers the fallback.
+    sample_json = json.dumps(
+        {
+            "id": "test-pool-ed-j5",
+            "target": "expected",
+            "messages": [],
+            "scores": {},
+            "metadata": {"nan_value": math.nan},
+            "events": [
+                {
+                    "span_id": "s1",
+                    "timestamp": "2022-01-01T00:00:00+00:00",
+                    "event": "model",
+                    "model": "test-model",
+                    "input": [],
+                    "input_refs": [[0, 1]],
+                    "output": {"model": "test-model", "choices": []},
+                    "tools": [],
+                    "tool_choice": "auto",
+                    "config": {},
+                },
+            ],
+            "attachments": {},
+            "events_data": {
+                "messages": [{"role": "user", "content": "from pool"}],
+                "calls": [],
+            },
+        }
+    )
+    result = await load_filtered_transcript(
+        io.BytesIO(sample_json.encode()),
+        TranscriptInfo(
+            transcript_id="test-pool-ed-j5",
+            source_type="test",
+            source_id="source-pool-ed-j5",
+            source_uri="/test-pool-ed-j5.json",
+            metadata={},
+        ),
+        "all",
+        "all",
+    )
+    assert len(result.events) == 1
+    model_event = result.events[0]
+    assert isinstance(model_event, ModelEvent)
+    assert len(model_event.input) == 1
+    assert model_event.input[0].content == "from pool"
+
+
+def _info_with_index_metadata() -> TranscriptInfo:
+    """A TranscriptInfo carrying the index's LazyJSONDict, attached as eval_log does.
+
+    `sample_metadata` is a JSON *string* here, as the index stores it; the
+    declined path must hand it back parsed, not raw.
+    """
+    info = TranscriptInfo(
+        transcript_id="test",
+        source_type="test",
+        source_id="42",
+        source_uri="/test.json",
+        metadata={},
+    )
+    object.__setattr__(
+        info,
+        "metadata",
+        LazyJSONDict(
+            {
+                "sample_metadata": '{"thin": "summary"}',
+                "target": "a, b",
+                "score_accuracy": "C",
+            },
+            json_keys=["sample_metadata"],
+        ),
+    )
+    return info
+
+
+_UNTHINNED_BODY: dict[str, Any] = {
+    "id": "test",
+    "target": ["a", "b"],
+    "messages": [{"role": "user", "content": "Hello"}],
+    "output": {},
+    "scores": {"accuracy": {"value": "C", "answer": "C"}},
+    "metadata": {"full_key": "full_value", "nested": {"a": 1}},
+    "events": [],
+    "attachments": {},
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("nan_in_body", [False, True], ids=["ijson", "json5-fallback"])
+async def test_declined_metadata_keeps_the_index_values(nan_in_body: bool) -> None:
+    """Both parse paths keep the index's thinned values and never hand back a raw JSON string."""
+    body = json.dumps(_UNTHINNED_BODY)
+    if nan_in_body:
+        # ijson rejects NaN, so this routes through the json5 fallback.
+        body = body.replace('"output": {}', '"output": {"x": NaN}')
+    info = _info_with_index_metadata()
+
+    result = await load_filtered_transcript(
+        io.BytesIO(body.encode()), info, "all", None, metadata=False
+    )
+
+    assert result.metadata["sample_metadata"] == {"thin": "summary"}
+    assert result.metadata["target"] == "a, b"
+    assert "scores" not in result.metadata

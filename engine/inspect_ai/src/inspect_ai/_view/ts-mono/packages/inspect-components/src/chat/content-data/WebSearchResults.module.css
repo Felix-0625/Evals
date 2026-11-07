@@ -1,0 +1,8 @@
+.result a:hover {
+  text-decoration: underline;
+}
+
+.result a {
+  opacity: 0.8;
+  text-decoration: none;
+}

@@ -1,0 +1,558 @@
+import inspect
+import json
+from collections.abc import Sequence
+from typing import (
+    Any,
+    Callable,
+    NoReturn,
+    Type,
+    TypeVar,
+    get_args,
+    get_origin,
+)
+
+from inspect_ai._util.error import PrerequisiteError
+from inspect_ai._util.json import to_json_str_safe
+from inspect_ai.model import (
+    ChatMessage,
+    ChatMessageTool,
+    ChatMessageUser,
+    GenerateConfig,
+    Model,
+    ModelOutput,
+    execute_tools,
+    get_model,
+)
+from inspect_ai.scorer import ValueToFloat
+from inspect_ai.tool import (
+    Tool,
+    ToolDef,
+    ToolInfo,
+    ToolParams,
+    ToolSource,
+)
+from inspect_ai.util import JSONSchema
+from inspect_ai.util._json import resolve_schema_references
+from pydantic import BaseModel, Field, create_model
+
+from inspect_scout._llm_scanner.types import AnswerStructured
+from inspect_scout._scanner.result import Reference, Result, as_resultset
+from inspect_scout._util.refusal import generate_retry_refusals
+
+
+async def structured_generate(
+    input: str | list[ChatMessage],
+    schema: JSONSchema,
+    answer_tool: str | None = "answer",
+    context_tools: Sequence[Tool | ToolDef | ToolInfo | ToolSource] = (),
+    model: str | Model | None = None,
+    config: GenerateConfig | None = None,
+    max_attempts: int = 3,
+    retry_refusals: int = 3,
+) -> tuple[dict[str, Any] | None, list[ChatMessage], ModelOutput]:
+    # resolve input
+    input = [ChatMessageUser(content=input)] if isinstance(input, str) else input
+
+    # resolve model
+    model = get_model(model)
+
+    # create a dynamic tool definition for the answer tool
+    # use module-level function to ensure picklability
+    answer_tooldef = ToolDef(
+        tool=_answer_tool_impl,
+        name=answer_tool,
+        description="Use this tool to submit your final answer.",
+        parameters=ToolParams(
+            type="object",
+            properties=schema.properties or {},
+            required=schema.required or [],
+        ),
+    )
+
+    # wrap each context tool in a stub that preserves name/description/schema
+    # but whose body just tells the model to call answer() instead. these are
+    # declarations the model needs to see for the input transcript to be
+    # API-valid; we never want them executed for real.
+    executable_tools: list[ToolDef | ToolSource] = [
+        *(_context_tool_stub(t, answer_tooldef.name) for t in context_tools),
+        answer_tooldef,
+    ]
+
+    # setup initial values for messages and output (we will return these)
+    value: dict[str, Any] | None = None
+    messages = input.copy()
+    output: ModelOutput
+
+    # setup a generate loop that will run until a successful call to the
+    # answer tool is made
+    attempts = 0
+    while attempts < max_attempts:
+        output = await generate_retry_refusals(
+            model,
+            input=messages,
+            tools=executable_tools,
+            tool_choice="auto",
+            config=(config or GenerateConfig()).merge(
+                GenerateConfig(parallel_tool_calls=False)
+            ),
+            retry_refusals=retry_refusals,
+        )
+        messages.append(output.message)
+
+        # execute every tool call so each tool_use is paired with a
+        # tool_result before the next generate. this validates answer()
+        # arguments against the schema, returns "not callable here" for
+        # context-tool stubs, and reports "not found" for hallucinated tools.
+        execute_messages, execute_output = await execute_tools(
+            messages=messages, tools=executable_tools
+        )
+        messages.extend(execute_messages)
+        if execute_output is not None:
+            output = execute_output
+
+        # check for a successful call to the 'answer' tool
+        answer_tool_call = next(
+            (
+                tool_call
+                for tool_call in (output.message.tool_calls or [])
+                if tool_call.function == answer_tool
+            ),
+            None,
+        )
+        if answer_tool_call:
+            answer_result = next(
+                (
+                    m
+                    for m in execute_messages
+                    if isinstance(m, ChatMessageTool)
+                    and m.tool_call_id == answer_tool_call.id
+                ),
+                None,
+            )
+            if answer_result is not None and answer_result.error is None:
+                # set the value to the object returned by the model and break
+                value = answer_tool_call.arguments
+                output.completion = to_json_str_safe(answer_tool_call.arguments)
+                break
+
+        # if there were no tool calls then we need to insert a user message to
+        # tell the model to keep going (otherwise the tool results above are
+        # the feedback)
+        if len(output.message.tool_calls or []) == 0:
+            messages.append(
+                ChatMessageUser(
+                    content=f"Please use the {answer_tool}() tool to report your answer."
+                )
+            )
+
+        # keep going
+        attempts += 1
+
+    # return results
+    return value, messages, output
+
+
+def _context_tool_stub(
+    tool: Tool | ToolDef | ToolInfo | ToolSource, answer_tool: str
+) -> ToolDef | ToolSource:
+    """Clone a context tool's name/description/schema onto a non-callable stub.
+
+    The stub accepts any arguments and returns a string redirecting the model
+    to the answer tool, so ``execute_tools`` can pair the ``tool_use`` with a
+    ``tool_result`` without running anything real.
+    """
+    if isinstance(tool, ToolSource):
+        return tool
+    info = tool if isinstance(tool, (ToolDef, ToolInfo)) else ToolDef(tool)
+
+    async def stub(**kwargs: Any) -> str:
+        return (
+            f"'{info.name}' is not callable here — please respond using the "
+            f"{answer_tool}() tool."
+        )
+
+    return ToolDef(
+        tool=stub,
+        name=info.name,
+        description=info.description,
+        parameters=info.parameters,
+        options=info.options,
+    )
+
+
+ST = TypeVar("ST", bound=BaseModel)
+
+
+def structured_schema(answer: AnswerStructured[Any]) -> JSONSchema:
+    # Augment the type with an explanation field if it doesn't have one
+    answer_type, result_set = structured_answer_type(answer)
+    augmented_type = augment_type_with_explanation(answer_type)
+
+    # validate descriptions on all fields including nested BaseModel types
+    # we use validate_nested_models to handle nested BaseModel types properly
+    # (Pydantic uses $ref for nested models which complicates JSON schema validation)
+    missing_descriptions = validate_nested_models(augmented_type)
+    if missing_descriptions:
+        raise_missing_descriptions(missing_descriptions)
+
+    # Pydantic emits nested BaseModel fields as $ref/$defs, but JSONSchema has
+    # no fields for these — validating through it would silently drop the
+    # references and leave the model with an unspecified item shape (see #447).
+    # Inline all $ref definitions before validating.
+    item_schema = resolve_schema_references(
+        augmented_type.model_json_schema(by_alias=False)
+    )
+
+    # For result sets, synthesize a wrapper schema with a single list field
+    if result_set is not False:
+        # Determine the field name for the results list
+        field_name = "results" if result_set is True else result_set
+
+        # Create a wrapper schema with a single list field containing items of this type
+        wrapper_schema = {
+            "type": "object",
+            "properties": {
+                field_name: {
+                    "type": "array",
+                    "items": item_schema,
+                    "description": f"List of {augmented_type.__name__} items",
+                }
+            },
+            "required": [field_name],
+        }
+
+        return JSONSchema.model_validate(wrapper_schema)
+    else:
+        # For single results, return the schema as-is
+        return JSONSchema.model_validate(item_schema)
+
+
+def structured_answer_type(
+    answer: AnswerStructured[Any],
+) -> tuple[type[BaseModel], bool]:
+    origin = get_origin(answer.type)
+    if origin is list:
+        args = get_args(answer.type)
+        if not args or not issubclass(args[0], BaseModel):
+            raise ValueError("List must be parameterized with BaseModel subclass")
+        answer_type = args[0]
+        result_set = True
+    elif origin is not None:
+        # e.g. tuple[Model, ...] — statically admitted by the Sequence bound
+        # but only list is supported
+        raise ValueError(
+            f"AnswerStructured type must be a BaseModel subclass or a "
+            f"list of BaseModel, not {answer.type}"
+        )
+    else:
+        answer_type = answer.type
+        result_set = False
+    return answer_type, result_set
+
+
+class _InjectedExplanation(BaseModel):
+    """Validates the explanation field injected into augmented answer schemas."""
+
+    explanation: str
+
+
+def structured_result(
+    answer: AnswerStructured[Any],
+    output: ModelOutput,
+    extract_references_fn: Callable[[str], list[Reference]],
+    value_to_float: ValueToFloat | None = None,
+) -> Result:
+    """Convert structured model output to Result(s).
+
+    Args:
+        answer: The AnswerStructured configuration.
+        output: The ModelOutput containing the validated JSON.
+        extract_references_fn: Function to extract references from text.
+        value_to_float: Optional function to convert result values to float
+
+    Returns:
+        A Result with ``parsed`` set to the validated answer instance(s).
+    """
+    # parse out type info
+    answer_type, result_set = structured_answer_type(answer)
+
+    # Whether an explanation field was injected into the generation schema
+    # (i.e. the declared type has none of its own)
+    augmented = augment_type_with_explanation(answer_type) is not answer_type
+
+    # Helper: Find field value by name or alias
+    def get_field_by_name_or_alias(
+        obj: BaseModel, target_name: str
+    ) -> tuple[str | None, Any]:
+        """Get field value by field name or alias.
+
+        Returns:
+            Tuple of (actual_field_name, field_value) or (None, None) if not found.
+        """
+        model_fields = type(obj).model_fields
+
+        # Check direct field name first
+        if target_name in model_fields:
+            return target_name, getattr(obj, target_name)
+
+        # Check for alias
+        for field_name, field_info in model_fields.items():
+            if field_info.alias == target_name:
+                return field_name, getattr(obj, field_name)
+
+        return None, None
+
+    # Helper: Validate one answer object into the declared type.
+    def parse_answer_data(data: Any) -> tuple[BaseModel, Any]:
+        """Validate answer data, returning the instance and its explanation.
+
+        Validation runs exactly once, on the wire-format data, so
+        ``mode="before"`` validators and ``model_post_init`` see it exactly
+        once. An injected explanation field is lifted out before validation
+        (the declared type may forbid extra fields) and validated separately,
+        raising ``ValidationError`` when missing or malformed — models violate
+        the answer schema often enough that callers rely on catching it.
+        """
+        if augmented:
+            explanation = _InjectedExplanation.model_validate(data).explanation
+            data = {k: v for k, v in data.items() if k != "explanation"}
+            return answer_type.model_validate(data, by_name=True), explanation
+        else:
+            instance = answer_type.model_validate(data, by_name=True)
+            _, explanation = get_field_by_name_or_alias(instance, "explanation")
+            return instance, explanation
+
+    # Helper: Create a Result from a parsed object
+    def create_result_from_parsed(obj: BaseModel, explanation_value: Any) -> Result:
+        """Create a Result from a validated answer instance and its explanation."""
+        # Fields lifted out of value/metadata: the declared type's own
+        # explanation field (when present), label, and any value-aliased field
+        exclude_from_metadata: set[str] = set()
+        explanation_field, _ = get_field_by_name_or_alias(obj, "explanation")
+        if explanation_field:
+            exclude_from_metadata.add(explanation_field)
+
+        # Extract label (optional - can be used to distinguish results in a result set)
+        label_field, label_value = get_field_by_name_or_alias(obj, "label")
+        if label_field:
+            exclude_from_metadata.add(label_field)
+
+        # Look for field with alias="value"
+        value: Any
+        value_field, value_field_value = get_field_by_name_or_alias(obj, "value")
+        if value_field:
+            value = value_field_value
+            exclude_from_metadata.add(value_field)
+        # otherwise use the whole object
+        else:
+            value = obj.model_dump(exclude=exclude_from_metadata)
+
+        # call value_to_float if provided
+        if value_to_float is not None:
+            value = value_to_float(value)
+
+        # Collect metadata from remaining fields
+        all_fields = obj.model_dump()
+
+        # When the value already has the whole object we don't need metadata
+        if value_field is None:
+            metadata = None
+        else:
+            metadata = {
+                k: v for k, v in all_fields.items() if k not in exclude_from_metadata
+            }
+
+        return Result(
+            value=value,
+            parsed=obj,
+            explanation=explanation_value,
+            label=label_value,
+            metadata=metadata if metadata else None,
+            references=extract_references(
+                [value, explanation_value, metadata], extract_references_fn
+            ),
+        )
+
+    # Handle result set (multiple results)
+    if result_set is not False:
+        # Extract the list of answer objects from the synthesized wrapper
+        wrapper_data = json.loads(output.completion)
+        field_name = "results" if result_set is True else result_set
+        if field_name not in wrapper_data:
+            raise ValueError(f"Expected field '{field_name}' in result set wrapper")
+        list_data = wrapper_data[field_name]
+        if not isinstance(list_data, list):
+            raise ValueError(f"Field '{field_name}' must be a list")
+
+        # Create a Result for each answer object
+        results = [
+            create_result_from_parsed(*parse_answer_data(item)) for item in list_data
+        ]
+
+        # Return as a result set
+        resultset = as_resultset(results)
+        resultset.parsed = [result.parsed for result in results]
+        return resultset
+    else:
+        # Handle single result
+        return create_result_from_parsed(
+            *parse_answer_data(json.loads(output.completion))
+        )
+
+
+def extract_references(
+    values: list[Any],
+    extract_fn: Callable[[str], list[Reference]],
+) -> list[Reference]:
+    """Extract deduplicated references from a list of values.
+
+    Recursively walks each value (strings, dicts, lists) and extracts
+    references using the provided function, deduplicating by reference id.
+
+    Args:
+        values: Values to extract references from (strings, dicts, lists, or None).
+        extract_fn: Function that extracts references from a string.
+
+    Returns:
+        Deduplicated list of references in order of first occurrence.
+    """
+    references: list[Reference] = []
+    seen_ids: set[str] = set()
+    for value in values:
+        _collect_references(value, extract_fn, references, seen_ids)
+    return references
+
+
+def _collect_references(
+    value: Any,
+    extract_references_fn: Callable[[str], list[Reference]],
+    references: list[Reference],
+    seen_ids: set[str],
+) -> None:
+    """Recursively extract references from strings within a value.
+
+    Deduplicates by reference id using the shared ``seen_ids`` set.
+    """
+    if value is None:
+        return
+    if isinstance(value, str):
+        for ref in extract_references_fn(value):
+            if ref.id not in seen_ids:
+                references.append(ref)
+                seen_ids.add(ref.id)
+    elif isinstance(value, dict):
+        for v in value.values():
+            _collect_references(v, extract_references_fn, references, seen_ids)
+    elif isinstance(value, list):
+        for item in value:
+            _collect_references(item, extract_references_fn, references, seen_ids)
+
+
+def validate_nested_models(model_type: Type[BaseModel], path: str = "") -> list[str]:
+    """Recursively validate nested BaseModel types have descriptions on all fields.
+
+    Args:
+        model_type: The BaseModel type to validate.
+        path: The current property path (using dot notation).
+
+    Returns:
+        List of property paths that are missing descriptions.
+    """
+    missing_descriptions: list[str] = []
+
+    for field_name, field_info in model_type.model_fields.items():
+        current_path = f"{path}.{field_name}" if path else field_name
+
+        # Check if field has a description
+        if not field_info.description:
+            missing_descriptions.append(current_path)
+
+        # Check if this field's type is a nested BaseModel
+        field_type = field_info.annotation
+        if (
+            field_type
+            and inspect.isclass(field_type)
+            and issubclass(field_type, BaseModel)
+        ):
+            # Recursively validate nested model
+            missing_descriptions.extend(
+                validate_nested_models(field_type, current_path)
+            )
+        elif field_type:
+            # Check if it's a list of BaseModels
+            origin = get_origin(field_type)
+            if origin is list:
+                args = get_args(field_type)
+                if args and len(args) == 1:
+                    inner_type = args[0]
+                    if inspect.isclass(inner_type) and issubclass(
+                        inner_type, BaseModel
+                    ):
+                        # Recursively validate list item type
+                        missing_descriptions.extend(
+                            validate_nested_models(inner_type, current_path)
+                        )
+
+    return missing_descriptions
+
+
+def raise_missing_descriptions(missing_descriptions: list[str]) -> NoReturn:
+    error_msg = "The following properties are missing descriptions:\n"
+    error_msg += "\n".join(f"  - {prop}" for prop in missing_descriptions)
+    error_msg += "\nThe description field is required for prompting the model to provide structured answers."
+    raise PrerequisiteError(error_msg)
+
+
+def augment_type_with_explanation(type: Type[ST]) -> Type[ST]:
+    """Augment a type with an explanation field if it doesn't already have one.
+
+    Args:
+        type: The BaseModel type to check and potentially augment.
+
+    Returns:
+        The original type if it has an explanation field, or a new type
+        with an explanation field added.
+    """
+    # Check if the type already has an explanation field (by name or alias)
+    has_explanation = False
+    if "explanation" in type.model_fields:
+        has_explanation = True
+    else:
+        # Check for field with alias="explanation"
+        for _, field_info in type.model_fields.items():
+            if field_info.alias == "explanation":
+                has_explanation = True
+                break
+
+    # If it already has explanation, return as-is
+    if has_explanation:
+        return type
+
+    # Create a new type that extends the original with an explanation field
+    new_fields = {
+        "explanation": (
+            str,
+            Field(
+                description="Please provide an explanation of the answer you have provided. It should include the message id's (e.g. '[M2]') to clarify which message(s) you are referring to."
+            ),
+        )
+    }
+
+    # Use create_model to dynamically create a new type
+    augmented_type = create_model(
+        f"{type.__name__}WithExplanation",
+        __base__=type,
+        **new_fields,  # type: ignore
+    )
+
+    return augmented_type  # type: ignore
+
+
+# Module-level tool function for picklability in multiprocessing
+async def _answer_tool_impl(**kwargs: Any) -> str:
+    """Implementation of the answer tool for structured generation.
+
+    This is defined at module level rather than as a local function
+    to ensure it can be pickled when using multiprocessing.
+    """
+    return ""

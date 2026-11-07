@@ -1,0 +1,290 @@
+/**
+ * Regression test for the running-log header synthesis.
+ *
+ * The recorder doesn't write `header.json` until the eval finishes;
+ * mid-run reads fall back to `_journal/start.json`. The fallback used
+ * to copy only `status` / `eval` / `plan` — leaving the top-level
+ * `tags` and `metadata` undefined, even though `eval.tags` /
+ * `eval.metadata` were populated. The viewer rendered an empty chip
+ * row on running logs as a result.
+ *
+ * `headerFromLogStart` lifts the eval-time fields onto the header,
+ * matching what Python's `EvalLog.recompute_tags_and_metadata` does
+ * after deserialization.
+ */
+
+import { strToU8, zipSync } from "fflate";
+import { beforeEach, describe, expect, test } from "vitest";
+
+import { testEvalPlan, testEvalSpec } from "@tsmono/inspect-common/testing";
+import type { EvalSpec } from "@tsmono/inspect-common/types";
+
+import { notImplemented, testSampleSummary } from "../api/testClientApi";
+import { LogViewAPI, SampleSummary } from "../api/types";
+
+import {
+  dedupeSummaries,
+  headerFromLogStart,
+  LogStart,
+  openRemoteLogFile,
+  readJournalConfigUpdatesFrom,
+} from "./remoteLogFile";
+
+// Entries of the in-memory .eval served to openRemoteLogFile: entry name →
+// JSON content. Populated per-test; zipped when the api is created.
+const zipEntries = new Map<string, unknown>();
+
+const zipBytes = (): Uint8Array =>
+  zipSync(
+    Object.fromEntries(
+      Array.from(zipEntries, ([name, content]) => [
+        name,
+        strToU8(JSON.stringify(content)),
+      ])
+    )
+  );
+
+const baseEval = testEvalSpec({
+  task: "test_task",
+  task_id: "task_id",
+  created: "2026-05-20T00:00:00Z",
+});
+
+function makeStart(eval_: EvalSpec): LogStart {
+  return {
+    version: 2,
+    eval: eval_,
+    plan: testEvalPlan(),
+  };
+}
+
+describe("headerFromLogStart", () => {
+  test("lifts eval.tags onto the top-level header for running logs", () => {
+    const header = headerFromLogStart(
+      makeStart({ ...baseEval, tags: ["qa_passed", "needs_review"] })
+    );
+    expect(header.status).toBe("started");
+    expect(header.tags).toEqual(["qa_passed", "needs_review"]);
+  });
+
+  test("lifts eval.metadata onto the top-level header for running logs", () => {
+    const header = headerFromLogStart(
+      makeStart({ ...baseEval, metadata: { reviewer: "alice", priority: 1 } })
+    );
+    expect(header.metadata).toEqual({ reviewer: "alice", priority: 1 });
+  });
+
+  test("defaults tags / metadata to empty when missing from eval", () => {
+    const header = headerFromLogStart(makeStart(baseEval));
+    expect(header.tags).toEqual([]);
+    expect(header.metadata).toEqual({});
+  });
+
+  test("preserves eval and plan references for downstream readers", () => {
+    const start = makeStart({ ...baseEval, tags: ["x"] });
+    const header = headerFromLogStart(start);
+    // EvalHeader.eval is what readEvalBasicInfo / readLogSummary thread
+    // through to LogDetails.eval. Identity-preserved so consumers can
+    // rely on stable references.
+    expect(header.eval).toBe(start.eval);
+    expect(header.plan).toBe(start.plan);
+  });
+});
+
+describe("readJournalConfigUpdatesFrom", () => {
+  const prefix = "_journal/config_updates/";
+
+  // A minimally-valid ConfigUpdate payload carrying the entry name as its
+  // change name, so ordering assertions can read it back out.
+  const updateFor = (name: string) => ({
+    changes: [{ name, config: "eval", value: 1 }],
+    scope: "task",
+    provenance: { timestamp: "", author: "", metadata: {} },
+  });
+  const changeNames = (updates: { changes: { name: string }[] }[]) =>
+    updates.map((update) => update.changes[0]?.name);
+
+  test("orders entries numerically, not lexicographically", async () => {
+    const names = [`${prefix}10.json`, `${prefix}2.json`, `${prefix}1.json`];
+    const reads: string[] = [];
+    const updates = await readJournalConfigUpdatesFrom(names, (name) => {
+      reads.push(name);
+      return Promise.resolve(updateFor(name));
+    });
+    expect(reads).toEqual([
+      `${prefix}1.json`,
+      `${prefix}2.json`,
+      `${prefix}10.json`,
+    ]);
+    expect(updates).toHaveLength(3);
+  });
+
+  test("ignores non-integer and out-of-prefix names", async () => {
+    const names = [
+      `${prefix}notes.json`,
+      `${prefix}1.json`,
+      "_journal/summaries/1.json",
+      `${prefix}2.txt`,
+    ];
+    const updates = await readJournalConfigUpdatesFrom(names, (name) =>
+      Promise.resolve(updateFor(name))
+    );
+    expect(changeNames(updates)).toEqual([`${prefix}1.json`]);
+  });
+
+  test("stops at the first failed read, not splicing around it", async () => {
+    // The fold is last-wins: a truncated tail is safe, a gap is not.
+    const names = [`${prefix}1.json`, `${prefix}2.json`, `${prefix}3.json`];
+    const updates = await readJournalConfigUpdatesFrom(names, (name) =>
+      name.endsWith("2.json")
+        ? Promise.reject(new Error("corrupt entry"))
+        : Promise.resolve(updateFor(name))
+    );
+    expect(changeNames(updates)).toEqual([`${prefix}1.json`]);
+  });
+
+  test("drops malformed entries instead of poisoning the fold", async () => {
+    const names = [`${prefix}1.json`, `${prefix}2.json`];
+    const updates = await readJournalConfigUpdatesFrom(names, (name) =>
+      Promise.resolve(
+        name.endsWith("1.json") ? { changes: "not-an-array" } : updateFor(name)
+      )
+    );
+    expect(changeNames(updates)).toEqual([`${prefix}2.json`]);
+  });
+
+  test("returns empty when no journal entries exist", async () => {
+    const updates = await readJournalConfigUpdatesFrom([], () =>
+      Promise.resolve({})
+    );
+    expect(updates).toEqual([]);
+  });
+});
+
+function makeSummary(
+  id: number | string,
+  epoch: number,
+  error?: string
+): SampleSummary {
+  return testSampleSummary({ id, epoch, error });
+}
+
+// Wiring tests for boundary normalization (#555): these fail if the
+// normalizeSampleSummaries call is removed from readSampleSummaries /
+// readFallbackSummaries, not just if the normalizer itself regresses.
+describe("readLogSummary summary normalization", () => {
+  // Serves a real zip of `zipEntries` through the byte-range api, the way a
+  // view server serves a .eval.
+  const fakeApi = (): LogViewAPI => {
+    const bytes = zipBytes();
+    return {
+      client_events: notImplemented("client_events"),
+      get_eval_set: notImplemented("get_eval_set"),
+      get_flow: notImplemented("get_flow"),
+      get_logs: notImplemented("get_logs"),
+      get_log_contents: notImplemented("get_log_contents"),
+      get_log_info: () => Promise.resolve({ size: bytes.length }),
+      get_log_bytes: (_file, start, end) =>
+        Promise.resolve(bytes.slice(start, end + 1)),
+      get_log_summaries: notImplemented("get_log_summaries"),
+      log_message: notImplemented("log_message"),
+      download_file: notImplemented("download_file"),
+      open_log_file: notImplemented("open_log_file"),
+      get_app_config: notImplemented("get_app_config"),
+    };
+  };
+
+  // A finalized 2024-era header; normalizeEvalHeader fills the rest.
+  const vintageHeader = {
+    version: 2,
+    status: "success",
+    eval: {
+      task: "demo",
+      task_id: "t1",
+      run_id: "r1",
+      created: "2024-11-05T13:32:37-05:00",
+      model: "mockllm/model",
+      dataset: {},
+      config: {},
+    },
+  };
+
+  // The five fields real vintage summary rows carry.
+  const vintageRow = {
+    id: "s1",
+    epoch: 1,
+    input: "q",
+    target: "a",
+    scores: null,
+  };
+
+  const expectedFills = {
+    id: "s1",
+    completed: true,
+    metadata: {},
+    model_usage: {},
+    role_usage: {},
+  };
+
+  beforeEach(() => {
+    zipEntries.clear();
+    zipEntries.set("header.json", vintageHeader);
+  });
+
+  test("keeps malformed history errors on stats when loading a .eval header", async () => {
+    zipEntries.set("header.json", {
+      ...vintageHeader,
+      stats: { connection_limit_history: [null] },
+    });
+    zipEntries.set("summaries.json", []);
+    const remoteLog = await openRemoteLogFile(fakeApi(), "log.eval", 1);
+    const details = await remoteLog.readLogSummary();
+    expect(details.stats?.connection_limit_history).toEqual([]);
+    expect(details.stats?.connectionHistoryError).toMatch(
+      "Invalid connection history"
+    );
+    expect(details.eval.task).toBe("demo");
+  });
+
+  test("fills read-time defaults on vintage summaries.json rows", async () => {
+    zipEntries.set("summaries.json", [vintageRow]);
+    const remoteLog = await openRemoteLogFile(fakeApi(), "log.eval", 1);
+    const details = await remoteLog.readLogSummary();
+    expect(details.sampleSummaries).toHaveLength(1);
+    expect(details.sampleSummaries[0]).toMatchObject(expectedFills);
+  });
+
+  test("fills read-time defaults on journal fallback rows", async () => {
+    zipEntries.set("_journal/summaries/1.json", [vintageRow]);
+    const remoteLog = await openRemoteLogFile(fakeApi(), "log.eval", 1);
+    const details = await remoteLog.readLogSummary();
+    expect(details.sampleSummaries).toHaveLength(1);
+    expect(details.sampleSummaries[0]).toMatchObject(expectedFills);
+  });
+});
+
+describe("dedupeSummaries", () => {
+  test("keeps the last row per (id, epoch)", () => {
+    // a requeued sample journals its superseded prior attempt and, in a
+    // later journal file, its re-run — the re-run's row must win
+    const deduped = dedupeSummaries([
+      makeSummary("flaky", 1, "boom"),
+      makeSummary("steady", 1),
+      makeSummary("flaky", 1),
+    ]);
+    expect(deduped).toEqual([
+      makeSummary("flaky", 1),
+      makeSummary("steady", 1),
+    ]);
+  });
+
+  test("treats epochs of the same sample as distinct rows", () => {
+    const rows = [makeSummary("s1", 1), makeSummary("s1", 2)];
+    expect(dedupeSummaries(rows)).toEqual(rows);
+  });
+
+  test("does not conflate numeric and string ids", () => {
+    const rows = [makeSummary(1, 1), makeSummary("1", 1)];
+    expect(dedupeSummaries(rows)).toEqual(rows);
+  });
+});

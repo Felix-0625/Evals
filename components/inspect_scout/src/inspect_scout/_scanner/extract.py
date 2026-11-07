@@ -1,0 +1,577 @@
+import json
+import re
+from dataclasses import dataclass
+from functools import reduce
+from logging import getLogger
+from typing import (
+    Awaitable,
+    Callable,
+    Generic,
+    Literal,
+    TypeAlias,
+    TypedDict,
+    TypeVar,
+    overload,
+)
+
+from inspect_ai.model import (
+    ChatMessage,
+    ChatMessageAssistant,
+    ChatMessageTool,
+    Content,
+)
+from inspect_ai.util import warn_once
+from typing_extensions import Unpack
+
+from inspect_scout._scanner.result import Reference
+from inspect_scout._transcript.types import Transcript
+
+from .util import _message_id
+
+logger = getLogger(__name__)
+
+T = TypeVar("T", Transcript, list[ChatMessage])
+
+MIN_NONCE_LENGTH = 8
+
+
+@dataclass(frozen=True)
+class MessageFormatOptions:
+    """Message formatting options for controlling message content display.
+
+    These options control which parts of messages are included when
+    formatting messages to strings.
+    """
+
+    exclude_system: bool = True
+    """Exclude system messages (defaults to `True`)"""
+
+    exclude_reasoning: bool = False
+    """Exclude reasoning content (defaults to `False`)."""
+
+    exclude_tool_usage: bool = False
+    """Exclude tool usage (defaults to `False`)"""
+
+
+@dataclass(frozen=True)
+class MessagesPreprocessor(MessageFormatOptions, Generic[T]):
+    """ChatMessage preprocessing transformations.
+
+    Provide a `transform` function for fully custom transformations.
+    Use the higher-level options (e.g. `exclude_system`) to
+    perform various common content removal transformations.
+
+    The default `MessagesPreprocessor` will exclude system
+    messages and do no other transformations.
+    """
+
+    transform: Callable[[T], Awaitable[list[ChatMessage]]] | None = None
+    """Transform the list of messages."""
+
+
+class DeprecatedArgs(TypedDict, total=False):
+    as_json: bool
+
+
+@overload
+async def messages_as_str(
+    input: T,
+    *,
+    preprocessor: MessagesPreprocessor[T] | None = None,
+    format: Literal["text", "json"] = "text",
+    nonce: str | None = None,
+    **deprecated: Unpack[DeprecatedArgs],
+) -> str: ...
+
+
+@overload
+async def messages_as_str(
+    input: T,
+    *,
+    preprocessor: MessagesPreprocessor[T] | None = None,
+    format: Literal["list"],
+    nonce: str | None = None,
+    **deprecated: Unpack[DeprecatedArgs],
+) -> list[str]: ...
+
+
+@overload
+async def messages_as_str(
+    input: T,
+    *,
+    preprocessor: MessagesPreprocessor[T] | None = None,
+    include_ids: Literal[True],
+    format: Literal["text", "json"] = "text",
+    nonce: str | None = None,
+    **deprecated: Unpack[DeprecatedArgs],
+) -> tuple[str, Callable[[str], list[Reference]]]: ...
+
+
+@overload
+async def messages_as_str(
+    input: T,
+    *,
+    preprocessor: MessagesPreprocessor[T] | None = None,
+    include_ids: Literal[True],
+    format: Literal["list"],
+    nonce: str | None = None,
+    **deprecated: Unpack[DeprecatedArgs],
+) -> tuple[list[str], Callable[[str], list[Reference]]]: ...
+
+
+async def messages_as_str(
+    input: T,
+    *,
+    preprocessor: MessagesPreprocessor[T] | None = None,
+    include_ids: Literal[True] | None = None,
+    format: Literal["text", "json", "list"] = "text",
+    nonce: str | None = None,
+    **deprecated: Unpack[DeprecatedArgs],
+) -> str | list[str] | tuple[str | list[str], Callable[[str], list[Reference]]]:
+    """Concatenate list of chat messages into a string.
+
+    Args:
+       input: The Transcript with the messages or a list of messages.
+       preprocessor: Content filter for messages.
+       include_ids: If True, prepend ordinal references (e.g., [M1], [M2])
+          to each message and return a function to extract references from text.
+          If None (default), return plain formatted string.
+       format: Output format. `"text"` (default) joins messages with newlines,
+          `"json"` returns a JSON string, `"list"` returns individual
+          formatted strings as a list.
+       nonce: If set, written on every marker in the output: message
+          headers (e.g. `USER (3f9a1c7e):`), `Tool Call`, `Tool Use` and
+          tool error lines, reasoning and prefill tags (e.g.
+          `<thinking 3f9a1c7e>`), and the start and end lines of a tool call
+          argument that spans lines. A reader that knows the nonce can then
+          tell real markers from text in a message that imitates one. Must
+          be at least 8 characters, all ASCII letters and digits.
+
+    Returns:
+       If include_ids is None: Messages as `str` (text/json) or `list[str]` (list).
+       If include_ids is True: Tuple of (formatted output, function that takes text
+          and returns list of Reference objects for any [M1], [M2], etc. references
+          found in the text).
+
+    Raises:
+       ValueError: If `nonce` is not at least 8 ASCII letters and digits.
+    """
+    check_nonce(nonce)
+
+    # handle deprecated as_json parameter
+    if "as_json" in deprecated:
+        warn_once(logger, "'as_json' is deprecated, please use 'format' instead")
+        if deprecated["as_json"]:
+            format = "json"
+
+    messages = (
+        await preprocessor.transform(input)
+        if preprocessor is not None and preprocessor.transform is not None
+        else input.messages
+        if isinstance(input, Transcript)
+        else input
+    )
+
+    def reduce_message(
+        acc: tuple[list[dict[str, str]], dict[str, str]], message: ChatMessage
+    ) -> tuple[list[dict[str, str]], dict[str, str]]:
+        items, id_map = acc
+        if (content := message_as_str(message, preprocessor, nonce=nonce)) is not None:
+            item: dict[str, str] = {
+                "role": _role_label(message, upper_fallback=False),
+                "content": content,
+            }
+            if include_ids:
+                ordinal = f"M{len(id_map) + 1}"
+                id_map[ordinal] = _message_id(message)
+                item["id"] = ordinal
+            items.append(item)
+        return items, id_map
+
+    items, id_map = reduce(
+        reduce_message, messages, (list[dict[str, str]](), dict[str, str]())
+    )
+
+    if format == "json":
+        result: str | list[str] = json.dumps(items)
+    elif format == "list":
+        result = [
+            f"[{item['id']}] {item['content']}" if "id" in item else item["content"]
+            for item in items
+        ]
+    else:
+        result = "\n".join(
+            f"[{item['id']}] {item['content']}" if "id" in item else item["content"]
+            for item in items
+        )
+
+    return (
+        (result, lambda text: _extract_references(text, id_map))
+        if include_ids
+        else result
+    )
+
+
+MessagesAsStr: TypeAlias = Callable[[list[ChatMessage]], Awaitable[str]]
+ExtractReferences: TypeAlias = Callable[[str], list[Reference]]
+LabelForId: TypeAlias = Callable[[str], str | None]
+
+
+@overload
+def message_numbering(
+    preprocessor: MessagesPreprocessor[list[ChatMessage]] | None = None,
+    *,
+    nonce: str | None = None,
+) -> tuple[MessagesAsStr, ExtractReferences]: ...
+
+
+@overload
+def message_numbering(
+    preprocessor: MessagesPreprocessor[list[ChatMessage]] | None = None,
+    *,
+    label_for_id: Literal[True],
+    nonce: str | None = None,
+) -> tuple[MessagesAsStr, ExtractReferences, LabelForId]: ...
+
+
+def message_numbering(
+    preprocessor: MessagesPreprocessor[list[ChatMessage]] | None = None,
+    *,
+    label_for_id: bool = False,
+    nonce: str | None = None,
+) -> (
+    tuple[MessagesAsStr, ExtractReferences]
+    | tuple[MessagesAsStr, ExtractReferences, LabelForId]
+):
+    """Create a messages_as_str / extract_references pair with shared numbering.
+
+    Returns two functions that share a closure-captured counter and id_map.
+    Each call to the returned messages_as_str auto-increments message IDs
+    globally, so multiple calls produce M1..M5, then M6..M10, etc.
+
+    The returned extract_references resolves citations from ANY prior
+    messages_as_str call within this numbering scope.
+
+    Args:
+        preprocessor: Message preprocessing options applied to every call
+            (e.g., exclude_system, exclude_reasoning). Defaults to excluding
+            system messages when no preprocessor is provided.
+        label_for_id: When True, return a third function that maps real
+            message IDs to their assigned labels (e.g. ``"M3"``).
+        nonce: If set, written on every marker in the output: message
+            headers (e.g. ``[M2] USER (3f9a1c7e):``), ``Tool Call``, ``Tool Use`` and
+            tool error lines, reasoning and prefill tags (e.g.
+            ``<thinking 3f9a1c7e>``), and the start and end lines of a tool call
+            argument that spans lines. A reader that knows the nonce can then
+            tell real markers from text in a message that imitates one. Must
+            be at least 8 characters, all ASCII letters and digits.
+
+    Returns:
+        Tuple of:
+            - messages_as_str: takes list[ChatMessage], returns formatted string with globally unique [M1], [M2], etc. prefixes.
+            - extract_refs: takes text, returns list of Reference objects for any [M1], [M2], etc. references found across all prior calls.
+            - label_for_id (when requested): takes a real message ID, returns its label (e.g. ``"M3"``) or None if not yet seen.
+
+    Raises:
+        ValueError: If `nonce` is not at least 8 ASCII letters and digits.
+    """
+    check_nonce(nonce)
+
+    counter = [0]
+    id_map: dict[str, str] = {}
+    reverse_map: dict[str, str] = {}
+
+    async def _messages_as_str(messages: list[ChatMessage]) -> str:
+        if preprocessor is not None and preprocessor.transform is not None:
+            messages = await preprocessor.transform(messages)
+
+        items: list[str] = []
+        for message in messages:
+            content = message_as_str(message, preprocessor, nonce=nonce)
+            if content is not None:
+                counter[0] += 1
+                ordinal = f"M{counter[0]}"
+                real_id = _message_id(message)
+                id_map[ordinal] = real_id
+                reverse_map[real_id] = ordinal
+                items.append(f"[{ordinal}] {content}")
+
+        return "\n".join(items)
+
+    def _extract_refs(text: str) -> list[Reference]:
+        return _extract_references(text, id_map)
+
+    def _label_for_id(message_id: str) -> str | None:
+        return reverse_map.get(message_id)
+
+    if label_for_id:
+        return _messages_as_str, _extract_refs, _label_for_id
+    else:
+        return _messages_as_str, _extract_refs
+
+
+def message_as_str(
+    message: ChatMessage,
+    preprocessor: MessageFormatOptions | None = None,
+    *,
+    nonce: str | None = None,
+) -> str | None:
+    """Convert a ChatMessage to a formatted string representation.
+
+    The default role prefix (``USER:``, ``ASSISTANT:``, ``TOOL:``) can be
+    overridden per message by setting ``message.metadata["role_label"]``
+    to a non-empty string. The label is uppercased to match the default
+    convention.
+
+    Args:
+        message: The `ChatMessage` to convert.
+        preprocessor: Content filter for messages. Defaults to removing system messages.
+        nonce: If set, written on every marker in the output: message
+            headers (e.g. ``USER (3f9a1c7e):``), ``Tool Call``, ``Tool Use`` and
+            tool error lines, reasoning and prefill tags (e.g.
+            ``<thinking 3f9a1c7e>``), and the start and end lines of a tool call
+            argument that spans lines. A reader that knows the nonce can then
+            tell real markers from text in a message that imitates one. Must
+            be at least 8 characters, all ASCII letters and digits.
+
+    Returns:
+        A formatted string with the message role and content, or None if the message
+        should be excluded based on the provided flags.
+
+    Raises:
+        ValueError: If `nonce` is not at least 8 ASCII letters and digits.
+    """
+    check_nonce(nonce)
+    preprocessor = preprocessor or MessageFormatOptions()
+
+    if preprocessor.exclude_system and message.role == "system":
+        return None
+
+    content = _better_content_text(
+        message.content,
+        preprocessor.exclude_tool_usage,
+        preprocessor.exclude_reasoning,
+        nonce,
+    )
+
+    mark = _marker_nonce(nonce)
+    role_label = _role_label(message, upper_fallback=True) + mark
+
+    if (
+        not preprocessor.exclude_tool_usage
+        and isinstance(message, ChatMessageAssistant)
+        and message.tool_calls
+    ):
+        entry = f"{role_label}:\n{content}\n"
+
+        for tool in message.tool_calls:
+            func_name = tool.function
+            args = tool.arguments
+
+            if isinstance(args, dict):
+                args_text = "\n".join(
+                    _argument_str(k, v, nonce) for k, v in args.items()
+                )
+                entry += f"\nTool Call{mark}: {func_name}\nArguments:\n{args_text}\n"
+            else:
+                entry += f"\nTool Call{mark}: {func_name}\nArguments: {args}\n"
+
+    elif isinstance(message, ChatMessageTool):
+        if preprocessor.exclude_tool_usage:
+            return None
+        func_name = message.function or "unknown"
+        # with a nonce, repr() keeps a line break in the name off the nonce line
+        quoted_name = repr(func_name) if nonce is not None else f"'{func_name}'"
+        error_part = (
+            f"\n\nError in tool call {quoted_name}{mark}:\n{message.error.message}\n"
+            if message.error
+            else ""
+        )
+        return f"{role_label}:\n{content}{error_part}\n"
+
+    else:
+        entry = f"{role_label}:\n{content}\n"
+
+    if (
+        message.role == "assistant"
+        and message.metadata
+        and message.metadata.get("prefill")
+    ):
+        tag = _tag_nonce(nonce)
+        entry = f"<prefill{tag}>\n{entry}</prefill{tag}>"
+
+    return entry
+
+
+def check_nonce(nonce: str | None) -> None:
+    """Raise `ValueError` if `nonce` is set and is not `MIN_NONCE_LENGTH` or more ASCII letters and digits."""
+    if nonce is not None and not (
+        len(nonce) >= MIN_NONCE_LENGTH and nonce.isascii() and nonce.isalnum()
+    ):
+        raise ValueError(
+            f"nonce must be at least {MIN_NONCE_LENGTH} characters, all ASCII "
+            f"letters and digits, got {nonce!r}"
+        )
+
+
+def _marker_nonce(nonce: str | None) -> str:
+    """The nonce as written on a marker line (e.g. `USER (3f9a1c7e):`), or `""`."""
+    return f" ({nonce})" if nonce is not None else ""
+
+
+def _tag_nonce(nonce: str | None) -> str:
+    """The nonce as written inside a tag (e.g. `<thinking 3f9a1c7e>`), or `""`."""
+    return f" {nonce}" if nonce is not None else ""
+
+
+def _argument_str(key: str, value: object, nonce: str | None) -> str:
+    """One tool call argument as `key: value`.
+
+    With a nonce, an argument that spans lines goes between `[BEGIN 'key' (nonce)]`
+    and `[END 'key' (nonce)]` lines, so its lines cannot pass for other
+    arguments or tool calls. The key is written with `repr()` so that a key
+    with a line break cannot start a line that ends in the nonce.
+    """
+    text = str(value)
+    line = f"{key}: {text}"
+    if nonce is None or line.splitlines() == [line]:
+        return line
+    return f"[BEGIN {key!r} ({nonce})]\n{text}\n[END {key!r} ({nonce})]"
+
+
+def _role_label(message: ChatMessage, *, upper_fallback: bool) -> str:
+    """Custom role label from ``metadata["role_label"]`` if present, else the canonical role.
+
+    The label is uppercased to match the default ``USER:`` / ``ASSISTANT:``
+    convention. When ``upper_fallback`` is True, the fallback is
+    ``message.role.upper()`` (matches the text-rendering convention); when
+    False, the fallback is the raw ``message.role`` (matches the
+    JSON-rendering convention).
+    """
+    if message.metadata:
+        label = message.metadata.get("role_label")
+        if isinstance(label, str) and label:
+            return label.upper()
+    return message.role.upper() if upper_fallback else message.role
+
+
+def _text_from_content(
+    content: Content,
+    exclude_tool_usage: bool,
+    exclude_reasoning: bool,
+    nonce: str | None,
+) -> str | None:
+    tag = _tag_nonce(nonce)
+    mark = _marker_nonce(nonce)
+    # with a nonce, a closing tag starts its own line, so reasoning text that
+    # ends in a partial line cannot precede the nonce on that line
+    close_break = "\n" if nonce is not None else ""
+    match content.type:
+        case "text":
+            return content.text
+        case "reasoning":
+            if exclude_reasoning:
+                return None
+            if content.redacted:
+                if content.summary:
+                    return f"\n<thinking_summary{tag}>{content.summary}{close_break}</thinking_summary{tag}>"
+                else:
+                    return f"\n<thinking_redacted{tag}/>"
+            elif content.reasoning:
+                return (
+                    f"\n<thinking{tag}>{content.reasoning}{close_break}</thinking{tag}>"
+                )
+            else:
+                return None
+
+        case "tool_use":
+            return (
+                None
+                if exclude_tool_usage
+                else f"\nTool Use{mark}: {content.name}({content.arguments}) -> {content.result} {content.error if content.error else ''}"
+            )
+        case "image" | "audio" | "video" | "data" | "document":
+            return f"<{content.type} />"
+
+
+def _better_content_text(
+    content: str | list[Content],
+    exclude_tool_usage: bool,
+    exclude_reasoning: bool,
+    nonce: str | None,
+) -> str:
+    if isinstance(content, str):
+        return content
+    else:
+        all_text = [
+            text
+            for c in content
+            if (
+                text := _text_from_content(
+                    c, exclude_tool_usage, exclude_reasoning, nonce
+                )
+            )
+            is not None
+        ]
+        return "\n".join(all_text)
+
+
+def _extract_references(text: str, id_map: dict[str, str]) -> list[Reference]:
+    """Extract message and event references from text.
+
+    Args:
+        text: Text containing references in bracketed form (e.g., [M1], [M1-M3],
+            [M2, M4], [M1, E2]).
+        id_map: Dict mapping ordinal IDs (e.g., "M1", "M2", "E1", "E2") to actual IDs
+
+    Returns:
+        List of Reference objects with type="message" or type="event"
+    """
+    references: list[Reference] = []
+    seen_ids: set[str] = set()
+
+    def _add_ref(ordinal_key: str, cite: str) -> None:
+        if ordinal_key in id_map:
+            actual_id = id_map[ordinal_key]
+            if actual_id not in seen_ids:
+                ref_type: Literal["message", "event"] = (
+                    "message" if ordinal_key.startswith("M") else "event"
+                )
+                references.append(Reference(type=ref_type, cite=cite, id=actual_id))
+                seen_ids.add(actual_id)
+
+    # Find all bracketed expressions containing M/E references,
+    # then extract each M/E token from within them.
+    for bracket_match in re.finditer(r"\[[^\]]*(?:M|E)\d+[^\]]*\]", text):
+        bracket_text = bracket_match.group(0)
+        for ref_match in re.finditer(r"(M|E)\d+", bracket_text):
+            ordinal_key = ref_match.group(0)
+            _add_ref(ordinal_key, f"[{ordinal_key}]")
+
+    return references
+
+
+def tool_callers(
+    transcript: Transcript,
+) -> dict[str, tuple[ChatMessageAssistant, int]]:
+    """
+    Build a mapping from tool_call_id to the assistant message that made the call.
+
+    This is useful for scanners that need to reference the assistant message
+    that initiated a tool call, rather than the tool message itself.
+
+    Args:
+        transcript: The transcript containing all messages.
+
+    Returns:
+        A dictionary mapping tool_call_id to a tuple of (assistant_message, message_index).
+        The message_index is 1-indexed to match the [M1], [M2], etc. citation format.
+    """
+    tool_call_to_assistant: dict[str, tuple[ChatMessageAssistant, int]] = {}
+
+    for i, message in enumerate(transcript.messages, start=1):
+        if isinstance(message, ChatMessageAssistant) and message.tool_calls:
+            for tool_call in message.tool_calls:
+                tool_call_to_assistant[tool_call.id] = (message, i)
+
+    return tool_call_to_assistant

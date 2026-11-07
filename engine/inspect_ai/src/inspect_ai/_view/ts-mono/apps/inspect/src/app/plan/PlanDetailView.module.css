@@ -1,0 +1,33 @@
+.floatingCol {
+  flex: 0 1 1;
+  width: unset;
+  text-align: left;
+  padding-left: 0.6rem;
+  padding-right: 0.6rem;
+}
+
+.wideCol {
+  flex: 1 1 1;
+  width: unset;
+  padding-left: 0.6rem;
+  padding-right: 0.6rem;
+}
+
+.planCol {
+  margin-top: 0;
+  margin-bottom: 0.5em;
+}
+
+.container {
+  padding-top: 0;
+  padding-bottom: 1em;
+  margin-left: 0;
+}
+
+.grid {
+  display: grid;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  padding-bottom: 1em;
+  margin-bottom: 0.5em;
+}

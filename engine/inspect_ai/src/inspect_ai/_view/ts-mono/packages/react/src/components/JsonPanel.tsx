@@ -1,0 +1,93 @@
+import clsx from "clsx";
+import { CSSProperties, FC, useMemo, useRef } from "react";
+
+import { isRecord, maybeBase64 } from "@tsmono/util";
+
+import { usePrismHighlight } from "../hooks/usePrismHighlight";
+
+import { ContentCode } from "./ContentTrust";
+import styles from "./JsonPanel.module.css";
+
+interface JSONPanelProps {
+  id?: string;
+  data?: unknown;
+  json?: string;
+  simple?: boolean;
+  style?: CSSProperties;
+  className?: string | string[];
+}
+
+const kMaxStringValueDisplay = 1048576;
+
+export const JSONPanel: FC<JSONPanelProps> = ({
+  id,
+  json,
+  data,
+  simple = false,
+  style,
+  className,
+}) => {
+  const sourceCode = useMemo(() => {
+    if (json) return json;
+    if (data) return JSON.stringify(resolveBase64(data), undefined, 2);
+    return "";
+  }, [json, data]);
+
+  const sourceCodeRef = useRef<HTMLDivElement | null>(null);
+  usePrismHighlight(sourceCodeRef, sourceCode.length);
+
+  return (
+    <div ref={sourceCodeRef}>
+      <pre
+        className={clsx(
+          styles.jsonPanel,
+          simple ? styles.simple : "",
+          className
+        )}
+        style={style}
+      >
+        <ContentCode
+          id={id}
+          className={clsx("source-code", "language-javascript")}
+          text={sourceCode}
+        />
+      </pre>
+    </div>
+  );
+};
+
+const resolveBase64 = (value: unknown): unknown => {
+  const prefix = "data:image";
+
+  // Handle arrays recursively
+  if (Array.isArray(value)) {
+    return value.map((v) => resolveBase64(v));
+  }
+
+  // Handle objects recursively
+  if (isRecord(value)) {
+    const resolvedObject: Record<string, unknown> = {};
+    for (const key of Object.keys(value)) {
+      resolvedObject[key] = resolveBase64(value[key]);
+    }
+    return resolvedObject;
+  }
+
+  // Handle string values with protocol references
+  if (typeof value === "string") {
+    let resolvedValue = value;
+    if (resolvedValue.startsWith(prefix)) {
+      resolvedValue = "[base64 image]";
+    } else if (resolvedValue.length > kMaxStringValueDisplay) {
+      resolvedValue = "[long data]";
+    } else if (maybeBase64(resolvedValue)) {
+      resolvedValue = "[base64 data]";
+    }
+    return resolvedValue;
+  }
+
+  // Return unchanged for other types
+  return value;
+};
+
+export default JSONPanel;

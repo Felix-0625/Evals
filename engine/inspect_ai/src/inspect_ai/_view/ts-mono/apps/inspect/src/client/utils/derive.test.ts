@@ -1,0 +1,265 @@
+import { afterEach, describe, expect, test } from "vitest";
+
+import {
+  testEvalMetric,
+  testEvalResults,
+  testEvalScore,
+  testEvalSpec,
+  testEvalStats,
+  testModelUsage,
+  testScore,
+} from "@tsmono/inspect-common/testing";
+
+import { testLogHeader, testSampleSummary } from "../api/testClientApi";
+import { LogHeader, SampleSummary } from "../api/types";
+
+import { deriveLogFields, deriveSampleFields } from "./derive";
+
+const makeHeader = (overrides: Partial<LogHeader> = {}): LogHeader =>
+  testLogHeader({
+    version: 1,
+    status: "success",
+    eval: testEvalSpec({
+      eval_id: "eval-1",
+      run_id: "run-1",
+      created: "2024-01-01T00:00:00Z",
+      task: "test-task",
+      task_id: "task-1",
+      model: "gpt-4",
+    }),
+    results: null,
+    error: null,
+    ...overrides,
+  });
+
+const makeSummary = (overrides: Partial<SampleSummary> = {}): SampleSummary =>
+  testSampleSummary({
+    id: 1,
+    epoch: 0,
+    input: "test input",
+    target: "test target",
+    ...overrides,
+  });
+
+describe("deriveLogFields", () => {
+  test("sums total tokens across models", () => {
+    const header = makeHeader({
+      stats: testEvalStats({
+        started_at: "2024-01-01T00:00:00Z",
+        completed_at: "2024-01-01T01:00:00Z",
+        model_usage: {
+          "openai/gpt-4": testModelUsage({
+            input_tokens: 10,
+            output_tokens: 5,
+            total_tokens: 15,
+          }),
+          "anthropic/claude": testModelUsage({
+            input_tokens: 20,
+            output_tokens: 10,
+            total_tokens: 30,
+          }),
+        },
+      }),
+    });
+    const derived = deriveLogFields(header);
+    expect(derived.total_tokens).toBe(45);
+    expect(derived.duration).toBe(3600);
+  });
+
+  test("returns undefined fields for a header with no stats/results", () => {
+    const derived = deriveLogFields(makeHeader());
+    expect(derived.total_tokens).toBeUndefined();
+    expect(derived.duration).toBeUndefined();
+    expect(derived.task_args).toBeUndefined();
+    expect(derived.percent_completed).toBeUndefined();
+    expect(derived.sample_limits).toBeUndefined();
+    expect(derived.scores).toBeUndefined();
+  });
+
+  test("ignores a duration whose end precedes its start", () => {
+    const header = makeHeader({
+      stats: testEvalStats({
+        started_at: "2024-01-01T02:00:00Z",
+        completed_at: "2024-01-01T01:00:00Z",
+      }),
+    });
+    expect(deriveLogFields(header).duration).toBeUndefined();
+  });
+
+  test("formats task args, preferring task_args_passed", () => {
+    const header = makeHeader({
+      eval: testEvalSpec({
+        task_args: { a: 1, b: "two", defaulted: true },
+        task_args_passed: { a: 1, b: "two" },
+      }),
+    });
+    expect(deriveLogFields(header).task_args).toBe('a=1, b="two"');
+  });
+
+  test("computes percent completed and joins sample limits", () => {
+    const header = makeHeader({
+      results: testEvalResults({
+        total_samples: 8,
+        completed_samples: 2,
+      }),
+      sampleLimits: ["message", "time"],
+    });
+    const derived = deriveLogFields(header);
+    expect(derived.percent_completed).toBe(25);
+    expect(derived.sample_limits).toBe("message, time");
+  });
+
+  test("maps scores keyed scorer → metric", () => {
+    const header = makeHeader({
+      results: testEvalResults({
+        total_samples: 1,
+        completed_samples: 1,
+        scores: [
+          testEvalScore({
+            name: "grader",
+            metrics: {
+              accuracy: testEvalMetric({ name: "accuracy", value: 0.9 }),
+              stderr: testEvalMetric({ name: "stderr", value: 0.01 }),
+            },
+          }),
+          testEvalScore({
+            name: "other",
+            metrics: {
+              accuracy: testEvalMetric({ name: "accuracy", value: 0.5 }),
+            },
+          }),
+        ],
+      }),
+    });
+    expect(deriveLogFields(header).scores).toEqual({
+      grader: { accuracy: 0.9, stderr: 0.01 },
+      other: { accuracy: 0.5 },
+    });
+  });
+});
+
+const priced = (total_tokens: number, total_cost: number) =>
+  testModelUsage({ input_tokens: total_tokens, total_tokens, total_cost });
+
+describe("deriveSampleFields", () => {
+  test("derives text, tokens, fallbacks, and scores", () => {
+    const summary = makeSummary({
+      input: "what is 2+2?",
+      target: ["4", "four"],
+      model_usage: {
+        "openai/gpt-4": testModelUsage({
+          input_tokens: 10,
+          output_tokens: 5,
+          total_tokens: 15,
+        }),
+      },
+      model_fallbacks: [{ model: "a", fallback_model: "b", count: 2 }],
+      scores: {
+        accuracy: {
+          value: 1,
+          answer: null,
+          explanation: null,
+          metadata: {},
+          history: [],
+        },
+      },
+    });
+    const derived = deriveSampleFields(summary);
+    expect(derived.input).toBe("what is 2+2?");
+    expect(derived.target).toBe("4, four");
+    expect(derived.tokens).toBe(15);
+    expect(derived.fallbacks).toBe(2);
+    expect(derived.scores).toEqual({ accuracy: 1 });
+  });
+
+  test("handles a minimal summary", () => {
+    const derived = deriveSampleFields(makeSummary());
+    expect(derived.input).toBe("test input");
+    expect(derived.target).toBe("test target");
+    expect(derived.tokens).toBeUndefined();
+    expect(derived.cost).toBeUndefined();
+    expect(derived.fallbacks).toBeUndefined();
+    expect(derived.scores).toBeUndefined();
+  });
+
+  test("sums cost when every model that used tokens was priced", () => {
+    const derived = deriveSampleFields(
+      makeSummary({
+        model_usage: {
+          "openai/gpt-4": priced(15, 0.5),
+          "anthropic/claude": priced(30, 0.25),
+        },
+      })
+    );
+    expect(derived.cost).toBe(0.75);
+  });
+
+  test("leaves cost undefined when any model that used tokens is unpriced", () => {
+    const derived = deriveSampleFields(
+      makeSummary({
+        model_usage: {
+          "openai/gpt-4": priced(15, 0.5),
+          "mockllm/model": testModelUsage({
+            input_tokens: 10,
+            output_tokens: 5,
+            total_tokens: 15,
+          }),
+        },
+      })
+    );
+    expect(derived.tokens).toBe(30);
+    expect(derived.cost).toBeUndefined();
+  });
+});
+
+describe("prototype safety", () => {
+  const prototypeKeys = new Set(Object.getOwnPropertyNames(Object.prototype));
+  const objectStatics = new Set(Object.getOwnPropertyNames(Object));
+  const objectKeys = Object.keys;
+
+  afterEach(() => {
+    for (const key of Object.getOwnPropertyNames(Object.prototype)) {
+      if (!prototypeKeys.has(key))
+        Reflect.deleteProperty(Object.prototype, key);
+    }
+    for (const key of Object.getOwnPropertyNames(Object)) {
+      if (!objectStatics.has(key)) Reflect.deleteProperty(Object, key);
+    }
+    Object.keys = objectKeys;
+  });
+
+  const headerWithScore = (name: string, metric: string) =>
+    makeHeader({
+      results: testEvalResults({
+        scores: [
+          testEvalScore({
+            name,
+            metrics: { [metric]: testEvalMetric({ name: metric, value: 1 }) },
+          }),
+        ],
+      }),
+    });
+
+  test.each([
+    ["__proto__", "planted"],
+    ["constructor", "keys"],
+  ])("keeps a scorer named %s as an ordinary entry", (name, metric) => {
+    const scores = deriveLogFields(headerWithScore(name, metric)).scores;
+
+    expect(Object.hasOwn(Object.prototype, "planted")).toBe(false);
+    expect(Object.keys).toBe(objectKeys);
+    expect(scores && Object.entries(scores)).toEqual([[name, { [metric]: 1 }]]);
+  });
+
+  test("keeps a sample score named __proto__ as an ordinary entry", () => {
+    const derived = deriveSampleFields(
+      makeSummary({
+        scores: { ["__proto__"]: testScore({ value: { planted: 1 } }) },
+      })
+    );
+
+    expect(derived.scores && Object.entries(derived.scores)).toEqual([
+      ["__proto__", { planted: 1 }],
+    ]);
+  });
+});

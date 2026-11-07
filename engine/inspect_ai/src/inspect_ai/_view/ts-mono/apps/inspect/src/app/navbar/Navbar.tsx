@@ -1,0 +1,151 @@
+import clsx from "clsx";
+import { FC, Fragment, ReactNode, useMemo, useRef } from "react";
+import { Link } from "react-router";
+
+import { useBreadcrumbTruncation } from "@tsmono/react/hooks";
+import { Icon } from "@tsmono/react/icons";
+import {
+  basename,
+  dirname,
+  ensureTrailingSlash,
+  prettyDirUri,
+} from "@tsmono/util";
+
+import { useLogDir } from "../../app_config";
+
+import styles from "./Navbar.module.css";
+
+interface NavbarProps {
+  children?: ReactNode;
+  bordered?: boolean;
+  fnNavigationUrl: (file: string, log_dir?: string) => string;
+  currentPath: string | undefined;
+  /** Override the back button's target (default: parent of currentPath). */
+  backUrl?: string;
+  /** Override the home button's target (default: root listing). */
+  homeUrl?: string;
+  breadcrumbsEnabled?: boolean;
+}
+
+export const Navbar: FC<NavbarProps> = ({
+  fnNavigationUrl,
+  bordered,
+  children,
+  currentPath,
+  backUrl: backUrlOverride,
+  homeUrl: homeUrlOverride,
+  breadcrumbsEnabled,
+}) => {
+  const logDir = useLogDir();
+  const displayDir =
+    logDir === "."
+      ? basename(
+          window.location.pathname.substring(
+            0,
+            window.location.pathname.lastIndexOf("/")
+          )
+        )
+      : logDir || "";
+  const baseLogDir = dirname(displayDir);
+  const baseLogName = basename(displayDir);
+  const pathContainerRef = useRef<HTMLDivElement>(null);
+
+  const backUrl =
+    backUrlOverride ??
+    fnNavigationUrl(ensureTrailingSlash(dirname(currentPath || "")), logDir);
+
+  const segments = useMemo(() => {
+    const pathSegments = currentPath ? currentPath.split("/") : [];
+    const dirSegments: Array<{ text: string; url: string }> = [];
+    const currentSegment = [];
+    for (const pathSegment of pathSegments) {
+      currentSegment.push(pathSegment);
+      const segmentUrl = fnNavigationUrl(currentSegment.join("/"), logDir);
+      dirSegments.push({
+        text: pathSegment,
+        url: segmentUrl,
+      });
+    }
+
+    return [
+      { text: prettyDirUri(baseLogDir) },
+      { text: baseLogName, url: fnNavigationUrl("", logDir) },
+      ...dirSegments,
+    ];
+  }, [baseLogDir, baseLogName, currentPath, fnNavigationUrl, logDir]);
+
+  const { visibleSegments, showEllipsis } = useBreadcrumbTruncation(
+    segments,
+    pathContainerRef
+  );
+
+  return (
+    <nav
+      className={clsx(
+        "text-size-smaller",
+        "header-nav",
+        styles.header,
+        bordered === false ? null : styles.bordered
+      )}
+      aria-label="breadcrumb"
+      data-unsearchable={true}
+    >
+      <div className={clsx(styles.left)}>
+        <Link
+          to={backUrl}
+          className={clsx(styles.toolbarButton)}
+          aria-label="Back"
+        >
+          <Icon name="navBack" />
+        </Link>
+        <Link
+          to={homeUrlOverride ?? fnNavigationUrl("", logDir)}
+          className={clsx(styles.toolbarButton)}
+          aria-label="Home"
+        >
+          <Icon name="navHome" />
+        </Link>
+        {breadcrumbsEnabled !== false && (
+          <div className={clsx(styles.pathContainer)} ref={pathContainerRef}>
+            {logDir ? (
+              <ol className={clsx("breadcrumb", styles.breadcrumbs)}>
+                {visibleSegments.map((segment, index) => {
+                  const isLast = index === visibleSegments.length - 1;
+                  const shouldShowEllipsis =
+                    showEllipsis && index === 1 && visibleSegments.length >= 2;
+
+                  return (
+                    <Fragment key={index}>
+                      {shouldShowEllipsis && (
+                        <li
+                          className={clsx("breadcrumb-item", styles.ellipsis)}
+                        >
+                          <span>...</span>
+                        </li>
+                      )}
+                      <li
+                        className={clsx(
+                          "breadcrumb-item",
+                          isLast ? "active" : undefined
+                        )}
+                      >
+                        {segment.url && !isLast ? (
+                          <Link to={segment.url}>{segment.text}</Link>
+                        ) : (
+                          <span>{segment.text}</span>
+                        )}
+                      </li>
+                    </Fragment>
+                  );
+                })}
+              </ol>
+            ) : (
+              ""
+            )}
+          </div>
+        )}
+      </div>
+      <div className={clsx(styles.right)}>{children}</div>
+    </nav>
+  );
+};

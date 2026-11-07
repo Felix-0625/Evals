@@ -1,0 +1,95 @@
+// @no-unsafe-eval: hosts may serve the viewers under a CSP without it.
+import { table } from "arquero";
+import { describe, expect, test } from "vitest";
+
+import { castScanValue, decodeArrowBase64, decodeArrowBytes } from "./arrow";
+
+// LZ4_FRAME-compressed Arrow IPC stream containing:
+//   id:                 int32  [1, 2, 3, 4]
+//   name:               utf8   ["alpha", "beta", "gamma", "delta"]
+//   value:              utf8   ["42", "3.14", "true", "hi"]
+//   value_type:         utf8   ["number", "number", "boolean", "string"]
+//   scan_error_refusal: utf8   ["true", "false", "TRUE", "false"]
+// Generated once via flechette's tableToIPC so the test has no encoder dep.
+const FIXTURE_B64 =
+  "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";
+
+describe("decodeArrowBase64", () => {
+  test("decodes an LZ4-compressed IPC stream and casts mixed-type columns", () => {
+    const table = decodeArrowBase64(FIXTURE_B64);
+
+    expect(table.numRows()).toBe(4);
+    expect(table.columnNames().sort()).toEqual([
+      "id",
+      "name",
+      "scan_error_refusal",
+      "value",
+      "value_type",
+    ]);
+
+    expect(table.array("id")).toEqual([1, 2, 3, 4]);
+    expect(table.array("name")).toEqual(["alpha", "beta", "gamma", "delta"]);
+    expect(table.array("value_type")).toEqual([
+      "number",
+      "number",
+      "boolean",
+      "string",
+    ]);
+
+    // `value` is cast based on the parallel `value_type` column.
+    expect(table.array("value")).toEqual([42, 3.14, true, "hi"]);
+
+    // `scan_error_refusal` strings get cast to booleans (case-insensitive).
+    expect(table.array("scan_error_refusal")).toEqual([
+      true,
+      false,
+      true,
+      false,
+    ]);
+  });
+
+  test("leaves columns without a cast as they are, in order", () => {
+    const bytes = table({
+      zeta: ["a", "b"],
+      count: [1, 2],
+      alpha: [true, null],
+    }).toArrowIPC();
+
+    const decoded = decodeArrowBytes(bytes);
+
+    expect(decoded.columnNames()).toEqual(["zeta", "count", "alpha"]);
+    expect(decoded.array("zeta")).toEqual(["a", "b"]);
+    expect(decoded.array("count")).toEqual([1, 2]);
+    expect(decoded.array("alpha")).toEqual([true, null]);
+  });
+
+  test("casts typed and null cells", () => {
+    const bytes = table({
+      value: ["7", null, "x"],
+      value_type: ["number", "number", null],
+      scan_error_refusal: [true, null, false],
+    }).toArrowIPC();
+
+    const decoded = decodeArrowBytes(bytes);
+
+    // A row without a value_type keeps its value.
+    expect(decoded.array("value")).toEqual([7, null, "x"]);
+    expect(decoded.array("scan_error_refusal")).toEqual([true, false, false]);
+  });
+});
+
+describe("castScanValue", () => {
+  test.each([
+    { value: "0.5", type: "number", expected: 0.5 },
+    { value: " 3 ", type: "number", expected: 3 },
+    { value: "n/a", type: "number", expected: null },
+    { value: "", type: "number", expected: null },
+    { value: "TRUE", type: "boolean", expected: true },
+    { value: "False", type: "boolean", expected: false },
+    { value: "yes", type: "boolean", expected: null },
+    { value: 3, type: "string", expected: 3 },
+    { value: undefined, type: "string", expected: null },
+  ])("casts $value under $type to $expected", ({ value, type, expected }) => {
+    expect(castScanValue(value, type)).toBe(expected);
+  });
+});

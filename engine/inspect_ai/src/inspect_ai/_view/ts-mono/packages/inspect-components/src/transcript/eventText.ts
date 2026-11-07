@@ -1,0 +1,678 @@
+import type { Content } from "@tsmono/inspect-common/types";
+import { isRecord, toTitleCase } from "@tsmono/util";
+
+import { fenced, inlineCode, quoted } from "../content/markdownBlocks";
+
+import { eventTitle } from "./event/utils";
+import { formatModifiedCall, formatSuspicion } from "./transform/toolSentinels";
+import type { EventType } from "./types";
+import { EventNode } from "./types";
+
+// `type` -> required payload key. The payload-key check avoids collapsing
+// user data that happens to share a discriminator value but isn't a Content*.
+const SANITIZED_CONTENT_KEYS: Record<string, string> = {
+  image: "image",
+  audio: "audio",
+  video: "video",
+  data: "data",
+  document: "document",
+};
+
+// Mirror how the viewer renders Content* values: ContentReasoning becomes the
+// readable text (matching MessageContent.tsx), other Content* become a
+// `<type />` placeholder (matching the UI's <img>/<audio>/etc. tags). Returns
+// undefined for anything else, so the caller preserves the original value.
+const readOptionalBoolean = (value: unknown, key: string): boolean => {
+  if (!isRecord(value)) return false;
+  return value[key] === true;
+};
+
+const readOptionalString = (
+  value: unknown,
+  key: string
+): string | undefined => {
+  if (!isRecord(value)) return undefined;
+  const raw = value[key];
+  return typeof raw === "string" ? raw : undefined;
+};
+
+const sanitizeContent = (val: unknown): string | undefined => {
+  if (val === null || typeof val !== "object" || !("type" in val)) {
+    return undefined;
+  }
+  if (val.type === "reasoning" && "reasoning" in val) {
+    const reasoning = readOptionalString(val, "reasoning");
+    const summary = readOptionalString(val, "summary");
+    const redacted = readOptionalBoolean(val, "redacted");
+    return redacted ? (summary ?? "") : reasoning || summary || "";
+  }
+  if (typeof val.type === "string") {
+    const payloadKey = SANITIZED_CONTENT_KEYS[val.type];
+    if (payloadKey && payloadKey in val) {
+      return `<${val.type} />`;
+    }
+  }
+  return undefined;
+};
+
+const sanitizeStringify = (v: unknown): string => {
+  // Top-level Content* values: bypass JSON.stringify, which would wrap a
+  // reviver-returned string in literal JSON quotes.
+  const rootSanitized = sanitizeContent(v);
+  if (rootSanitized !== undefined) {
+    return rootSanitized;
+  }
+  return JSON.stringify(v, (_key, val: unknown) => {
+    const replacement = sanitizeContent(val);
+    return replacement !== undefined ? replacement : val;
+  });
+};
+
+/**
+ * Extracts labeled fields from an event for search and text serialization.
+ */
+export const extractEventFields = (event: EventType): [string, string][] => {
+  const fields: [string, string][] = [];
+
+  switch (event.event) {
+    case "model": {
+      const modelEvent = event;
+      // Model name (displayed in title)
+      if (modelEvent.model) {
+        fields.push(["model", modelEvent.model]);
+      }
+      // Extract text from model output
+      for (const choice of modelEvent.output.choices) {
+        for (const text of extractContentText(choice.message.content)) {
+          fields.push(["output", text]);
+        }
+      }
+      // Extract text from user/system input messages shown in the view
+      for (const msg of modelEvent.input) {
+        if (msg.role === "user" || msg.role === "system") {
+          for (const text of extractContentText(msg.content)) {
+            fields.push([msg.role, text]);
+          }
+        }
+      }
+      // API-call errors / tracebacks surfaced on the model event itself
+      // (e.g. provider 5xx) — make them searchable like the rendered view.
+      if (modelEvent.error) {
+        fields.push(["error", modelEvent.error]);
+      }
+      if (modelEvent.traceback) {
+        fields.push(["traceback", modelEvent.traceback]);
+      }
+      break;
+    }
+
+    case "tool": {
+      const toolEvent = event;
+      // Custom tool title (displayed instead of function name)
+      if (toolEvent.view?.title) {
+        const resolvedTitle = toolEvent.view.title.replace(
+          /\{\{(\w+)\}\}/g,
+          (match, key: string) => {
+            if (!Object.hasOwn(toolEvent.arguments, key)) return match;
+            const val =
+              toolEvent.arguments[key as keyof typeof toolEvent.arguments];
+            return typeof val === "string" ? val : JSON.stringify(val);
+          }
+        );
+        fields.push(["title", resolvedTitle]);
+      }
+      // Tool function name
+      if (toolEvent.function) {
+        fields.push(["function", toolEvent.function]);
+      }
+      // Tool arguments
+      fields.push(["arguments", JSON.stringify(toolEvent.arguments)]);
+      // Tool result
+      if (toolEvent.result) {
+        if (typeof toolEvent.result === "string") {
+          fields.push(["result", toolEvent.result]);
+        } else {
+          for (const text of extractToolResultText(toolEvent.result)) {
+            fields.push(["result", text]);
+          }
+        }
+      }
+      // Tool error
+      if (toolEvent.error?.message) {
+        fields.push(["error", toolEvent.error.message]);
+      }
+      break;
+    }
+
+    case "error": {
+      const errorEvent = event;
+      if (errorEvent.error.message) {
+        fields.push(["message", errorEvent.error.message]);
+      }
+      if (errorEvent.error.traceback) {
+        fields.push(["traceback", errorEvent.error.traceback]);
+      }
+      break;
+    }
+
+    case "logger": {
+      const loggerEvent = event;
+      if (loggerEvent.message.message) {
+        fields.push(["message", loggerEvent.message.message]);
+      }
+      // Filename shown in the view
+      if (loggerEvent.message.filename) {
+        fields.push(["filename", loggerEvent.message.filename]);
+      }
+      break;
+    }
+
+    case "info": {
+      const infoEvent = event;
+      // Source shown in title
+      if (infoEvent.source) {
+        fields.push(["source", infoEvent.source]);
+      }
+      if (infoEvent.data) {
+        if (typeof infoEvent.data === "string") {
+          fields.push(["data", infoEvent.data]);
+        } else {
+          fields.push(["data", sanitizeStringify(infoEvent.data)]);
+        }
+      }
+      break;
+    }
+
+    case "branch": {
+      if (event.from_anchor) {
+        fields.push(["from_anchor", event.from_anchor]);
+      }
+      break;
+    }
+
+    case "anchor": {
+      fields.push(["anchor_id", event.anchor_id]);
+      if (event.source) fields.push(["source", event.source]);
+      break;
+    }
+
+    case "compaction": {
+      // Mirror CompactionEventView: title (source if non-default) plus the
+      // tokens/metadata MetaDataGrid.
+      const compactionEvent = event;
+      if (compactionEvent.source && compactionEvent.source !== "inspect") {
+        fields.push(["source", compactionEvent.source]);
+      }
+      if (compactionEvent.tokens_before != null) {
+        fields.push(["tokens_before", String(compactionEvent.tokens_before)]);
+      }
+      if (compactionEvent.tokens_after != null) {
+        fields.push(["tokens_after", String(compactionEvent.tokens_after)]);
+      }
+      if (compactionEvent.metadata) {
+        for (const [k, v] of Object.entries(compactionEvent.metadata)) {
+          fields.push([k, typeof v === "string" ? v : sanitizeStringify(v)]);
+        }
+      }
+      break;
+    }
+
+    case "step": {
+      const stepEvent = event;
+      if (stepEvent.name) {
+        fields.push(["name", stepEvent.name]);
+      }
+      // Type shown in title (e.g., "solver: name")
+      if (stepEvent.type) {
+        fields.push(["type", stepEvent.type]);
+      }
+      break;
+    }
+
+    case "subtask": {
+      const subtaskEvent = event;
+      if (subtaskEvent.name) {
+        fields.push(["name", subtaskEvent.name]);
+      }
+      // Type shown in title
+      if (subtaskEvent.type) {
+        fields.push(["type", subtaskEvent.type]);
+      }
+      // Input/result shown in summary
+      fields.push(["input", sanitizeStringify(subtaskEvent.input)]);
+      if (subtaskEvent.result) {
+        fields.push(["result", sanitizeStringify(subtaskEvent.result)]);
+      }
+      break;
+    }
+
+    case "span_begin": {
+      const spanEvent = event;
+      if (spanEvent.name) {
+        fields.push(["name", spanEvent.name]);
+      }
+      // Type shown in title
+      if (spanEvent.type) {
+        fields.push(["type", spanEvent.type]);
+      }
+      break;
+    }
+
+    case "score": {
+      const scoreEvent = event;
+      if (scoreEvent.score.answer) {
+        fields.push(["answer", scoreEvent.score.answer]);
+      }
+      if (scoreEvent.score.explanation) {
+        fields.push(["explanation", scoreEvent.score.explanation]);
+      }
+      const scoreValue = scoreEvent.score.value;
+      fields.push([
+        "value",
+        typeof scoreValue === "string"
+          ? scoreValue
+          : JSON.stringify(scoreValue),
+      ]);
+      if (scoreEvent.target) {
+        if (typeof scoreEvent.target === "string") {
+          fields.push(["target", scoreEvent.target]);
+        } else if (Array.isArray(scoreEvent.target)) {
+          for (const t of scoreEvent.target) {
+            fields.push(["target", t]);
+          }
+        }
+      }
+      break;
+    }
+
+    case "score_edit": {
+      const scoreEditEvent = event;
+      if (scoreEditEvent.score_name) {
+        fields.push(["score_name", scoreEditEvent.score_name]);
+      }
+      if (
+        scoreEditEvent.edit.answer &&
+        scoreEditEvent.edit.answer !== "UNCHANGED"
+      ) {
+        fields.push(["answer", scoreEditEvent.edit.answer]);
+      }
+      if (
+        scoreEditEvent.edit.explanation &&
+        scoreEditEvent.edit.explanation !== "UNCHANGED"
+      ) {
+        fields.push(["explanation", scoreEditEvent.edit.explanation]);
+      }
+      break;
+    }
+
+    case "sample_init": {
+      const sampleInitEvent = event;
+      const sample = sampleInitEvent.sample;
+      if (sample.target) {
+        if (typeof sample.target === "string") {
+          fields.push(["target", sample.target]);
+        } else {
+          fields.push(["target", JSON.stringify(sample.target)]);
+        }
+      }
+      if (sample.metadata && Object.keys(sample.metadata).length > 0) {
+        fields.push(["metadata", sanitizeStringify(sample.metadata)]);
+      }
+      break;
+    }
+
+    case "sample_limit": {
+      const sampleLimitEvent = event;
+      if (sampleLimitEvent.message) {
+        fields.push(["message", sampleLimitEvent.message]);
+      }
+      fields.push(["type", sampleLimitEvent.type]);
+      break;
+    }
+
+    case "input": {
+      const inputEvent = event;
+      if (inputEvent.input) {
+        fields.push(["input", inputEvent.input]);
+      }
+      break;
+    }
+
+    case "interrupt": {
+      const interruptEvent = event;
+      fields.push(["source", interruptEvent.source]);
+      fields.push(["interrupted", interruptEvent.interrupted]);
+      if (interruptEvent.interrupted_tool_call_id) {
+        fields.push([
+          "interrupted_tool_call_id",
+          interruptEvent.interrupted_tool_call_id,
+        ]);
+      }
+      if (interruptEvent.interrupted_model_event_id) {
+        fields.push([
+          "interrupted_model_event_id",
+          interruptEvent.interrupted_model_event_id,
+        ]);
+      }
+      break;
+    }
+
+    case "approval": {
+      const approvalEvent = event;
+      fields.push(["decision", approvalEvent.decision]);
+      if (approvalEvent.explanation) {
+        fields.push(["explanation", approvalEvent.explanation]);
+      }
+      if (approvalEvent.approver) {
+        fields.push(["approver", approvalEvent.approver]);
+      }
+      break;
+    }
+
+    case "review": {
+      const reviewEvent = event;
+      fields.push(["decision", reviewEvent.decision]);
+      if (reviewEvent.explanation) {
+        fields.push(["explanation", reviewEvent.explanation]);
+      }
+      fields.push(["reviewer", reviewEvent.reviewer]);
+      break;
+    }
+
+    case "communication":
+    case "swarm":
+      // Model and producer text, so one JSON block, as InfoEvent.data was;
+      // plain JSON, since `data` is opaque and never Content. Printed as the
+      // views' JSONPanel prints it, so find reveals what search counts.
+      fields.push(["payload", JSON.stringify(eventPayload(event), null, 2)]);
+      break;
+
+    case "sentinel": {
+      const sentinelEvent = event;
+      fields.push(["kind", sentinelEvent.kind]);
+      fields.push(["status", sentinelEvent.status]);
+      if (sentinelEvent.path) {
+        fields.push(["path", sentinelEvent.path]);
+      }
+      fields.push(["factory", sentinelEvent.factory]);
+      if (sentinelEvent.function) {
+        fields.push(["function", sentinelEvent.function]);
+      }
+      fields.push(["stage", sentinelEvent.stage]);
+      if (
+        sentinelEvent.suspicion !== undefined &&
+        sentinelEvent.suspicion !== null
+      ) {
+        fields.push(["suspicion", formatSuspicion(sentinelEvent.suspicion)]);
+      }
+      if (sentinelEvent.action) {
+        fields.push(["action", sentinelEvent.action]);
+      }
+      if (sentinelEvent.modified) {
+        fields.push(["modified", formatModifiedCall(sentinelEvent.modified)]);
+      }
+      if (sentinelEvent.audit) {
+        fields.push(["audit", "true"]);
+      }
+      if (sentinelEvent.message) {
+        fields.push(["message", sentinelEvent.message]);
+      }
+      if (sentinelEvent.explanation) {
+        fields.push(["explanation", sentinelEvent.explanation]);
+      }
+      if (sentinelEvent.error) {
+        fields.push(["error", sentinelEvent.error]);
+      }
+      break;
+    }
+
+    case "sandbox": {
+      const sandboxEvent = event;
+      fields.push(["action", sandboxEvent.action]);
+      if (sandboxEvent.cmd) {
+        fields.push(["cmd", sandboxEvent.cmd]);
+      }
+      if (sandboxEvent.output) {
+        fields.push(["output", sandboxEvent.output]);
+      }
+      if (sandboxEvent.file) {
+        fields.push(["file", sandboxEvent.file]);
+      }
+      break;
+    }
+
+    case "state":
+    case "store": {
+      const stateEvent = event;
+      for (const change of stateEvent.changes) {
+        fields.push(["path", change.path]);
+        fields.push([
+          "value",
+          typeof change.value === "string"
+            ? change.value
+            : sanitizeStringify(change.value),
+        ]);
+      }
+      break;
+    }
+  }
+
+  return fields;
+};
+
+/**
+ * Extracts searchable text from an EventNode for find-in-page functionality.
+ */
+export const eventSearchText = (node: EventNode): string[] => {
+  return extractEventFields(node.event).map(([, v]) => v);
+};
+
+/**
+ * Converts an array of events to a human-readable text transcript.
+ */
+export const eventsToStr = (events: readonly EventType[]): string => {
+  return events
+    .map((event) => {
+      const fields = extractEventFields(event);
+      if (fields.length === 0) return null;
+      const body = fields
+        .map(([k, v]) => (v.includes("\n") ? `${k}:\n${v}` : `${k}: ${v}`))
+        .join("\n");
+      return `[${event.event}]\n${body}`;
+    })
+    .filter((s): s is string => s !== null)
+    .join("\n\n");
+};
+
+/**
+ * Converts an array of events to a Markdown transcript suitable for reports
+ * and other review artifacts. Sections use the viewer's event titles. Prose
+ * fields (model output, messages, explanations) keep their Markdown, quoted
+ * when multi-line; everything else — tool arguments and results, tracebacks,
+ * JSON — is fenced or put in inline code so it renders verbatim.
+ */
+export const eventsToMarkdown = (events: readonly EventType[]): string => {
+  return events
+    .map((event) => {
+      const fields = extractEventFields(event);
+      // Tool titles interpolate raw arguments, which may span lines.
+      const title = (eventTitle(event) || titleCase(event.event)).replace(
+        /\s+/g,
+        " "
+      );
+      // A selected event with nothing to extract still gets its heading so the
+      // export never silently shortens (or empties) the selection.
+      if (fields.length === 0) return `## ${title}`;
+      const body = fields
+        .map(([key, value]) => {
+          const label = titleCase(key);
+          const prose = kProseFields.has(key);
+          if (value.includes("\n")) {
+            return `**${label}**\n\n${prose ? quoted(value) : fenced(value)}`;
+          }
+          if (!prose && looksLikeJson(value)) {
+            return `**${label}**\n\n${fenced(value)}`;
+          }
+          const text = kCodeLikeFields.has(key) ? inlineCode(value) : value;
+          return `**${label}:** ${text}`;
+        })
+        .join("\n\n");
+      return `## ${title}\n\n${body}`;
+    })
+    .join("\n\n---\n\n");
+};
+
+const titleCase = (value: string): string =>
+  toTitleCase(value.replace(/_/g, " "));
+
+// Fields every event carries; the rest is what the event itself records.
+const kBaseEventFields: ReadonlySet<string> = new Set([
+  "event",
+  "uuid",
+  "span_id",
+  "timestamp",
+  "working_start",
+  "metadata",
+  "pending",
+]);
+
+/** An event's own fields, without those every event carries. */
+export const eventPayload = (event: object): Record<string, unknown> =>
+  Object.fromEntries(
+    Object.entries(event).filter(([key]) => !kBaseEventFields.has(key))
+  );
+
+const kProseFields: ReadonlySet<string> = new Set([
+  "answer",
+  "explanation",
+  "message",
+  "output",
+  "title",
+]);
+
+const kCodeLikeFields: ReadonlySet<string> = new Set([
+  "arguments",
+  "cmd",
+  "file",
+  "filename",
+  "function",
+  "path",
+]);
+
+const looksLikeJson = (value: string): boolean =>
+  /^\s*[[{]/.test(value) && /[\]}]\s*$/.test(value);
+
+/**
+ * Extracts text strings from message content.
+ */
+const extractContentText = (content: string | Array<Content>): string[] => {
+  if (typeof content === "string") {
+    return [content];
+  }
+
+  const texts: string[] = [];
+  for (const item of content) {
+    switch (item.type) {
+      case "text":
+        texts.push(item.text);
+        break;
+      case "reasoning": {
+        // The transcript uses MessageContent.tsx's reasoning renderer (via
+        // the chat view), which shows the summary when redacted (since the
+        // reasoning blob is encrypted) and the reasoning otherwise. Match
+        // that here so search hits what the user can see.
+        const text = item.redacted
+          ? item.summary
+          : item.reasoning || item.summary;
+        if (text) {
+          texts.push(text);
+        }
+        break;
+      }
+      case "tool_use": {
+        const toolUse = item;
+        if (toolUse.name) {
+          texts.push(toolUse.name);
+        }
+        if (toolUse.arguments) {
+          texts.push(sanitizeStringify(toolUse.arguments));
+        }
+        if (toolUse.result) {
+          texts.push(
+            typeof toolUse.result === "string"
+              ? toolUse.result
+              : sanitizeStringify(toolUse.result)
+          );
+        }
+        if (toolUse.error) {
+          texts.push(toolUse.error);
+        }
+        break;
+      }
+      case "image":
+      case "audio":
+      case "video":
+      case "data":
+      case "document":
+        texts.push(`<${item.type} />`);
+        break;
+    }
+  }
+  return texts;
+};
+
+const extractToolResultText = (value: unknown): string[] => {
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => extractToolResultItemText(item));
+  }
+  return [sanitizeStringify(value)];
+};
+
+const extractToolResultItemText = (item: unknown): string[] => {
+  if (typeof item === "string") {
+    return [item];
+  }
+  if (item == null) {
+    return [];
+  }
+  if (
+    typeof item === "number" ||
+    typeof item === "boolean" ||
+    typeof item === "bigint"
+  ) {
+    return [item.toString()];
+  }
+  if (typeof item === "symbol") {
+    return [String(item)];
+  }
+  if (typeof item !== "object") {
+    return [];
+  }
+  if (!("type" in item)) {
+    return [sanitizeStringify(item)];
+  }
+
+  switch (item.type) {
+    case "text":
+      return "text" in item && typeof item.text === "string" ? [item.text] : [];
+    case "image":
+      return "image" in item &&
+        typeof item.image === "string" &&
+        !item.image.startsWith("data:")
+        ? [item.image]
+        : [];
+    case "document":
+      return "filename" in item && typeof item.filename === "string"
+        ? [item.filename]
+        : [];
+    case "audio":
+    case "video":
+      return [];
+    case "tool":
+      return "content" in item && Array.isArray(item.content)
+        ? item.content.flatMap((inner) => extractToolResultItemText(inner))
+        : [sanitizeStringify(item)];
+    default:
+      return [sanitizeStringify(item)];
+  }
+};

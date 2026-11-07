@@ -1,0 +1,6 @@
+/* Scout-specific overlay on top of @tsmono/theme/base + @tsmono/theme/vscode.
+   Shared rules live in the theme package. */
+
+pre > code {
+  color: var(--bs-body-color);
+}

@@ -1,0 +1,515 @@
+"""Tests for importing eval logs into Parquet database and verifying query equivalence."""
+
+import json
+from pathlib import Path
+from typing import Any, AsyncIterator
+
+import pytest
+import pytest_asyncio
+from inspect_scout import columns as c
+from inspect_scout import transcripts_from
+from inspect_scout._transcript.database.parquet import ParquetTranscriptsDB
+from inspect_scout._transcript.transcripts import Transcripts
+from inspect_scout._transcript.types import Transcript, TranscriptContent
+
+# Path to test logs
+TEST_LOGS_DIR = Path(__file__).parent.parent / "recorder" / "logs"
+
+
+@pytest.fixture
+def log_transcripts() -> Transcripts:
+    """Load transcripts from test eval logs."""
+    return transcripts_from(str(TEST_LOGS_DIR))
+
+
+@pytest.fixture
+def test_db_location(tmp_path: Path) -> Path:
+    """Create temporary directory for Parquet database."""
+    location = tmp_path / "transcript_db"
+    location.mkdir(parents=True, exist_ok=True)
+    return location
+
+
+@pytest_asyncio.fixture
+async def parquet_db(test_db_location: Path) -> AsyncIterator[ParquetTranscriptsDB]:
+    """Create and connect to a ParquetTranscriptDB."""
+    db = ParquetTranscriptsDB(str(test_db_location))
+    await db.connect()
+    yield db
+    await db.disconnect()
+
+
+@pytest_asyncio.fixture
+async def populated_parquet_db(
+    parquet_db: ParquetTranscriptsDB, log_transcripts: Transcripts
+) -> ParquetTranscriptsDB:
+    """Create a Parquet database populated with test logs."""
+    # Import all transcripts from logs into the Parquet database
+    await parquet_db.insert(log_transcripts)
+    return parquet_db
+
+
+@pytest.fixture
+def parquet_transcripts(
+    test_db_location: Path, populated_parquet_db: ParquetTranscriptsDB
+) -> Transcripts:
+    """Get Transcripts interface to the populated Parquet database."""
+    return transcripts_from(str(test_db_location))
+
+
+async def get_transcript_ids(transcripts: Transcripts) -> list[str]:
+    """Get list of transcript IDs from a Transcripts source."""
+    async with transcripts.reader() as reader:
+        return [info.transcript_id async for info in reader.index()]
+
+
+async def read_full_transcript(
+    transcripts: Transcripts, transcript_id: str
+) -> Transcript:
+    """Read a full transcript with all messages and events."""
+    async with transcripts.reader() as reader:
+        async for info in reader.index():
+            if info.transcript_id == transcript_id:
+                return await reader.read(
+                    info, TranscriptContent(messages="all", events="all")
+                )
+    raise ValueError(f"Transcript {transcript_id} not found")
+
+
+def normalize_metadata_value(value: Any) -> Any:
+    """Normalize metadata values for comparison.
+
+    Converts JSON strings to their parsed equivalents for comparison.
+    """
+    if isinstance(value, str):
+        # Try to parse as JSON
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            return value
+    return value
+
+
+def assert_transcripts_equal(t1: Transcript, t2: Transcript) -> None:
+    """Assert that two transcripts are equal in all aspects."""
+    # Basic fields
+    assert t1.transcript_id == t2.transcript_id
+    assert t1.source_type == t2.source_type
+    assert t1.source_id == t2.source_id
+
+    # Metadata (keys and values)
+    assert set(t1.metadata.keys()) == set(t2.metadata.keys())
+    for key in t1.metadata:
+        # Normalize both values for comparison (handles JSON string vs dict)
+        v1 = normalize_metadata_value(t1.metadata[key])
+        v2 = normalize_metadata_value(t2.metadata[key])
+        assert v1 == v2, f"Metadata key {key} differs: {v1} != {v2}"
+
+    # Messages
+    assert len(t1.messages) == len(t2.messages)
+    for i, (m1, m2) in enumerate(zip(t1.messages, t2.messages, strict=True)):
+        assert type(m1) is type(m2), f"Message {i} type differs"
+        assert m1.role == m2.role, f"Message {i} role differs"
+        assert m1.content == m2.content, f"Message {i} content differs"
+
+    # Events
+    assert len(t1.events) == len(t2.events)
+    for i, (e1, e2) in enumerate(zip(t1.events, t2.events, strict=True)):
+        assert type(e1) is type(e2), f"Event {i} type differs: {type(e1)} vs {type(e2)}"
+        # Compare the event objects (they should be equal if same type and data)
+        assert e1 == e2, f"Event {i} differs"
+
+
+@pytest.mark.asyncio
+async def test_query_simple_equality(
+    log_transcripts: Transcripts, parquet_transcripts: Transcripts
+) -> None:
+    """Test simple equality filter works the same on both sources."""
+    # Query for specific task
+    log_filtered = log_transcripts.where(c.task_set == "popularity")
+    parquet_filtered = parquet_transcripts.where(c.task_set == "popularity")
+
+    log_ids = await get_transcript_ids(log_filtered)
+    parquet_ids = await get_transcript_ids(parquet_filtered)
+
+    assert len(log_ids) > 0, "Should find some popularity transcripts"
+    # Sort for platform-independent comparison (file system ordering differs)
+    assert sorted(log_ids) == sorted(parquet_ids), "Should return same IDs"
+
+
+@pytest.mark.asyncio
+async def test_query_simple_inequality(
+    log_transcripts: Transcripts, parquet_transcripts: Transcripts
+) -> None:
+    """Test inequality filter works the same on both sources."""
+    log_filtered = log_transcripts.where(c.task_set != "popularity")
+    parquet_filtered = parquet_transcripts.where(c.task_set != "popularity")
+
+    log_ids = await get_transcript_ids(log_filtered)
+    parquet_ids = await get_transcript_ids(parquet_filtered)
+
+    assert len(log_ids) > 0, "Should find non-popularity transcripts"
+    assert set(log_ids) == set(parquet_ids), "Should return same IDs"
+
+
+@pytest.mark.asyncio
+async def test_query_greater_equal(
+    log_transcripts: Transcripts, parquet_transcripts: Transcripts
+) -> None:
+    """Test greater-than-or-equal filter works the same on both sources."""
+    log_filtered = log_transcripts.where(c.epoch >= 0)
+    parquet_filtered = parquet_transcripts.where(c.epoch >= 0)
+
+    log_ids = await get_transcript_ids(log_filtered)
+    parquet_ids = await get_transcript_ids(parquet_filtered)
+
+    assert set(log_ids) == set(parquet_ids), "Should return same IDs"
+
+
+@pytest.mark.asyncio
+async def test_query_in_operator(
+    log_transcripts: Transcripts, parquet_transcripts: Transcripts
+) -> None:
+    """Test IN operator works the same on both sources."""
+    tasks = ["popularity", "security-guide"]
+    log_filtered = log_transcripts.where(c.task_set.in_(tasks))
+    parquet_filtered = parquet_transcripts.where(c.task_set.in_(tasks))
+
+    log_ids = await get_transcript_ids(log_filtered)
+    parquet_ids = await get_transcript_ids(parquet_filtered)
+
+    assert len(log_ids) > 0, "Should find transcripts matching tasks"
+    # Sort for platform-independent comparison (file system ordering differs)
+    assert sorted(log_ids) == sorted(parquet_ids), "Should return same IDs"
+
+
+@pytest.mark.asyncio
+async def test_query_null_check(
+    log_transcripts: Transcripts, parquet_transcripts: Transcripts
+) -> None:
+    """Test NULL check works the same on both sources."""
+    log_filtered = log_transcripts.where(c.error.is_null())
+    parquet_filtered = parquet_transcripts.where(c.error.is_null())
+
+    log_ids = await get_transcript_ids(log_filtered)
+    parquet_ids = await get_transcript_ids(parquet_filtered)
+
+    # Sort for platform-independent comparison (file system ordering differs)
+    assert sorted(log_ids) == sorted(parquet_ids), "Should return same IDs"
+
+
+@pytest.mark.asyncio
+async def test_query_and_operator(
+    log_transcripts: Transcripts, parquet_transcripts: Transcripts
+) -> None:
+    """Test AND operator works the same on both sources."""
+    condition = (c.task_set == "popularity") & (c.epoch == 0)
+    log_filtered = log_transcripts.where(condition)
+    parquet_filtered = parquet_transcripts.where(condition)
+
+    log_ids = await get_transcript_ids(log_filtered)
+    parquet_ids = await get_transcript_ids(parquet_filtered)
+
+    # Sort for platform-independent comparison (file system ordering differs)
+    assert sorted(log_ids) == sorted(parquet_ids), "Should return same IDs"
+
+
+@pytest.mark.asyncio
+async def test_query_or_operator(
+    log_transcripts: Transcripts, parquet_transcripts: Transcripts
+) -> None:
+    """Test OR operator works the same on both sources."""
+    condition = (c.task_set == "popularity") | (c.task_set == "security-guide")
+    log_filtered = log_transcripts.where(condition)
+    parquet_filtered = parquet_transcripts.where(condition)
+
+    log_ids = await get_transcript_ids(log_filtered)
+    parquet_ids = await get_transcript_ids(parquet_filtered)
+
+    assert len(log_ids) > 0, "Should find transcripts"
+    # Sort for platform-independent comparison (file system ordering differs)
+    assert sorted(log_ids) == sorted(parquet_ids), "Should return same IDs"
+
+
+@pytest.mark.asyncio
+async def test_query_not_operator(
+    log_transcripts: Transcripts, parquet_transcripts: Transcripts
+) -> None:
+    """Test NOT operator works the same on both sources."""
+    condition = ~(c.task_set == "popularity")
+    log_filtered = log_transcripts.where(condition)
+    parquet_filtered = parquet_transcripts.where(condition)
+
+    log_ids = await get_transcript_ids(log_filtered)
+    parquet_ids = await get_transcript_ids(parquet_filtered)
+
+    assert len(log_ids) > 0, "Should find non-popularity transcripts"
+    assert set(log_ids) == set(parquet_ids), "Should return same IDs"
+
+
+@pytest.mark.asyncio
+async def test_query_limit(
+    log_transcripts: Transcripts, parquet_transcripts: Transcripts
+) -> None:
+    """Test limit works on both sources.
+
+    Note: Without explicit ordering, the two sources may return different
+    transcripts, so we only verify that the limit is respected.
+    """
+    log_filtered = log_transcripts.limit(2)
+    parquet_filtered = parquet_transcripts.limit(2)
+
+    log_ids = await get_transcript_ids(log_filtered)
+    parquet_ids = await get_transcript_ids(parquet_filtered)
+
+    assert len(log_ids) == 2, "Should limit to 2 transcripts"
+    assert len(parquet_ids) == 2, "Should limit to 2 transcripts"
+
+
+@pytest.mark.asyncio
+async def test_query_shuffle_deterministic(
+    log_transcripts: Transcripts, parquet_transcripts: Transcripts
+) -> None:
+    """Test shuffle with seed works the same on both sources."""
+    log_filtered = log_transcripts.shuffle(seed=42)
+    parquet_filtered = parquet_transcripts.shuffle(seed=42)
+
+    log_ids = await get_transcript_ids(log_filtered)
+    parquet_ids = await get_transcript_ids(parquet_filtered)
+
+    # With same seed, shuffled order should be identical (sort for platform independence)
+    assert sorted(log_ids) == sorted(parquet_ids), (
+        "Should return same IDs with same seed"
+    )
+
+    # Verify it's actually shuffled (not in original order)
+    original_log_ids = await get_transcript_ids(log_transcripts)
+    assert log_ids != original_log_ids, "Should be shuffled from original order"
+
+
+@pytest.mark.asyncio
+async def test_full_content_verification(
+    log_transcripts: Transcripts, parquet_transcripts: Transcripts
+) -> None:
+    """Test that full transcript content (messages and events) matches."""
+    # Get first few transcript IDs
+    log_ids = await get_transcript_ids(log_transcripts.limit(3))
+
+    for transcript_id in log_ids:
+        log_transcript = await read_full_transcript(log_transcripts, transcript_id)
+        parquet_transcript = await read_full_transcript(
+            parquet_transcripts, transcript_id
+        )
+
+        assert_transcripts_equal(log_transcript, parquet_transcript)
+
+
+@pytest.mark.asyncio
+async def test_chained_queries(
+    log_transcripts: Transcripts, parquet_transcripts: Transcripts
+) -> None:
+    """Test complex chained queries work the same on both sources."""
+    # Chain multiple operations
+    log_filtered = (
+        log_transcripts.where(c.task_set != "popularity").limit(5).shuffle(seed=42)
+    )
+    parquet_filtered = (
+        parquet_transcripts.where(c.task_set != "popularity").limit(5).shuffle(seed=42)
+    )
+
+    log_ids = await get_transcript_ids(log_filtered)
+    parquet_ids = await get_transcript_ids(parquet_filtered)
+
+    assert len(log_ids) <= 5, "Should limit to 5 transcripts"
+    # Sort for platform-independent comparison (file system ordering differs)
+    assert sorted(log_ids) == sorted(parquet_ids), "Should return same IDs"
+
+
+@pytest.mark.asyncio
+async def test_multiple_where_clauses(
+    log_transcripts: Transcripts, parquet_transcripts: Transcripts
+) -> None:
+    """Test multiple sequential where clauses work the same on both sources."""
+    # Multiple where calls should be ANDed together
+    log_filtered = log_transcripts.where(c.epoch >= 0).where(
+        c.task_set.in_(["popularity", "security-guide"])
+    )
+    parquet_filtered = parquet_transcripts.where(c.epoch >= 0).where(
+        c.task_set.in_(["popularity", "security-guide"])
+    )
+
+    log_ids = await get_transcript_ids(log_filtered)
+    parquet_ids = await get_transcript_ids(parquet_filtered)
+
+    # Sort for platform-independent comparison (file system ordering differs)
+    assert sorted(log_ids) == sorted(parquet_ids), "Should return same IDs"
+
+
+@pytest.mark.asyncio
+async def test_success_column_values(
+    log_transcripts: Transcripts, parquet_transcripts: Transcripts
+) -> None:
+    """Test that success column correctly maps score values.
+
+    Verifies that:
+    - Scores with value "C" (correct) have success=True (value_to_float returns 1.0)
+    - Scores with value "I" (incorrect) have success=False (value_to_float returns 0.0)
+    """
+    # Get popularity transcripts which have "C" and "I" score values
+    log_filtered = log_transcripts.where(c.task_set == "popularity")
+    parquet_filtered = parquet_transcripts.where(c.task_set == "popularity")
+
+    # Check success values from log source
+    async with log_filtered.reader() as reader:
+        log_success_mapping: dict[str, bool | None] = {}
+        log_score_value_mapping: dict[str, Any] = {}
+        async for info in reader.index():
+            # success is stored as int (0/1) in the database, convert to bool
+            success = info.success
+            if success is not None:
+                success = bool(success)
+            log_success_mapping[info.transcript_id] = success
+            # score is now the raw value directly (e.g., "C" or "I")
+            log_score_value_mapping[info.transcript_id] = info.score
+
+    # Check success values from parquet source
+    async with parquet_filtered.reader() as reader:
+        parquet_success_mapping: dict[str, bool | None] = {}
+        parquet_score_value_mapping: dict[str, Any] = {}
+        async for info in reader.index():
+            # success is stored as int (0/1) in the database, convert to bool
+            success = info.success
+            if success is not None:
+                success = bool(success)
+            parquet_success_mapping[info.transcript_id] = success
+            # score is now the raw value directly (e.g., "C" or "I")
+            parquet_score_value_mapping[info.transcript_id] = info.score
+
+    # Verify both sources have the same number of transcripts
+    assert len(log_success_mapping) > 0, "Should have popularity transcripts"
+    assert len(log_success_mapping) == len(parquet_success_mapping)
+
+    # Verify success mapping is consistent between sources
+    for transcript_id in log_success_mapping:
+        assert transcript_id in parquet_success_mapping
+        assert (
+            log_success_mapping[transcript_id] == parquet_success_mapping[transcript_id]
+        ), f"Success value mismatch for {transcript_id}"
+
+    # Verify success values match expected behavior:
+    # - "C" (correct) scores should have success=True
+    # - "I" (incorrect) scores should have success=False
+    correct_count = 0
+    incorrect_count = 0
+
+    for transcript_id, score_value in log_score_value_mapping.items():
+        success = log_success_mapping[transcript_id]
+        if score_value == "C":
+            assert success is True, (
+                f"Score 'C' should result in success=True for {transcript_id}"
+            )
+            correct_count += 1
+        elif score_value == "I":
+            assert success is False, (
+                f"Score 'I' should result in success=False for {transcript_id}"
+            )
+            incorrect_count += 1
+
+    # Verify we tested both types of scores
+    assert correct_count > 0, "Should have some correct (C) scores"
+    assert incorrect_count > 0, "Should have some incorrect (I) scores"
+
+
+@pytest.mark.asyncio
+async def test_filter_by_source_type(
+    log_transcripts: Transcripts, parquet_transcripts: Transcripts
+) -> None:
+    """Test filtering by source_type column works on both sources."""
+    # Filter by source_type == "eval_log" (all test logs should have this)
+    log_filtered = log_transcripts.where(c.source_type == "eval_log")
+    parquet_filtered = parquet_transcripts.where(c.source_type == "eval_log")
+
+    log_ids = await get_transcript_ids(log_filtered)
+    parquet_ids = await get_transcript_ids(parquet_filtered)
+
+    # All transcripts from eval logs should match
+    all_log_ids = await get_transcript_ids(log_transcripts)
+    assert len(log_ids) == len(all_log_ids), (
+        "All logs should have source_type='eval_log'"
+    )
+    assert sorted(log_ids) == sorted(parquet_ids), "Should return same IDs"
+
+
+@pytest.mark.asyncio
+async def test_filter_by_source_id(
+    log_transcripts: Transcripts, parquet_transcripts: Transcripts
+) -> None:
+    """Test filtering by source_id column works on both sources."""
+    # Get a source_id (eval_id) from the first transcript
+    async with log_transcripts.reader() as reader:
+        first_info = None
+        async for info in reader.index():
+            first_info = info
+            break
+        assert first_info is not None
+
+    source_id = first_info.source_id
+    assert source_id is not None, "source_id should be set for eval logs"
+
+    # Filter by that specific source_id
+    log_filtered = log_transcripts.where(c.source_id == source_id)
+    parquet_filtered = parquet_transcripts.where(c.source_id == source_id)
+
+    log_ids = await get_transcript_ids(log_filtered)
+    parquet_ids = await get_transcript_ids(parquet_filtered)
+
+    assert len(log_ids) > 0, "Should find transcripts with matching source_id"
+    assert sorted(log_ids) == sorted(parquet_ids), "Should return same IDs"
+
+
+@pytest.mark.asyncio
+async def test_filter_by_source_uri(
+    log_transcripts: Transcripts, parquet_transcripts: Transcripts
+) -> None:
+    """Test filtering by source_uri column works on both sources."""
+    # Get a source_uri (log path) from the first transcript
+    async with log_transcripts.reader() as reader:
+        first_info = None
+        async for info in reader.index():
+            first_info = info
+            break
+        assert first_info is not None
+
+    source_uri = first_info.source_uri
+    assert source_uri is not None, "source_uri should be set for eval logs"
+
+    # Filter by that specific source_uri
+    log_filtered = log_transcripts.where(c.source_uri == source_uri)
+    parquet_filtered = parquet_transcripts.where(c.source_uri == source_uri)
+
+    log_ids = await get_transcript_ids(log_filtered)
+    parquet_ids = await get_transcript_ids(parquet_filtered)
+
+    assert len(log_ids) > 0, "Should find transcripts with matching source_uri"
+    assert sorted(log_ids) == sorted(parquet_ids), "Should return same IDs"
+
+
+@pytest.mark.asyncio
+async def test_filter_by_transcript_id(
+    log_transcripts: Transcripts, parquet_transcripts: Transcripts
+) -> None:
+    """Test filtering by transcript_id column works on both sources."""
+    # Get a transcript_id from the first transcript
+    all_ids = await get_transcript_ids(log_transcripts)
+    assert len(all_ids) > 0
+    target_id = all_ids[0]
+
+    # Filter by that specific transcript_id
+    log_filtered = log_transcripts.where(c.transcript_id == target_id)
+    parquet_filtered = parquet_transcripts.where(c.transcript_id == target_id)
+
+    log_ids = await get_transcript_ids(log_filtered)
+    parquet_ids = await get_transcript_ids(parquet_filtered)
+
+    assert log_ids == [target_id], "Should find exactly one transcript"
+    assert parquet_ids == [target_id], "Should find exactly one transcript"

@@ -1,0 +1,83 @@
+---
+title: Results
+llms-description: "Collecting and analyzing scanner results"
+---
+
+## Overview
+
+The results of scans are stored in directory on the local filesystem (by default `./scans`) or in a remote S3 bucket. When a scan job is completed its directory is printed, and you can also use the `scan_list()` function or `scout scan list` command to enumerate scan jobs.
+
+Scan results include the following:
+
+-   Scan configuration (e.g. options passed to `scan()` or to `scout scan`).
+
+-   Transcripts scanned and scanners executed and errors which occurred during the last scan.
+
+-   A set of [Parquet](https://parquet.apache.org/docs/) files with scan results (one for each scanner). Functions are available to interface with these files as Pandas data frames.
+
+## Workflow
+
+### Scout CLI
+
+The `scout scan` command will print its status at the end of its run. If all of the scanners completed without errors you'll see a message indicating the scan is complete along with a pointer to the scan directory where results are stored:
+
+![](images/scan-complete.png)
+
+If you are running in VS Code, you can click the scan directory to view the results in Scout View. If you are using another editor, execute `scout view` from the terminal to launch the viewer:
+
+```bash
+scout view
+```
+
+![](images/scout-view.png){.border}
+
+To show model output as plain text when you're reviewing content from models you don't trust, see [Untrusted Content](projects.qmd#untrusted-content).
+
+To get programmatic access to the results, pass the scan directory to the `scan_results_df()` function:
+
+``` python
+from inspect_scout import scan_results_df
+
+results = scan_results_df("scans/scan_id=3ibJe9cg7eM5zo3h5Hpbr8")
+deception_df = results.scanners["deception"]
+tool_errors_df = results.scanners["tool_errors"]
+```
+
+### Python API
+
+The `scan()` function returns a `Status` object which indicates whether the scan completed successfully (in which case the scanner results are available for analysis). You'll therefore want to check the `.completed` field before proceeding to read the results. For example:
+
+``` python
+from inspect_scout import (
+    scan, scan_results_df, transcripts_from
+)
+
+from .scanners import ctf_environment, java_tool_calls
+
+status = scan(
+    transcripts=transcripts_from("./logs"),
+    scanners=[ctf_environment(), java_tool_calls()]
+)
+
+if status.complete:
+    results = scan_results_df(status.location)
+    deception_df = results.scanners["deception"]
+    tool_errors_df = results.scanners["tool_errors"]
+```
+
+## Results Data
+
+The `Results` object returned from `scan_results_df()` includes both metadata about the scan as well as the scanner data frames:
+
+| Field | Type | Description |
+|-------------------|-------------------|----------------------------------|
+| `complete` | bool | Is the job complete? (all transcripts scanned) |
+| `spec` | ScanSpec | Scan specification (transcripts, scanners, options, etc.) |
+| `location` | str | Location of scan directory |
+| `summary` | Summary | Summary of scan (results, metrics, errors, tokens, etc.) |
+| `errors` | list\[Error\] | Errors during last scan attempt. |
+| `scanners` | dict\[str, pd.DataFrame\] | Results data for each scanner (see [Data Frames](#data-frames) for details) |
+
+: {tbl-colwidths=\[20,20,60\]}
+
+{{< include _results-data-frame.md >}}

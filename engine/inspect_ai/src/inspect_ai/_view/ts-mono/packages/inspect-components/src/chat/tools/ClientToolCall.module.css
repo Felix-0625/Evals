@@ -1,0 +1,12 @@
+/* Custom tool views (answer, submit, todo lists) own their full rendering —
+   they get the block frame (accent edge + container border) without the
+   header row. */
+.custom {
+  border: 1px solid var(--bs-light-border-subtle);
+  border-left: var(--inspect-tool-block-edge);
+  border-radius: var(--bs-border-radius);
+  /* `clip` rounds the corners without becoming a scroll container, which
+     would trap the sticky "less…" toggle of the panels inside. */
+  overflow: clip;
+  padding: 0.7rem;
+}

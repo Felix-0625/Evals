@@ -1,0 +1,35 @@
+# Independent upstream clones; do not track them in this repository.
+/inspect_ai/
+/inspect_scout/
+/gepa/
+/.clone-cache/
+
+# Python environments and generated files.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+/build/
+/dist/
+.ipynb_checkpoints/
+node_modules/
+.turbo/
+/runs/
+/artifacts/
+/evals-workspace/
+/logs/
+/.bug-hunter/
+/artifacts-*.txt
+/artifacts-*.json
+**/evals-*.txt
+**/content-security-policy.json.tmp
+
+# Local credentials; keep example templates versionable.
+.env
+.env.*
+!.env.example
+!.env.*.example

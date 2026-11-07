@@ -1,0 +1,51 @@
+# To get started with Dependabot version updates, you'll need to specify which
+# package ecosystems to update and where the package manifests are located.
+# Please see the documentation for all configuration options:
+# https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+
+version: 2
+
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+    open-pull-requests-limit: 5
+
+    # Match the pnpm minimumReleaseAge soak in pnpm-workspace.yaml so
+    # Dependabot waits before opening PRs. Without this, pnpm refuses the
+    # resolution and the update job errors out silently. Note: Dependabot
+    # cooldown does not apply to transitive deps (dependabot-core#14683) —
+    # the pnpm-side setting covers those. Security updates bypass cooldown.
+    cooldown:
+      default-days: 7
+
+    groups:
+      minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Actions are pinned to commit SHAs with a `# vX.Y.Z` comment; Dependabot
+  # bumps both. The cooldown gives a compromised release time to be caught
+  # before it is proposed. `/` only covers .github/workflows, so composite
+  # actions are listed separately. Branch refs (agents@main) are not updated.
+  - package-ecosystem: "github-actions"
+    directories:
+      - "/"
+      - "/.github/actions/*"
+    schedule:
+      interval: "weekly"
+
+    cooldown:
+      default-days: 7
+
+    # One PR per week for every action update, majors included, across both
+    # directories.
+    groups:
+      github-actions:
+        patterns:
+          - "*"

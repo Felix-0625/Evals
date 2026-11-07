@@ -1,0 +1,319 @@
+import clsx from "clsx";
+import { FC, useMemo } from "react";
+
+import {
+  EvalDataset,
+  EvalPlan,
+  EvalResults,
+  EvalSpec,
+  EvalStats,
+  ProvenanceData,
+} from "@tsmono/inspect-common/types";
+import {
+  ConfigChangeInfo,
+  effectiveEvalConfig,
+  effectiveGenerateConfig,
+  evalConfigChanges,
+  generateConfigChanges,
+} from "@tsmono/inspect-common/utils";
+import { ConfigChangesCountChip } from "@tsmono/inspect-components/config";
+import { ExpandablePanel, LabeledValue } from "@tsmono/react/components";
+import { formatDataset, valueAsString } from "@tsmono/util";
+
+import { EvalDescriptor } from "../../../app/samples/descriptor/types";
+import { sampleFilterItems } from "../../../app/samples/sample-tools/filters";
+import {
+  useConfigUpdates,
+  useEvalDescriptor,
+  useSelectedSampleInvalidation,
+} from "../../../state/hooks";
+import { formatDateTime, formatDuration } from "../../../utils/format";
+import { useTimelineNavigation } from "../useTimelineNavigation";
+
+import styles from "./SecondaryBar.module.css";
+
+interface SecondaryBarProps {
+  evalSpec?: EvalSpec;
+  evalPlan?: EvalPlan;
+  evalResults?: EvalResults | null;
+  evalStats?: EvalStats;
+  status?: string;
+  sampleCount?: number;
+}
+
+/**
+ * Renders the SecondaryBar
+ */
+export const SecondaryBar: FC<SecondaryBarProps> = ({
+  evalSpec,
+  evalPlan,
+  evalResults,
+  evalStats,
+  status,
+  sampleCount,
+}) => {
+  const evalDescriptor = useEvalDescriptor();
+  const sampleInvalidation = useSelectedSampleInvalidation();
+  const configUpdates = useConfigUpdates();
+  const { href: timelineHref, show: showTimeline } = useTimelineNavigation();
+
+  // The chip string reads what the run actually finished under; the
+  // aggregate "N changed" chip carries the affordance for the retunes.
+  const configChanges = useMemo<ConfigChangeInfo[]>(
+    () => [
+      ...evalConfigChanges(configUpdates).values(),
+      ...generateConfigChanges(configUpdates).values(),
+    ],
+    [configUpdates]
+  );
+
+  if (!evalSpec || status !== "success") {
+    return null;
+  }
+
+  const effectiveConfig = effectiveEvalConfig(evalSpec.config, configUpdates);
+  const epochs = effectiveConfig.epochs || 1;
+  const hyperparameters: Record<string, unknown> = {
+    ...effectiveGenerateConfig(evalPlan?.config || {}, configUpdates),
+    ...evalSpec.task_args,
+  };
+
+  const hasConfig =
+    Object.keys(hyperparameters).length > 0 || configChanges.length > 0;
+
+  const values = [];
+  values.push({
+    size: "minmax(12%, auto)",
+    value: (
+      <LabeledValue
+        key="sb-dataset"
+        label="Dataset"
+        className={clsx(styles.staticCol, "text-size-small")}
+      >
+        <DatasetSummary
+          dataset={evalSpec.dataset}
+          sampleCount={sampleCount}
+          epochs={epochs}
+        />
+      </LabeledValue>
+    ),
+  });
+
+  const label =
+    evalResults?.scores && evalResults.scores.length > 1 ? "Scorers" : "Scorer";
+  values.push({
+    size: "minmax(12%, auto)",
+    value: (
+      <LabeledValue
+        key="sb-scorer"
+        label={label}
+        className={clsx(
+          styles.staticCol,
+          hasConfig ? styles.justifyLeft : styles.justifyCenter,
+          "text-size-small"
+        )}
+      >
+        <ScorerSummary evalDescriptor={evalDescriptor} />
+      </LabeledValue>
+    ),
+  });
+
+  if (hasConfig) {
+    values.push({
+      size: "minmax(12%, auto)",
+      value: (
+        <LabeledValue
+          key="sb-params"
+          label="Config"
+          className={clsx(styles.justifyRight, "text-size-small")}
+        >
+          <span className={styles.paramsWithChanges}>
+            <ParamSummary params={hyperparameters} />
+            {configChanges.length > 0 ? (
+              <ConfigChangesCountChip
+                id="secondary-bar-config-changes"
+                changes={configChanges}
+                onViewTimeline={showTimeline}
+                timelineHref={timelineHref}
+              />
+            ) : null}
+          </span>
+        </LabeledValue>
+      ),
+    });
+  }
+
+  if (evalStats) {
+    const totalDuration = formatDuration(
+      new Date(evalStats.started_at),
+      new Date(evalStats.completed_at)
+    );
+    values.push({
+      size: "minmax(12%, auto)",
+      value: (
+        <LabeledValue
+          key="sb-duration"
+          label="Duration"
+          className={clsx(styles.justifyRight, "text-size-small")}
+        >
+          {totalDuration}
+        </LabeledValue>
+      ),
+    });
+  }
+
+  if (sampleInvalidation) {
+    values.push({
+      size: "minmax(12%, auto)",
+      value: (
+        <InvalidationStatus
+          key="sb-invalidation"
+          invalidation={sampleInvalidation}
+        />
+      ),
+    });
+  }
+
+  return (
+    <ExpandablePanel
+      id={"secondary-nav-bar"}
+      className={clsx(styles.container, "text-size-small")}
+      collapse={true}
+      lines={5}
+    >
+      <div
+        className={styles.valueGrid}
+        style={{
+          gridTemplateColumns: `${values
+            .map((val) => {
+              return val.size;
+            })
+            .join(" ")}`,
+        }}
+      >
+        {values.map((val) => {
+          return val.value;
+        })}
+      </div>
+    </ExpandablePanel>
+  );
+};
+
+interface DatasetSummaryProps {
+  dataset?: EvalDataset;
+  epochs: number;
+  sampleCount?: number;
+}
+
+/**
+ * A component that displays the dataset
+ */
+const DatasetSummary: FC<DatasetSummaryProps> = ({
+  sampleCount,
+  dataset,
+  epochs,
+}) => {
+  if (!dataset) {
+    return null;
+  }
+
+  return (
+    <div>
+      {sampleCount ? formatDataset(sampleCount, epochs, dataset.name) : ""}
+    </div>
+  );
+};
+
+interface ScoreSummaryProps {
+  evalDescriptor?: EvalDescriptor | null;
+}
+
+/**
+ * A component that displays a list of scrorers
+ */
+const ScorerSummary: FC<ScoreSummaryProps> = ({ evalDescriptor }) => {
+  if (!evalDescriptor) {
+    return null;
+  }
+
+  const items = sampleFilterItems(evalDescriptor);
+  return (
+    <span style={{ position: "relative" }}>
+      {Array.from(items).map((item, index, array) => (
+        <span key={index}>
+          <span title={item.tooltip}>{item.canonicalName}</span>
+          {index < array.length - 1 ? ", " : ""}
+        </span>
+      ))}
+    </span>
+  );
+};
+
+interface ParamSummaryProps {
+  params: Record<string, unknown>;
+}
+
+/**
+ * A component that displays a summary of parameters.
+ */
+const ParamSummary: FC<ParamSummaryProps> = ({ params }) => {
+  const paraValues = Object.keys(params).map((key) => {
+    const val = params[key];
+    if (Array.isArray(val) || typeof val === "object") {
+      return `${key}: ${JSON.stringify(val)}`;
+    } else {
+      return `${key}: ${valueAsString(val)}`;
+    }
+  });
+  if (paraValues.length > 0) {
+    return (
+      <code
+        style={{
+          padding: 0,
+          color: "var(--bs-body-color)",
+          overflowWrap: "anywhere",
+        }}
+      >
+        {paraValues.join(", ")}
+      </code>
+    );
+  } else {
+    return null;
+  }
+};
+
+interface InvalidationStatusProps {
+  invalidation: ProvenanceData;
+}
+
+/**
+ * A component that displays the sample invalidation status.
+ */
+const InvalidationStatus: FC<InvalidationStatusProps> = ({ invalidation }) => {
+  const formatTimestamp = (timestamp: string) => {
+    try {
+      return formatDateTime(new Date(timestamp));
+    } catch {
+      return timestamp;
+    }
+  };
+
+  const details = [
+    invalidation.author && `By: ${invalidation.author}`,
+    invalidation.timestamp && `On: ${formatTimestamp(invalidation.timestamp)}`,
+    invalidation.reason && `Reason: ${invalidation.reason}`,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  return (
+    <LabeledValue
+      label="Status"
+      className={clsx(styles.justifyRight, "text-size-small")}
+    >
+      <span className={styles.invalidationStatus} title={details}>
+        ⚠ Invalidated
+      </span>
+    </LabeledValue>
+  );
+};

@@ -1,0 +1,18 @@
+# Build outputs
+dist/
+dist-e2e/
+lib/
+
+# Generated
+src/@types/log.d.ts
+
+# Playwright output
+playwright-report/
+test-results/
+
+# Ignore all vendored code
+libs/**/*.css
+libs/**/*.js
+preact/**/*.js
+preact/**/*.mjs
+*.module.css.d.ts

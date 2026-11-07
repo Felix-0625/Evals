@@ -1,0 +1,18 @@
+export const defaultColumns: string[] = [
+  "transcript_id",
+  "value",
+  "explanation",
+  "metadata",
+  "transcript_source_id",
+  "transcript_metadata",
+  "input_ids",
+  "input",
+  "label",
+  "uuid",
+  "message_references",
+  "validation_target",
+  "validation_result",
+  "scan_total_tokens",
+  "scan_model_usage",
+  "timestamp",
+];

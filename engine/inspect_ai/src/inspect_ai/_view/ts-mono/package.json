@@ -1,0 +1,40 @@
+{
+  "name": "tsmono",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.22.0",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "build": "turbo run build",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "check": "manypkg check && node scripts/check-suppressions.mjs && turbo run check",
+    "manypkg:check": "manypkg check",
+    "manypkg:fix": "manypkg fix",
+    "test": "turbo run test",
+    "format": "turbo run format",
+    "format:check": "turbo run format:check",
+    "dev": "turbo run dev",
+    "e2e": "turbo run e2e",
+    "suppressions:check": "node scripts/check-suppressions.mjs",
+    "suppressions:update": "node scripts/check-suppressions.mjs --update"
+  },
+  "//": "manypkg requires root deps in 'dependencies', not 'devDependencies'. The root is private and never published, so the distinction is meaningless here — it's a consistency convention.",
+  "manypkg": {
+    "defaultBranch": "main",
+    "workspaceProtocol": "require"
+  },
+  "devDependencies": {
+    "@css-modules-kit/codegen": "^1.4.0",
+    "@ianvs/prettier-plugin-sort-imports": "^4.7.1",
+    "@manypkg/cli": "^0.25.1",
+    "@tsmono/prettier-config": "workspace:*",
+    "esbuild": "^0.28.2",
+    "picocolors": "^1.1.1",
+    "prettier": "^3.9.10",
+    "turbo": "^2.11.9",
+    "typescript": "npm:@typescript/typescript6@^6.0.2"
+  }
+}

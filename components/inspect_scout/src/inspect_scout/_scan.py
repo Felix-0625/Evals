@@ -1,0 +1,1579 @@
+import json
+import os
+import traceback
+from contextlib import asynccontextmanager
+from logging import getLogger
+from pathlib import Path
+from typing import Any, AsyncIterator, Awaitable, Callable, Mapping, Sequence, cast
+
+import anyio
+import yaml
+from anyio.abc import TaskGroup
+from dotenv import find_dotenv, load_dotenv
+from inspect_ai._eval.context import init_model_context
+from inspect_ai._util._async import run_coroutine
+from inspect_ai._util.background import set_background_task_group
+from inspect_ai._util.config import resolve_args
+from inspect_ai._util.constants import DEFAULT_LOG_LEVEL, DEFAULT_MAX_CONNECTIONS_BATCH
+from inspect_ai._util.error import PrerequisiteError
+from inspect_ai._util.json import jsonable_python
+from inspect_ai._util.path import pretty_path
+from inspect_ai._util.platform import platform_init as init_platform
+from inspect_ai._util.rich import clean_control_characters
+from inspect_ai.model._generate_config import GenerateConfig
+from inspect_ai.model._model import (
+    Model,
+    ModelRoles,
+    init_model_usage,
+    model_usage,
+    resolve_models,
+)
+from inspect_ai.model._model_config import (
+    model_config_to_model,
+    model_roles_config_to_model_roles,
+)
+from inspect_ai.model._util import resolve_model_roles
+from inspect_ai.util import span
+from inspect_ai.util._anyio import inner_exception
+from pydantic import JsonValue, TypeAdapter
+from rich import box
+from rich.table import Column, Table
+from typing_extensions import Unpack
+
+from inspect_scout._concurrency._mp_common import set_log_level
+from inspect_scout._project import read_project
+from inspect_scout._scanjob import merge_project_into_scanjob
+from inspect_scout._scanner.metrics import metrics_accumulators
+from inspect_scout._transcript.local_files_cache import (
+    cleanup_task_files_cache,
+    init_task_files_cache,
+)
+from inspect_scout._util.attachments import resolve_event_attachments
+from inspect_scout._util.refusal import RefusalError
+from inspect_scout._validation.predicates import PredicateFn
+from inspect_scout._validation.types import ValidationSet
+from inspect_scout._validation.validate import validate
+from inspect_scout._view.notify import view_notify_scan
+
+from ._concurrency.common import ParseFunctionResult, ParseJob, ScanMetrics, ScannerJob
+from ._concurrency.multi_process import multi_process_strategy
+from ._concurrency.single_process import single_process_strategy
+from ._display._display import (
+    DisplayType,
+    display,
+    display_type_initialized,
+    init_display_type,
+)
+from ._recorder import summary as recorder_summary
+from ._recorder.active_scans_store import active_scans_store
+from ._recorder.factory import (
+    scan_recorder_for_location,
+    scan_recorder_type_for_location,
+)
+from ._recorder.recorder import ScanRecorder, Status
+from ._scancontext import ScanContext, create_scan, resume_scan
+from ._scanjob import (
+    ScanDeprecatedArgs,
+    ScanJob,
+    Scanners,
+)
+from ._scanjob_config import ScanJobConfig
+from ._scanner.loader import config_for_loader
+from ._scanner.result import (
+    Error,
+    ReportInput,
+    Result,
+    ResultReport,
+    ResultValidation,
+    SerializedTranscript,
+    as_resultset,
+)
+from ._scanner.scanner import Scanner, config_for_scanner, scanner_supports_streaming
+from ._scanner.types import ScannerInput, ScannerInputNames
+from ._scanner.util import get_input_type_and_ids
+from ._scanspec import ScanSpec, Worklist
+from ._transcript.handle import (
+    MaterializedTranscriptHandle,
+    SpooledTranscriptHandle,
+    TranscriptHandle,
+)
+from ._transcript.json.passthrough import pooled_passthrough
+from ._transcript.transcripts import ScannerWork, Transcripts, TranscriptsReader
+from ._transcript.types import (
+    EventFilter,
+    MessageFilter,
+    Transcript,
+    TranscriptContent,
+    TranscriptInfo,
+)
+from ._transcript.util import union_transcript_contents
+from ._util.constants import DEFAULT_MAX_TRANSCRIPTS
+from ._util.deprecation import raise_results_error, show_results_warning
+from ._util.log import init_log
+
+logger = getLogger(__name__)
+
+
+def scan(
+    scanners: Scanners,
+    transcripts: Transcripts | None = None,
+    scans: str | None = None,
+    worklist: Sequence[ScannerWork] | Sequence[Worklist] | str | Path | None = None,
+    validation: str | ValidationSet | Mapping[str, str | ValidationSet] | None = None,
+    model: str | Model | None = None,
+    model_config: GenerateConfig | None = None,
+    model_base_url: str | None = None,
+    model_args: dict[str, Any] | str | None = None,
+    model_roles: ModelRoles | None = None,
+    max_transcripts: int | None = None,
+    max_processes: int | None = None,
+    limit: int | None = None,
+    shuffle: bool | int | None = None,
+    results_buffer: int | None = None,
+    tags: list[str] | None = None,
+    metadata: dict[str, Any] | None = None,
+    display: DisplayType | None = None,
+    log_level: str | None = None,
+    fail_on_error: bool = False,
+    dry_run: bool = False,
+    **deprecated: Unpack[ScanDeprecatedArgs],
+) -> Status:
+    """Scan transcripts.
+
+    Scan transcripts using one or more scanners. Note that scanners must each
+    have a unique name. If you have more than one instance of a scanner
+    with the same name, numbered prefixes will be automatically assigned.
+    Alternatively, you can pass tuples of (name,scanner) or a dict with
+    explicit names for each scanner.
+
+    Args:
+        scanners: Scanners to execute (list, dict with explicit names, or ScanJob). If a `ScanJob` or `ScanJobConfig` is specified, then its options are used as the default options for the scan.
+        transcripts: Transcripts to scan.
+        scans: Location to write scan results (filesystem or S3 bucket). Defaults to "./scans".
+        worklist: Transcripts too process for each scanner (defaults to processing all transcripts). Either a list of `ScannerWork` or a YAML or JSON file with same.
+        validation: Validation cases to evaluate for scanners. Can be a file path
+            (CSV, JSON, JSONL, YAML), a ValidationSet, or a dict mapping scanner
+            names to file paths or ValidationSets.
+        model: Model to use for scanning by default (individual scanners can always
+            call `get_model()` to us arbitrary models). If not specified use the model specified in the scout project config (if any).
+        model_config: `GenerationConfig` for calls to the model.
+        model_base_url: Base URL for communicating with the model API.
+        model_args: Model creation args (as a dictionary or as a path to a JSON or YAML config file).
+        model_roles: Named roles for use in `get_model()`.
+        max_transcripts: The maximum number of transcripts to process concurrently (this also serves as the default value for `max_connections`). Defaults to 25.
+        max_processes: The maximum number of concurrent processes (for multiproccesing). Defaults to 4.
+        limit: Limit the number of transcripts processed.
+        shuffle: Shuffle the order of transcripts (pass an `int` to set a seed for shuffling).
+        results_buffer: Sync in-progress results to the scan location every N recorded results so they can be inspected while the scan is still running (defaults to None, which syncs results only on completion or interruption).
+        tags: One or more tags for this scan.
+        metadata: Metadata for this scan.
+        display: Display type: "rich", "plain", "log", or "none" (defaults to "rich").
+        log_level: Level for logging to the console: "debug", "http", "sandbox",
+            "info", "warning", "error", "critical", or "notset" (defaults to "warning")
+        fail_on_error: Re-raise exceptions instead of capturing them in results. Defaults to False.
+        dry_run: Don't actually run the scan, just print the spec and return the status. Defaults to False.
+        deprecated: Deprecated arguments.
+
+    Returns:
+        ScanStatus: Status of scan (spec, completion, summary, errors, etc.)
+    """
+    top_level_sync_init(display)
+
+    return run_coroutine(
+        scan_async(
+            scanners=scanners,
+            transcripts=transcripts,
+            scans=scans,
+            worklist=worklist,
+            validation=validation,
+            model=model,
+            model_config=model_config,
+            model_base_url=model_base_url,
+            model_args=model_args,
+            model_roles=model_roles,
+            max_transcripts=max_transcripts,
+            max_processes=max_processes,
+            limit=limit,
+            shuffle=shuffle,
+            results_buffer=results_buffer,
+            tags=tags,
+            metadata=metadata,
+            log_level=log_level,
+            fail_on_error=fail_on_error,
+            dry_run=dry_run,
+            **deprecated,
+        )
+    )
+
+
+async def scan_async(
+    scanners: Scanners,
+    transcripts: Transcripts | None = None,
+    scans: str | None = None,
+    worklist: Sequence[ScannerWork] | Sequence[Worklist] | str | Path | None = None,
+    validation: str | ValidationSet | Mapping[str, str | ValidationSet] | None = None,
+    model: str | Model | None = None,
+    model_config: GenerateConfig | None = None,
+    model_base_url: str | None = None,
+    model_args: dict[str, Any] | str | None = None,
+    model_roles: ModelRoles | None = None,
+    max_transcripts: int | None = None,
+    max_processes: int | None = None,
+    limit: int | None = None,
+    shuffle: bool | int | None = None,
+    results_buffer: int | None = None,
+    tags: list[str] | None = None,
+    metadata: dict[str, Any] | None = None,
+    log_level: str | None = None,
+    fail_on_error: bool = False,
+    dry_run: bool = False,
+    **deprecated: Unpack[ScanDeprecatedArgs],
+) -> Status:
+    """Scan transcripts.
+
+    Scan transcripts using one or more scanners. Note that scanners must each
+    have a unique name. If you have more than one instance of a scanner
+    with the same name, numbered prefixes will be automatically assigned.
+    Alternatively, you can pass tuples of (name,scanner) or a dict with
+    explicit names for each scanner.
+
+    Args:
+        scanners: Scanners to execute (list, dict with explicit names, or ScanJob). If a `ScanJob` or `ScanJobConfig` is specified, then its options are used as the default options for the scan.
+        transcripts: Transcripts to scan.
+        scans: Location to write results (filesystem or S3 bucket). Defaults to "./scans".
+        worklist: Transcript ids to process for each scanner (defaults to processing all transcripts). Either a list of `ScannerWork` or a YAML or JSON file contianing the same.
+        validation: Validation cases to apply for scanners. Can be a file path
+            (CSV, JSON, JSONL, YAML), a ValidationSet, or a dict mapping scanner
+            names to file paths or ValidationSets.
+        model: Model to use for scanning by default (individual scanners can always
+            call `get_model()` to us arbitrary models). If not specified use the model specified in the scout project config (if any).
+        model_config: `GenerationConfig` for calls to the model.
+        model_base_url: Base URL for communicating with the model API.
+        model_args: Model creation args (as a dictionary or as a path to a JSON or YAML config file).
+        model_roles: Named roles for use in `get_model()`.
+        max_transcripts: The maximum number of transcripts to process concurrently (this also serves as the default value for `max_connections`). Defaults to 25.
+        max_processes: The maximum number of concurrent processes (for multiproccesing). Defaults to 4.
+        limit: Limit the number of transcripts processed.
+        shuffle: Shuffle the order of transcripts (pass an `int` to set a seed for shuffling).
+        results_buffer: Sync in-progress results to the scan location every N recorded results so they can be inspected while the scan is still running (defaults to None, which syncs results only on completion or interruption).
+        tags: One or more tags for this scan.
+        metadata: Metadata for this scan.
+        log_level: Level for logging to the console: "debug", "http", "sandbox",
+            "info", "warning", "error", "critical", or "notset" (defaults to "warning")
+        fail_on_error: Re-raise exceptions instead of capturing them in results. Defaults to False.
+        dry_run: Don't actually run the scan, just print the spec and return the status. Defaults to False.
+        deprecated: Deprecated arguments.
+
+    Returns:
+        ScanStatus: Status of scan (spec, completion, summary, errors, etc.)
+    """
+    project = read_project()
+    top_level_async_init(log_level or project.log_level)
+
+    # map deprecated
+    results_deprecated = deprecated.get("results", None)
+    if results_deprecated is not None:
+        if scans is not None:
+            raise_results_error()
+
+        show_results_warning()
+        scans = results_deprecated
+
+    # resolve scanjob
+    if isinstance(scanners, ScanJob):
+        scanjob = scanners
+    elif isinstance(scanners, ScanJobConfig):
+        scanjob = ScanJob.from_config(scanners)
+    else:
+        scanjob = ScanJob(scanners=scanners, worklist=await _resolve_worklist(worklist))
+
+    # Apply project defaults and merging (handles transcripts, results, model,
+    # worklist union, scanners union, validation union, tags union, metadata union,
+    # generate_config merge)
+    merge_project_into_scanjob(project, scanjob)
+
+    # Apply function parameter overrides on top of merged values
+    if transcripts:
+        scanjob._transcripts = transcripts
+    if scanjob._transcripts is None:
+        raise ValueError("No 'transcripts' specified for scan.")
+
+    # resolve results (function param takes precedence, then merged value, then env)
+    scanjob._scans = (
+        scans
+        or scanjob._scans
+        or str(
+            os.getenv("SCOUT_SCAN_SCANS", os.getenv("SCOUT_SCAN_RESULTS", "./scans"))
+        )
+    )
+
+    # resolve validation
+    if validation is not None:
+        scanjob._validation = _resolve_validation(validation, scanjob)
+
+    # initialize scan config
+    scanjob._generate_config = (
+        scanjob._generate_config.merge(model_config)
+        if scanjob._generate_config and model_config
+        else model_config or scanjob._generate_config or GenerateConfig()
+    )
+    scanjob._max_transcripts = (
+        max_transcripts
+        or scanjob._max_transcripts
+        or (
+            DEFAULT_MAX_TRANSCRIPTS
+            if scanjob.generate_config is None or not scanjob.generate_config.batch
+            else DEFAULT_MAX_CONNECTIONS_BATCH
+        )
+    )
+    scanjob._max_processes = max_processes or scanjob._max_processes
+    scanjob._limit = limit or scanjob._limit
+    scanjob._shuffle = shuffle if shuffle is not None else scanjob._shuffle
+    scanjob._results_buffer = (
+        results_buffer if results_buffer is not None else scanjob._results_buffer
+    )
+
+    # tags and metadata
+    scanjob._tags = tags or scanjob._tags
+    scanjob._metadata = metadata or scanjob._metadata
+
+    # derive max_connections if not specified
+    if scanjob._generate_config.max_connections is None:
+        scanjob._generate_config.max_connections = scanjob._max_transcripts
+
+    # initialize runtime context
+    resolved_model, resolved_model_args, resolved_model_roles = init_scan_model_context(
+        model=model or scanjob._model,
+        model_config=scanjob._generate_config,
+        model_base_url=model_base_url or scanjob._model_base_url,
+        model_args=model_args or scanjob._model_args,
+        model_roles=model_roles or scanjob._model_roles,
+    )
+    # only set the scanjob model if we have one
+    if str(resolved_model) != "none/none":
+        scanjob._model = resolved_model
+    scanjob._model_args = resolved_model_args
+    scanjob._model_roles = resolved_model_roles
+
+    scan = await create_scan(scanjob)
+    if dry_run:
+        return await _scan_dry_run(scan)
+
+    recorder = scan_recorder_for_location(scanjob._scans)
+    await recorder.init(scan.spec, scanjob._scans)
+
+    return await _scan_async(scan=scan, recorder=recorder, fail_on_error=fail_on_error)
+
+
+def scan_resume(
+    scan_location: str,
+    display: DisplayType | None = None,
+    log_level: str | None = None,
+    fail_on_error: bool = False,
+    predicate_overrides: Mapping[str, PredicateFn] | None = None,
+) -> Status:
+    """Resume a previous scan.
+
+    Args:
+       scan_location: Scan location to resume from.
+       display: Display type: "rich", "plain", "log", or "none" (defaults to "rich").
+       log_level: Level for logging to the console: "debug", "http", "sandbox",
+            "info", "warning", "error", "critical", or "notset" (defaults to "warning")
+       fail_on_error: Re-raise exceptions instead of capturing them in results.
+       predicate_overrides: Trusted custom validation predicates keyed by scanner
+            name. Required when the portable scan spec cannot recreate a predicate.
+
+    Returns:
+       ScanStatus: Status of scan (spec, completion, summary, errors, etc.)
+    """
+    top_level_sync_init(display)
+    return run_coroutine(
+        scan_resume_async(
+            scan_location,
+            log_level=log_level,
+            fail_on_error=fail_on_error,
+            predicate_overrides=predicate_overrides,
+        )
+    )
+
+
+async def scan_resume_async(
+    scan_location: str,
+    log_level: str | None = None,
+    fail_on_error: bool = False,
+    predicate_overrides: Mapping[str, PredicateFn] | None = None,
+) -> Status:
+    """Resume a previous scan.
+
+    Args:
+       scan_location: Scan location to resume from.
+       log_level: Level for logging to the console: "debug", "http", "sandbox",
+            "info", "warning", "error", "critical", or "notset" (defaults to "warning")
+       fail_on_error: Re-raise exceptions instead of capturing them in results.
+       predicate_overrides: Trusted custom validation predicates keyed by scanner
+            name. Required when the portable scan spec cannot recreate a predicate.
+
+    Returns:
+       ScanStatus: Status of scan (spec, completion, summary, errors, etc.)
+    """
+    top_level_async_init(log_level or read_project().log_level)
+
+    # resume job
+    scan = await resume_scan(scan_location, predicate_overrides)
+
+    # can't resume a job with non-deterministic shuffling
+    if scan.spec.options.shuffle is True:
+        raise RuntimeError(
+            "Cannot resume scans with transcripts shuffled without a seed."
+        )
+
+    # create model
+    if scan.spec.model is not None:
+        model = model_config_to_model(scan.spec.model)
+    else:
+        model = None
+
+    # create/initialize models then call init runtime context
+    init_scan_model_context(
+        model=model,
+        model_config=scan.spec.model.config if scan.spec.model else None,
+        model_roles=model_roles_config_to_model_roles(scan.spec.model_roles),
+    )
+
+    # create recorder and scan
+    recorder = scan_recorder_for_location(scan_location)
+    await recorder.resume(scan_location)
+    return await _scan_async(scan=scan, recorder=recorder, fail_on_error=fail_on_error)
+
+
+def scan_complete(
+    scan_location: str,
+    display: DisplayType | None = None,
+    log_level: str | None = None,
+) -> Status:
+    """Complete a scan.
+
+    This function is used to indicate that a scan with errors in some
+    transcripts should be completed in spite of the errors.
+
+    Args:
+       scan_location: Scan location to complete.
+       display: Display type: "rich", "plain", "log", or "none" (defaults to "rich").
+       log_level: Level for logging to the console: "debug", "http", "sandbox",
+            "info", "warning", "error", "critical", or "notset" (defaults to "warning")
+
+    Returns:
+       ScanStatus: Status of scan (spec, summary, errors, etc.)
+    """
+    top_level_sync_init(display)
+
+    return run_coroutine(scan_complete_async(scan_location, log_level=log_level))
+
+
+async def scan_complete_async(
+    scan_location: str, log_level: str | None = None
+) -> Status:
+    """Complete a scan.
+
+    This function is used to indicate that a scan with errors in some
+    transcripts should be completed in spite of the errors.
+
+    Args:
+       scan_location: Scan location to complete.
+       log_level: Level for logging to the console: "debug", "http", "sandbox",
+            "info", "warning", "error", "critical", or "notset" (defaults to "warning")
+
+    Returns:
+       ScanStatus: Status of scan (spec, summary, errors, etc.)
+    """
+    top_level_async_init(log_level or read_project().log_level)
+
+    # check if the scan is already complete
+    recorder_type = scan_recorder_type_for_location(scan_location)
+    status = await recorder_type.status(scan_location)
+    if status.complete:
+        raise PrerequisiteError(
+            f"Scan at '{pretty_path(scan_location)}' is already complete."
+        )
+
+    # complete the scan
+    status = await recorder_type.sync(scan_location, complete=True)
+    display().scan_complete(status)
+    return status
+
+
+_scan_async_running = False
+
+
+async def _scan_async(
+    *, scan: ScanContext, recorder: ScanRecorder, fail_on_error: bool = False
+) -> Status:
+    result: Status | None = None
+
+    async def run(tg: TaskGroup) -> None:
+        try:
+            nonlocal result
+            # the scope must outlive the interrupted-path sync inside
+            # `_scan_async_inner`, so it wraps the whole call
+            with recorder.run_scope():
+                result = await _scan_async_inner(
+                    scan=scan, recorder=recorder, tg=tg, fail_on_error=fail_on_error
+                )
+        finally:
+            tg.cancel_scope.cancel()
+
+    global _scan_async_running
+    if _scan_async_running:
+        raise RuntimeError(
+            "You can only have a single scan running at once in a process."
+        )
+    _scan_async_running = True
+
+    try:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(run, tg)
+    except Exception as ex:
+        raise inner_exception(ex) from None
+    except anyio.get_cancelled_exc_class():
+        # Cancelled exceptions are expected and handled by _scan_async_inner
+        pass
+    finally:
+        _scan_async_running = False
+
+    assert result is not None, "scan async did not return a result."
+
+    return result
+
+
+async def _scan_async_inner(
+    *,
+    scan: ScanContext,
+    recorder: ScanRecorder,
+    tg: TaskGroup,
+    fail_on_error: bool = False,
+) -> Status:
+    """Execute a scan by orchestrating concurrent scanner execution across transcripts.
+
+    This function is the orchestration layer that coordinates scanner execution
+    with a focus on maximizing LLM call throughput. Since scanners often make LLM
+    calls, which are orders of magnitude slower than local computation, the primary
+    optimization goal is to keep `max_transcripts` concurrent LLM calls in flight
+    at all times.
+
+    Args:
+        scan: The scan context containing scanners, transcripts, and configuration
+        recorder: The scan recorder for tracking completed work and persisting results
+        tg: Task group we are running within
+        fail_on_error: Re-raise exceptions instead of capturing them in results. Defaults to False.
+
+    Returns:
+        ScanStatus indicating completion status, spec, and location for resumption
+    """
+    try:
+        # set background task group for this coroutine (used by batching)
+        set_background_task_group(tg)
+
+        # initialize task local files cache
+        init_task_files_cache()
+
+        transcripts = _transcripts_for_scan_options(scan)
+
+        async with transcripts.reader() as tr:
+            # get the snapshot
+            snapshot = await tr.snapshot()
+            scan.spec.transcripts = snapshot
+
+            # write the snapshot
+            await recorder.snapshot_transcripts(snapshot)
+
+            # Count already-completed scans to initialize progress
+            scanner_names_list = list(scan.scanners.keys())
+            if not scanner_names_list:
+                raise PrerequisiteError("No scanners provided")
+            total_scans = 0
+            skipped_scans = 0
+            for transcript_id in snapshot.transcript_ids.keys():
+                for name in scanner_names_list:
+                    if await recorder.is_recorded(transcript_id, name):
+                        skipped_scans += 1
+                    total_scans += 1
+
+            # override total scans if there is a worklist
+            if scan.worklist is not None:
+                total_scans = sum(len(work.transcripts) for work in scan.worklist)
+
+            if total_scans == 0:
+                raise PrerequisiteError("No transcripts")
+
+            # start scan
+            with display().scan_display(
+                scan=scan,
+                scan_location=await recorder.location(),
+                summary=await recorder.summary(),
+                total=total_scans,
+                skipped=skipped_scans,
+            ) as scan_display:
+                # Build scanner list and union content for index resolution
+                scanners_list = list(scan.scanners.values())
+                union_content = union_transcript_contents(
+                    [
+                        _content_for_scanner(scanner)
+                        for scanner in scan.scanners.values()
+                    ]
+                )
+
+                # create metrics accumulator
+                metrics_accum = metrics_accumulators(scan.scanners)
+
+                async def _parse_function(
+                    job: ParseJob, reader: TranscriptsReader
+                ) -> ParseFunctionResult:
+                    try:
+                        # Eligible only when every scanner accepts handles and
+                        # each scanner's filter equals the union: the shared
+                        # union-filtered handle bypasses the per-scanner loader,
+                        # so a narrower filter would see union-broadened content
+                        # from a sibling. `open()` picks spooled vs materialized.
+                        job_scanners = [
+                            scanners_list[idx] for idx in job.scanner_indices
+                        ]
+                        streaming_eligible = all(
+                            scanner_supports_streaming(scanner)
+                            for scanner in job_scanners
+                        ) and _streaming_eligible(job_scanners, union_content)
+
+                        union_transcript: Transcript | TranscriptHandle
+                        on_complete: Callable[[], Awaitable[None]] | None
+                        if streaming_eligible:
+                            handle = await reader.open(
+                                job.transcript_info, union_content
+                            )
+                            union_transcript = handle
+
+                            # Lazy handle shared by 1 lead + N followers; each
+                            # on_complete decrements, closing the handle when
+                            # the count reaches zero.
+                            lead_idx, *follower_indices = sorted(job.scanner_indices)
+                            remaining = 1 + len(follower_indices)
+
+                            async def on_job_complete() -> None:
+                                nonlocal remaining
+                                remaining -= 1
+                                if remaining == 0:
+                                    await handle.aclose()
+
+                            on_complete = on_job_complete
+                        else:
+                            union_transcript = await reader.read(
+                                job.transcript_info, union_content
+                            )
+                            on_complete = None
+                            lead_idx, *follower_indices = sorted(job.scanner_indices)
+
+                        def _make_job(
+                            idx: int,
+                            followers: tuple[ScannerJob, ...] = (),
+                        ) -> ScannerJob:
+                            return ScannerJob(
+                                union_transcript=union_transcript,
+                                scanner=scanners_list[idx],
+                                scanner_name=scanner_names_list[idx],
+                                followers=followers,
+                                on_complete=on_complete,
+                            )
+
+                        # Run the first scanner alone for each transcript;
+                        # release the rest only after it completes. This lets
+                        # the lead's generate call populate the prompt cache
+                        # so followers hit the warm cache.
+                        lead = _make_job(
+                            lead_idx,
+                            followers=tuple(_make_job(idx) for idx in follower_indices),
+                        )
+                        return (True, lead)
+                    except Exception as ex:  # pylint: disable=W0718
+                        # Create error ResultReport for each affected scanner
+                        return (
+                            False,
+                            _reports_for_parse_error(job, ex, scanner_names_list),
+                        )
+
+                async def _scan_function(job: ScannerJob) -> list[ResultReport]:
+                    return await _scan_one(
+                        job,
+                        validation=scan.validation,
+                        fail_on_error=fail_on_error,
+                    )
+
+                prefetch_multiple = 1.0
+                max_tasks = min(
+                    total_scans, scan.spec.options.max_transcripts * len(scan.scanners)
+                )
+
+                diagnostics = os.getenv("SCOUT_DIAGNOSTICS", "false").lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                )
+                # are we running single process?
+                single_process = (
+                    total_scans == 1
+                    or scan.spec.options.limit == 1
+                    or scan.spec.options.max_processes == 1
+                    or os.name == "nt"
+                )
+
+                # set strategy accordingly
+                strategy = (
+                    single_process_strategy(
+                        task_count=max_tasks,
+                        prefetch_multiple=prefetch_multiple,
+                        diagnostics=diagnostics,
+                    )
+                    if single_process
+                    else multi_process_strategy(
+                        total_scans=total_scans,
+                        max_processes=scan.spec.options.max_processes,
+                        task_count=max_tasks,
+                        prefetch_multiple=prefetch_multiple,
+                        diagnostics=diagnostics,
+                    )
+                )
+
+                # Build a reader CM factory that the strategy will open exactly
+                # once. In single-process mode, reuse the parent's already-open
+                # reader (no-close wrapper). In multi-process mode, each worker
+                # opens its own from the snapshot.
+                if single_process:
+
+                    @asynccontextmanager
+                    async def _reader_cm_factory() -> AsyncIterator[TranscriptsReader]:
+                        yield tr
+                else:
+
+                    @asynccontextmanager
+                    async def _reader_cm_factory() -> AsyncIterator[TranscriptsReader]:
+                        async with transcripts.reader(snapshot) as worker_reader:
+                            yield worker_reader
+
+                def accumulate_metrics(
+                    scanner: str, results: Sequence[ResultReport]
+                ) -> dict[str, dict[str, float]] | None:
+                    if scanner in metrics_accum:
+                        for result in results:
+                            if result.result is not None:
+                                metrics_accum[scanner].add_result(result.result.value)
+                        return metrics_accum[scanner].compute_metrics_throttled()
+                    else:
+                        return None
+
+                scan_location = await recorder.location()
+
+                # periodic sync of in-progress results to the scan location.
+                # when `results_buffer` is set we compact partial results to
+                # the scan location every N recorded results so they can be
+                # inspected while the scan is still running. syncs run as
+                # background tasks so their latency (which can be substantial
+                # for remote locations like S3) stays off the recording path;
+                # if a sync is still in flight when the next one comes due we
+                # skip it (a later trigger or the final sync picks up the new
+                # results). `record_results` runs on the main event loop in
+                # both concurrency strategies, so plain counters are safe.
+                results_buffer = scan.spec.options.results_buffer
+                results_sync_tg: TaskGroup | None = None
+                results_since_sync = 0
+                results_sync_running = False
+
+                async def periodic_results_sync() -> None:
+                    nonlocal results_sync_running
+                    try:
+                        await recorder.sync(scan_location, complete=False)
+                    except Exception as ex:
+                        # a periodic sync failure must not bring down the
+                        # scan -- the final sync (or a later periodic one)
+                        # will retry.
+                        logger.warning(
+                            f"Periodic results sync failed (scan continues): {ex}"
+                        )
+                    finally:
+                        results_sync_running = False
+
+                def maybe_start_results_sync() -> None:
+                    nonlocal results_since_sync, results_sync_running
+                    if (
+                        results_buffer is None
+                        or results_buffer <= 0
+                        or results_sync_tg is None
+                    ):
+                        return
+                    results_since_sync += 1
+                    if results_sync_running or results_since_sync < results_buffer:
+                        return
+                    results_since_sync = 0
+                    results_sync_running = True
+                    results_sync_tg.start_soon(periodic_results_sync)
+
+                with active_scans_store() as active_store:
+                    active_store.put_spec(
+                        scan.spec.scan_id, scan.spec, total_scans, scan_location
+                    )
+
+                    async def record_results(
+                        transcript: TranscriptInfo,
+                        scanner: str,
+                        results: Sequence[ResultReport],
+                    ) -> None:
+                        metrics = accumulate_metrics(scanner, results)
+                        await recorder.record(transcript, scanner, results, metrics)
+                        scan_display.results(transcript, scanner, results, metrics)
+                        active_store.put_scanner_results(
+                            scan.spec.scan_id, scanner, results
+                        )
+                        maybe_start_results_sync()
+
+                    # the store ignores writes once closed (see _Store); this
+                    # guard additionally keeps a late trailing-edge fire away
+                    # from the finished display.
+                    scan_finished = False
+
+                    def update_metrics(metrics: ScanMetrics) -> None:
+                        if scan_finished:
+                            return
+                        active_store.put_metrics(scan.spec.scan_id, metrics)
+                        scan_display.metrics(metrics)
+
+                    try:
+                        # host periodic results syncs in a task group scoped
+                        # to the strategy: leaving the block awaits any sync
+                        # still in flight, so one can never race the final
+                        # sync below (and an error in the strategy cancels
+                        # any in-flight sync -- its writes are atomic).
+                        async with anyio.create_task_group() as tg:
+                            results_sync_tg = tg
+                            try:
+                                await strategy(
+                                    parse_jobs=_parse_jobs(scan, recorder, tr),
+                                    parse_function=_parse_function,
+                                    scan_function=_scan_function,
+                                    record_results=record_results,
+                                    update_metrics=update_metrics,
+                                    reader_cm_factory=_reader_cm_factory,
+                                )
+                            finally:
+                                results_sync_tg = None
+
+                        # we've been throttle metrics calculation, now report it all
+                        for scanner in metrics_accum:
+                            await recorder.record_metrics(
+                                scanner, metrics_accum[scanner].compute_metrics()
+                            )
+
+                        # report status
+                        errors = await recorder.errors()
+                        scan_status = await recorder.sync(
+                            await recorder.location(), complete=len(errors) == 0
+                        )
+                    finally:
+                        scan_finished = True
+                        active_store.delete_current()
+
+        # report scan complete
+        display().scan_complete(scan_status)
+
+        # notify view
+        view_notify_scan(scan_status.location)
+
+        # return status
+        return scan_status
+
+    except Exception as ex:
+        return await handle_scan_interrupted(ex, scan.spec, recorder)
+
+    except anyio.get_cancelled_exc_class():
+        return await handle_scan_interrupted("Aborted!", scan.spec, recorder)
+
+    finally:
+        cleanup_task_files_cache()
+
+
+def top_level_sync_init(display: DisplayType | None) -> None:
+    init_environment()
+    init_display_type(display)
+
+
+def top_level_async_init(
+    log_level: str | None,
+    *,
+    main_process: bool = True,
+) -> None:
+    init_platform(hooks=False)
+    init_environment()
+
+    log_level = log_level or DEFAULT_LOG_LEVEL
+
+    if not display_type_initialized():
+        init_display_type("plain")
+    init_log(log_level)
+    if main_process:
+        set_log_level(log_level)
+
+
+def init_environment() -> None:
+    global _initialized_environment
+    if not _initialized_environment:
+        dotenv_file = find_dotenv(usecwd=True)
+        load_dotenv(dotenv_file)
+        _initialized_environment = True
+
+
+_initialized_environment: bool = False
+
+
+def init_scan_model_context(
+    model: str | Model | None = None,
+    model_config: GenerateConfig | None = None,
+    model_base_url: str | None = None,
+    model_args: dict[str, Any] | str | None = None,
+    model_roles: ModelRoles | None = None,
+) -> tuple[Model, dict[str, Any], dict[str, Model | list[Model]] | None]:
+    # resolve from inspect eval model env var if rquired
+    if model is None:
+        model = os.getenv("SCOUT_SCAN_MODEL", None)
+
+    # init model context
+    resolved_model_args = resolve_args(model_args or {})
+    model = resolve_models(
+        model, model_base_url, resolved_model_args, model_config or GenerateConfig()
+    )[0]
+    resolved_model_roles = resolve_model_roles(model_roles)
+    if not model_config:
+        model_config = GenerateConfig()
+
+    init_model_context(
+        model=model,
+        model_roles=resolved_model_roles,
+        config=model_config,
+    )
+
+    return model, resolved_model_args, resolved_model_roles
+
+
+async def handle_scan_interrupted(
+    message_or_exc: str | Exception, spec: ScanSpec, recorder: ScanRecorder
+) -> Status:
+    # on interrupt this runs inside an already-cancelled scope, where an
+    # unshielded await re-raises the cancellation before the sync can
+    # complete (#578) -- shield it so the interrupted status gets written
+    # and reported rather than tripping the not-None assert upstream
+    with anyio.CancelScope(shield=True):
+        scan_status = await recorder.sync(await recorder.location(), complete=False)
+    display().scan_interrupted(message_or_exc, scan_status)
+    return scan_status
+
+
+async def _parse_jobs(
+    context: ScanContext,
+    recorder: ScanRecorder | None,
+    tr: TranscriptsReader,
+) -> AsyncIterator[ParseJob]:
+    """Yield `ParseJob` objects for transcripts needing scanning.
+
+    This encapsulates the logic for:
+    - Determining union content once
+    - Skipping already recorded (per-scanner) work
+    - Grouping scanners per transcript
+    """
+    # Build name->index mapping for scanners
+    scanner_names = list(context.scanners.keys())
+    name_to_index = {name: idx for idx, name in enumerate(scanner_names)}
+
+    # build scanner->transcript_ids map from worklist
+    if context.worklist:
+        scanner_to_transcript_ids: dict[str, list[str]] | None = {
+            work.scanner: work.transcripts for work in context.worklist
+        }
+    else:
+        scanner_to_transcript_ids = None
+
+    async for transcript_info in tr.index():
+        scanner_indices_for_transcript: list[int] = []
+        for name in scanner_names:
+            # if its not in the worklist then move on
+            if (
+                scanner_to_transcript_ids is not None
+                and transcript_info.transcript_id
+                not in scanner_to_transcript_ids.get(name, [])
+            ):
+                continue
+            if recorder is not None and await recorder.is_recorded(
+                transcript_info.transcript_id, name
+            ):
+                continue
+            scanner_indices_for_transcript.append(name_to_index[name])
+        if not scanner_indices_for_transcript:
+            continue
+        yield ParseJob(
+            transcript_info=transcript_info,
+            scanner_indices=set(scanner_indices_for_transcript),
+        )
+
+
+def _transcripts_for_scan_options(scan: ScanContext) -> Transcripts:
+    transcripts = scan.transcripts
+    if scan.spec.options.limit is not None:
+        transcripts = transcripts.limit(scan.spec.options.limit)
+    shuffle = scan.spec.options.shuffle
+    if shuffle is not None:
+        transcripts = transcripts.shuffle(int(shuffle))
+    return transcripts
+
+
+async def _scan_dry_run(scan: ScanContext) -> Status:
+    transcripts = _transcripts_for_scan_options(scan)
+
+    scanner_names = [*scan.scanners]
+    per_scanner_counts = {name: 0 for name in scanner_names}
+
+    async with transcripts.reader() as tr:
+        snapshot = await tr.snapshot()
+        scan.spec.transcripts = snapshot
+
+        async for job in _parse_jobs(scan, None, tr):
+            for scanner_idx in job.scanner_indices:
+                per_scanner_counts[scanner_names[scanner_idx]] += 1
+
+    # create table
+    table = Table(
+        Column("Scanner", footer="Total"),
+        Column("Count", footer=f"{sum(per_scanner_counts.values()):,}"),
+        title="Dry Run (no scans executed)",
+        box=box.MARKDOWN,
+        title_style="bold",
+        title_justify="left",
+        pad_edge=False,
+        padding=(0, 1),
+        show_footer=True,
+        min_width=60,
+    )
+
+    for name in scanner_names:
+        table.add_row(
+            clean_control_characters(name),
+            f"{per_scanner_counts[name]:,}",
+        )
+
+    table.add_section()
+
+    display().print(table)
+
+    return Status(
+        complete=True,
+        spec=scan.spec,
+        location="(dry-run)",
+        summary=recorder_summary.Summary(scanners=scanner_names),
+        errors=[],
+    )
+
+
+async def _single_item_iter(item: Any) -> AsyncIterator[Any]:
+    """Yield a single item as an async iterator (bypasses the loader)."""
+    yield item
+
+
+def _info_placeholder_transcript(info: TranscriptInfo) -> Transcript:
+    """An empty `Transcript` carrying only `info`'s metadata."""
+    return Transcript.model_construct(
+        **info.model_dump(), messages=[], events=[], timelines=[]
+    )
+
+
+async def _transcript_for_record(handle: TranscriptHandle) -> ReportInput:
+    """Produce the record value for `handle`.
+
+    A spooled handle emits its column strings straight from the spool. Any
+    other handle materializes. Raises if the content can't be read; the caller
+    decides whether that becomes an Error row or brings down the scan.
+    """
+    if isinstance(handle, SpooledTranscriptHandle):
+        parsed = await handle.parsed_result()
+        if parsed is not None:
+            columns = pooled_passthrough(handle.info, parsed)
+            return SerializedTranscript(
+                input_json=columns.input_json,
+                input_data_json=columns.input_data_json,
+            )
+    return await handle.load()
+
+
+async def _scan_one(
+    job: ScannerJob,
+    *,
+    validation: dict[str, ValidationSet] | None = None,
+    fail_on_error: bool = False,
+) -> list[ResultReport]:
+    """Run a single scanner against a single transcript.
+
+    This is the core dispatch primitive: iterates the scanner's loader over
+    the union transcript, invokes the scanner on each yielded input, and
+    builds a `ResultReport` for each invocation. Captures inspect-side
+    events and model usage per call. Errors are turned into Error records
+    on the report unless `fail_on_error=True`.
+
+    A `TranscriptHandle` union transcript is passed straight to a
+    handle-capable scanner (no materialization); errors raised lazily during
+    iteration are contained per-transcript as Error reports. `job.on_complete`,
+    if set, is awaited exactly once in a finally block to close the shared
+    handle after the last job.
+    """
+    from inspect_ai.log._transcript import (
+        Transcript as InspectTranscript,
+    )
+    from inspect_ai.log._transcript import init_transcript
+
+    # the code below might get called many times (e.g. if the scanner
+    # task message or event or list[message], list[event] or if it has
+    # a custom loader:
+    # 1) Is there a loader? If so it's a generator that will yield
+    #    scanner inputs.
+    # 2) We need to reflect the signature of the scanner fn -- either
+    #    by introspecting or by synthesizing a loader
+
+    # initialize model_usage tracking for this scan (force
+    # reset so usage doesn't accumulate across sequential
+    # scans within the same worker task)
+    init_model_usage(initial_usage={})
+
+    inspect_transcript = InspectTranscript()
+    init_transcript(inspect_transcript)
+
+    results: list[ResultReport] = []
+
+    scanner_config = config_for_scanner(job.scanner)
+    loader = scanner_config.loader
+
+    def _stream_error_report(ex: Exception) -> ResultReport:
+        """Error report for an exception raised lazily during iteration."""
+        union = job.union_transcript
+        report_input: ReportInput
+        if isinstance(union, Transcript):
+            report_input = union
+        else:
+            # The stream raised, so the content is unreadable; record an
+            # info-only placeholder rather than re-reading it. Mirrors the
+            # placeholder built by `_reports_for_parse_error`.
+            report_input = _info_placeholder_transcript(union.info)
+        return ResultReport(
+            input_type="transcript",
+            input_ids=[job.transcript_info.transcript_id],
+            input=report_input,
+            result=None,
+            validation=None,
+            error=Error(
+                transcript_id=job.transcript_info.transcript_id,
+                scanner=job.scanner_name,
+                error=str(ex),
+                traceback=traceback.format_exc(),
+                refusal=False,
+            ),
+            events=[],
+            model_usage={},
+        )
+
+    try:
+        loader_iterations: AsyncIterator[ScannerInput | TranscriptHandle]
+        if isinstance(job.union_transcript, Transcript):
+            loader_iterations = loader(job.union_transcript)
+        elif scanner_supports_streaming(job.scanner):
+            loader_iterations = _single_item_iter(job.union_transcript)
+        else:
+            # Handle paired with a non-streaming scanner: materialize, then
+            # run the loader. Nothing has reached the model yet, so this
+            # costs no wasted LLM call.
+            try:
+                transcript = await job.union_transcript.load()
+            except PrerequisiteError:
+                raise
+            except Exception as ex:  # pylint: disable=W0718
+                if fail_on_error:
+                    raise
+                results.append(_stream_error_report(ex))
+                return results
+            loader_iterations = loader(transcript)
+
+        # Iterate explicitly so a lazy parse error raised by the iteration is
+        # contained per-transcript rather than propagating. PrerequisiteError
+        # still re-raises.
+        it = aiter(loader_iterations)
+        while True:
+            # Each yielded item gets its own Inspect transcript, so the
+            # report's `events` describe that invocation alone (the loader
+            # work that produced the item plus its scan) rather than a
+            # snapshot of every earlier item's history; the shared
+            # transcript grew the recorded events quadratically in the
+            # item count.
+            inspect_transcript = InspectTranscript()
+            init_transcript(inspect_transcript)
+            try:
+                loader_result = await anext(it)
+            except StopAsyncIteration:
+                break
+            except PrerequisiteError:
+                raise
+            except Exception as ex:  # pylint: disable=W0718
+                if fail_on_error:
+                    raise
+                results.append(_stream_error_report(ex))
+                break
+
+            result: Result | list[Result] | None = None
+            final_result: Result | None = None
+            error: Error | None = None
+            # Both reset per iteration and before the `try`: the error path below
+            # reads them, so a raise inside the `try` must not leave them holding
+            # the previous item's validation/ids (this runs in a loop) or unbound.
+            validation_result: ResultValidation | None = None
+            type_and_ids: tuple[ScannerInputNames, list[str]] | None = None
+
+            # Match the concrete handle classes: TranscriptHandle is a plain
+            # Protocol, and making it runtime-checkable would only test
+            # method presence.
+            handle_input = (
+                loader_result
+                if isinstance(
+                    loader_result,
+                    (MaterializedTranscriptHandle, SpooledTranscriptHandle),
+                )
+                else None
+            )
+            report_input: ReportInput
+            loader_input: ScannerInput | None = None
+            if handle_input is None:
+                # mypy can't subtract the protocol, so cast the narrowed value.
+                loader_input = cast(ScannerInput, loader_result)
+                report_input = loader_input
+
+            try:
+                if handle_input is not None:
+                    # Ids come from info; the transcript itself is materialized
+                    # after the scan (below) so streamed content is not retained
+                    # while the scanner runs.
+                    type_and_ids = (
+                        "transcript",
+                        [handle_input.info.transcript_id],
+                    )
+                else:
+                    assert loader_input is not None
+                    type_and_ids = get_input_type_and_ids(loader_input)
+                if type_and_ids is None:
+                    init_model_usage(initial_usage={})
+                    continue
+
+                # do scan
+                async with span("scan"):
+                    result = await job.scanner(loader_result)
+
+                # handle lists
+                final_result = (
+                    as_resultset(result) if isinstance(result, list) else result
+                )
+
+                # do validation if we have one for this scanner/id
+                if validation and job.scanner_name in validation:
+                    validation_result = await _validate_scan(
+                        validation[job.scanner_name],
+                        type_and_ids[1],
+                        final_result,
+                    )
+
+            # special case for errors that should bring down the scan
+            except PrerequisiteError:
+                raise
+
+            except Exception as ex:  # pylint: disable=W0718
+                if fail_on_error:
+                    raise
+                error = Error(
+                    transcript_id=job.transcript_info.transcript_id,
+                    scanner=job.scanner_name,
+                    error=str(ex),
+                    traceback=traceback.format_exc(),
+                    refusal=isinstance(ex, RefusalError),
+                )
+
+            # Materialize a streamed handle for the record. Results must be
+            # self-contained (readable without the original logs), and a
+            # parquet cell is an atomic value, so the transcript has to exist
+            # in full at write time. Doing it here -- after the scan, success
+            # or error -- keeps it out of memory for the scan itself.
+            if handle_input is not None:
+                try:
+                    report_input = await _transcript_for_record(handle_input)
+                except PrerequisiteError:
+                    raise
+                except Exception as ex:  # pylint: disable=W0718
+                    if fail_on_error:
+                        raise
+                    # The scan ran, but its transcript can't be read back for
+                    # the record. Keep whatever the scan produced and surface
+                    # the read failure as this row's error -- never a clean
+                    # result over an info-only placeholder.
+                    report_input = _info_placeholder_transcript(handle_input.info)
+                    logger.warning(
+                        "Unable to read transcript %s for the result record; "
+                        "recording metadata only.",
+                        job.transcript_info.transcript_id,
+                        exc_info=True,
+                    )
+                    if error is None:
+                        error = Error(
+                            transcript_id=job.transcript_info.transcript_id,
+                            scanner=job.scanner_name,
+                            error=f"Unable to read transcript for the result record: {ex}",
+                            traceback=traceback.format_exc(),
+                            refusal=False,
+                        )
+
+            # always append a result (success or error) if we have type_and_ids
+            if type_and_ids is not None:
+                results.append(
+                    # all of this data needs to be pickleable (i.e. no async
+                    # functions that capture the task group)
+                    ResultReport(
+                        input_type=type_and_ids[0],
+                        input_ids=type_and_ids[1],
+                        input=report_input,
+                        result=final_result,
+                        validation=validation_result,
+                        error=error,
+                        events=jsonable_python(
+                            resolve_event_attachments(inspect_transcript)
+                        ),
+                        model_usage=model_usage(),
+                    )
+                )
+
+            # Usage is reported per yielded item, so reset it before the next
+            # one rather than letting it accumulate across the loop (#586).
+            init_model_usage(initial_usage={})
+
+        return results
+    finally:
+        if job.on_complete is not None:
+            await job.on_complete()
+
+
+def _content_for_scanner(scanner: Scanner[Any]) -> TranscriptContent:
+    """
+    Grab the TranscriptContent for the passed scanner
+
+    This logic relies on the fact that the loader used alongside this scanner has
+    adopted the filter from the scanner as appropriate.
+    """
+    return config_for_loader(config_for_scanner(scanner).loader).content
+
+
+def _filters_equal(
+    a: MessageFilter | EventFilter, b: MessageFilter | EventFilter
+) -> bool:
+    """Compare two content filters, ignoring order for sequence filters.
+
+    A filter is ``None``, ``"all"``, or a sequence of type strings; the union
+    build produces sequences in arbitrary order, so sequences compare as sets
+    while ``None``/``"all"`` compare exactly.
+    """
+    if (
+        isinstance(a, Sequence)
+        and not isinstance(a, str)
+        and isinstance(b, Sequence)
+        and not isinstance(b, str)
+    ):
+        return set(a) == set(b)
+    return a == b
+
+
+def _streaming_eligible(
+    scanners: list[Scanner[Any]], union_content: TranscriptContent
+) -> bool:
+    """Whether a job's scanners can safely share a union-filtered handle.
+
+    The handle is opened with union content and bypasses the per-scanner
+    loader's `filter_transcript`, so this is only safe when every scanner's
+    filter equals the union; a narrower filter would otherwise see a sibling's
+    broadened content. Messages and events both stream; any `timeline` filter
+    forces materialization (timeline selection needs the full transcript).
+
+    `metadata` is deliberately not compared. A scanner that declined it does
+    not read it, so receiving the union's merged metadata cannot change its
+    output -- while forcing materialization here would defeat the decline for
+    exactly the metadata-heavy sets it exists for.
+
+    Callers must already have checked `scanner_supports_streaming`.
+    """
+    if union_content.timeline is not None:
+        return False
+    for scanner in scanners:
+        content = _content_for_scanner(scanner)
+        if content.timeline is not None:
+            return False
+        if not _filters_equal(content.messages, union_content.messages):
+            return False
+        if not _filters_equal(content.events, union_content.events):
+            return False
+    return True
+
+
+def _reports_for_parse_error(
+    job: ParseJob, exception: Exception, scanner_names: list[str]
+) -> list[ResultReport]:
+    # Create placeholder transcript since parse failed
+    placeholder_transcript = _info_placeholder_transcript(job.transcript_info)
+    return [
+        ResultReport(
+            input_type="transcript",
+            input_ids=[job.transcript_info.transcript_id],
+            input=placeholder_transcript,
+            result=None,
+            validation=None,
+            error=Error(
+                transcript_id=job.transcript_info.transcript_id,
+                scanner=scanner_names[idx],
+                error=str(exception),
+                traceback=traceback.format_exc(),
+                refusal=False,
+            ),
+            events=[],
+            model_usage={},
+        )
+        for idx in job.scanner_indices
+    ]
+
+
+async def _resolve_worklist(
+    worklist: Sequence[ScannerWork] | Sequence[Worklist] | str | Path | None,
+) -> list[Worklist] | None:
+    if worklist is None:
+        return None
+    elif isinstance(worklist, str | Path):
+        with open(worklist, "r") as f:
+            contents = f.read().strip()
+
+        if contents.startswith("["):
+            data = json.loads(contents)
+        else:
+            data = yaml.safe_load(contents)
+
+        if not isinstance(data, list):
+            raise PrerequisiteError(
+                f"Worklist data from JSON or YAML file must be a list (found type {type(data)})"
+            )
+
+        # validate with pydantic and return
+        adapter = TypeAdapter[list[Worklist]](list[Worklist])
+        return adapter.validate_python(data)
+    else:
+        # resolve transcript queries
+        resolved: list[Worklist] = []
+        for work in worklist:
+            if isinstance(work.transcripts, Transcripts):
+                async with work.transcripts.reader() as tr:
+                    snapshot = await tr.snapshot()
+                    resolved.append(
+                        Worklist(
+                            scanner=work.scanner,
+                            transcripts=list(snapshot.transcript_ids.keys()),
+                        )
+                    )
+            else:
+                resolved.append(
+                    Worklist(scanner=work.scanner, transcripts=work.transcripts)
+                )
+
+        return resolved
+
+
+def _resolve_validation(
+    validation: str | ValidationSet | Mapping[str, str | ValidationSet],
+    scanjob: ScanJob,
+) -> dict[str, ValidationSet]:
+    from inspect_scout._validation.validation import validation_set as vs_from_file
+
+    # Handle string path -> convert to ValidationSet
+    if isinstance(validation, str):
+        validation = vs_from_file(validation)
+
+    if isinstance(validation, ValidationSet):
+        # single validation set - confirm single scanner
+        if len(scanjob.scanners) > 1:
+            raise ValueError(
+                "Validation sets must be specified as a dict of scanner:validation "
+                "when there is more than one scanner."
+            )
+        return {next(iter(scanjob.scanners)): validation}
+    else:
+        # dict/Mapping - validate keys and convert any string values
+        for s in validation.keys():
+            if s not in scanjob.scanners:
+                raise ValueError(
+                    f"Validation referenced scanner '{s}' however there is no "
+                    "scanner of that name passed to the scan."
+                )
+        return {
+            k: v if isinstance(v, ValidationSet) else vs_from_file(v)
+            for k, v in validation.items()
+        }
+
+
+async def _validate_scan(
+    validation_set: ValidationSet,
+    scan_ids: str | list[str],
+    scan_result: Result,
+) -> ResultValidation | None:
+    # normalize scan_ids to str for single-element lists
+    scan_ids = scan_ids[0] if len(scan_ids) == 1 else scan_ids
+
+    # is there a validation case for the scan_ids?
+    v_case = next(
+        (c for c in validation_set.cases if c.id == scan_ids),
+        None,
+    )
+
+    # if so then perform the validation and return it
+    if v_case:
+        # Determine effective predicate (per-case overrides global, default to "eq")
+        effective_predicate = v_case.predicate or validation_set.predicate or "eq"
+        # Convert to string for storage (None if callable)
+        predicate_str = (
+            effective_predicate if isinstance(effective_predicate, str) else None
+        )
+
+        async with span("validation"):
+            # Handle label-based validation for resultsets
+            if v_case.labels is not None:
+                valid = await validate(
+                    validation_set,
+                    scan_result,
+                    labels=v_case.labels,
+                    predicate_override=v_case.predicate,
+                )
+                return ResultValidation(
+                    target=cast(JsonValue, v_case.labels),
+                    valid=valid,
+                    predicate=predicate_str,
+                    split=v_case.split,
+                )
+            # Handle regular target-based validation
+            else:
+                valid = await validate(
+                    validation_set,
+                    scan_result,
+                    target=v_case.target,
+                    predicate_override=v_case.predicate,
+                )
+                return ResultValidation(
+                    target=v_case.target,
+                    valid=valid,
+                    predicate=predicate_str,
+                    split=v_case.split,
+                )
+    else:
+        return None

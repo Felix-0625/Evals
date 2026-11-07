@@ -1,0 +1,200 @@
+// @vitest-environment jsdom
+import { cleanup, render as renderUi, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { ComponentStateProvider } from "@tsmono/react/state";
+import {
+  makeStateHooks,
+  ResizeObserverStub,
+  TrustedContentWrapper,
+} from "@tsmono/react/testing";
+
+import { DisplayModeContext } from "../../content/DisplayModeContext";
+
+import { ClientToolCall } from "./ClientToolCall";
+import { ToolCallView } from "./ToolCallView";
+import { ToolOutput } from "./ToolOutput";
+
+// These tests exercise the rich rendering path, which needs trusted content.
+const render = (ui: Parameters<typeof renderUi>[0]) =>
+  renderUi(ui, { wrapper: TrustedContentWrapper });
+
+vi.stubGlobal("ResizeObserver", ResizeObserverStub);
+
+const renderToolCall = (output: string, displayMode: "rendered" | "raw") =>
+  render(
+    <ComponentStateProvider hooks={makeStateHooks()}>
+      <DisplayModeContext.Provider value={{ displayMode }}>
+        <ToolCallView
+          id="tool-call"
+          tool="close_agent"
+          functionCall="close_agent"
+          contentType="markdown"
+          output={output}
+        />
+      </DisplayModeContext.Provider>
+    </ComponentStateProvider>
+  );
+
+const renderClientToolCall = (
+  output: string,
+  displayMode: "rendered" | "raw"
+) =>
+  render(
+    <ComponentStateProvider hooks={makeStateHooks()}>
+      <DisplayModeContext.Provider value={{ displayMode }}>
+        <ClientToolCall
+          id="client-tool-call"
+          tool="tool_search"
+          functionCall="tool_search"
+          output={output}
+        />
+      </DisplayModeContext.Provider>
+    </ComponentStateProvider>
+  );
+
+const renderToolOutput = (output: string, displayMode: "rendered" | "raw") =>
+  render(
+    <ComponentStateProvider hooks={makeStateHooks()}>
+      <DisplayModeContext.Provider value={{ displayMode }}>
+        <ToolOutput output={output} />
+      </DisplayModeContext.Provider>
+    </ComponentStateProvider>
+  );
+
+afterEach(() => {
+  cleanup();
+});
+
+describe("ToolCallView display modes", () => {
+  const rawOutput = JSON.stringify({
+    previous_status: {
+      completed: "answer<content-internal>eyJ4IjoxfQ==</content-internal>",
+    },
+  });
+
+  it("keeps the concise Codex answer projection in rendered mode", async () => {
+    const { container } = renderToolCall(rawOutput, "rendered");
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("answer");
+    });
+    expect(container.textContent).not.toContain("content-internal");
+  });
+
+  it("shows the exact Codex tool payload in raw mode", () => {
+    const { container } = renderToolCall(rawOutput, "raw");
+
+    expect(container.querySelector("pre")?.textContent).toBe(rawOutput);
+  });
+
+  it("bypasses custom tool projections in raw mode", () => {
+    const toolSearchOutput = JSON.stringify([
+      {
+        type: "function",
+        name: "read_file",
+        parameters: { type: "object", properties: { path: {} } },
+      },
+    ]);
+    const { container } = renderClientToolCall(toolSearchOutput, "raw");
+
+    expect(container.querySelector("pre")?.textContent).toBe(toolSearchOutput);
+  });
+
+  it("preserves ANSI control bytes and whitespace in raw tool output", () => {
+    const output = " \u001b[32mSuccess\u001b[0m \n";
+    const { container } = renderToolOutput(output, "raw");
+
+    expect(container.querySelector("code")?.textContent).toBe(output);
+  });
+});
+
+describe("ClientToolCall errors", () => {
+  it("shows the annotated screenshot alongside a tool error", () => {
+    const { container } = render(
+      <ComponentStateProvider hooks={makeStateHooks()}>
+        <DisplayModeContext.Provider value={{ displayMode: "rendered" }}>
+          <ClientToolCall
+            id="failed-click"
+            tool="computer"
+            functionCall="computer"
+            output=""
+            error={{ type: "timeout", message: "click timed out" }}
+            selfAnnotation={{ action: "left_click", coordinate: [10, 20] }}
+            inputScreenshot={[
+              {
+                type: "image",
+                image: "data:image/png;base64,abc123",
+                detail: "auto",
+              },
+            ]}
+          />
+        </DisplayModeContext.Provider>
+      </ComponentStateProvider>
+    );
+
+    expect(container.textContent).toContain("click timed out");
+    expect(container.querySelector("img")).not.toBeNull();
+  });
+});
+
+// Tool output is log content; output that merely looks like JSON must never
+// throw out of render.
+describe("ToolOutput JSON-looking text", () => {
+  it("renders a JSON object as a record tree", async () => {
+    const { container } = renderToolOutput('{"answer": 42}', "rendered");
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("42");
+    });
+    expect(container.querySelector(".record-tree-key")).not.toBeNull();
+  });
+
+  it("renders a JSON object padded with a non-JSON space as a record tree", async () => {
+    const { container } = renderToolOutput(
+      '\u00A0{"answer": 42}\uFEFF',
+      "rendered"
+    );
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("42");
+    });
+    expect(container.querySelector(".record-tree-key")).not.toBeNull();
+  });
+
+  it("renders brace-wrapped non-JSON as text", () => {
+    const { container } = renderToolOutput("{not json}", "rendered");
+
+    expect(container.querySelector("code")?.textContent).toBe("{not json}");
+  });
+});
+
+describe("ClientToolCall selection", () => {
+  it("keeps the selection control when a custom tool view owns the content", () => {
+    const { getByRole, getByText } = render(
+      <ClientToolCall
+        id="custom-tool"
+        tool="custom"
+        functionCall="custom()"
+        output="result"
+        getCustomToolView={() => <div>Custom tool content</div>}
+        headerLeading={
+          <button
+            type="button"
+            role="checkbox"
+            aria-checked={false}
+            aria-label="Select message"
+          />
+        }
+      />
+    );
+    expect(getByText("Custom tool content").textContent).toBe(
+      "Custom tool content"
+    );
+    expect(
+      getByRole("checkbox", { name: "Select message" }).getAttribute(
+        "aria-checked"
+      )
+    ).toBe("false");
+  });
+});

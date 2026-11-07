@@ -1,0 +1,66 @@
+.header {
+  padding: 1rem 1rem;
+  border-top: solid var(--bs-light-border-subtle) 1px;
+}
+
+/* Higher specificity to beat text-size-smallest !important (source-order tie) */
+.header :global(span.text-size-smallest) {
+  font-size: inherit !important;
+}
+
+.headerWithScore {
+  display: grid;
+  gap: 1rem;
+}
+
+.metadataRegion {
+  min-width: 0;
+}
+
+.collapsedBar {
+  background: var(--bs-tertiary-bg);
+  border-top: 1px solid var(--bs-border-color);
+  border-bottom: 1px solid var(--bs-border-color);
+  padding: 0.25rem 0.9rem;
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  font-size: 0.76rem;
+  color: var(--bs-body-color);
+  min-height: 30px;
+}
+
+.collapsedTask {
+  font-size: 0.9rem;
+  white-space: nowrap;
+}
+
+/* Higher specificity to beat text-size-smallest !important (source-order tie) */
+.collapsedTask :global(span.text-size-smallest) {
+  font-size: inherit !important;
+}
+
+.collapsedSource {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.72rem;
+}
+
+.collapsedDate {
+  color: var(--bs-secondary-color);
+  white-space: nowrap;
+}
+
+.collapsedMono {
+  font-family: var(--bs-font-monospace);
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+
+.dot {
+  color: var(--bs-tertiary-color);
+  flex-shrink: 0;
+}

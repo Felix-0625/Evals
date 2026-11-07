@@ -1,0 +1,142 @@
+import clsx from "clsx";
+import { FC, ReactNode } from "react";
+
+import type { Content } from "@tsmono/inspect-common/types";
+import {
+  ANSIDisplay,
+  RequireMedia,
+  usePlainText,
+} from "@tsmono/react/components";
+import {
+  isAnsiOutput,
+  isRenderableImageSource,
+  parseJsonRecord,
+} from "@tsmono/util";
+
+import { cappedText } from "../../content/cappedText";
+import { useDisplayMode } from "../../content/DisplayModeContext";
+import { MediaReference } from "../../media/MediaReference";
+import { ContentDocumentView } from "../documents/ContentDocumentView";
+import { JsonMessageContent } from "../JsonMessageContent";
+
+import styles from "./ToolOutput.module.css";
+
+interface ToolOutputProps {
+  output: string | number | boolean | Exclude<Content, { type: "tool_use" }>[];
+  className?: string | string[];
+  onDownloadFile?: (filename: string, document: string) => void;
+}
+
+/**
+ * Renders the ToolOutput component.
+ */
+export const ToolOutput: FC<ToolOutputProps> = ({
+  output,
+  className,
+  onDownloadFile,
+}) => {
+  // If there is no output, don't show the tool
+  if (!output) {
+    return null;
+  }
+
+  // First process an array or object into a string
+  const outputs: ReactNode[] = [];
+  if (Array.isArray(output)) {
+    output.forEach((out, idx) => {
+      const key = `tool-output-${idx}`;
+      if (out.type === "text") {
+        outputs.push(<ToolTextOutput text={out.text} key={key} />);
+      } else if (out.type === "document") {
+        outputs.push(
+          <ContentDocumentView
+            id={key}
+            document={out}
+            key={key}
+            onDownloadFile={onDownloadFile}
+          />
+        );
+      } else if (out.type === "image") {
+        if (isRenderableImageSource(out.image)) {
+          outputs.push(
+            <RequireMedia kind="image" key={key}>
+              <img
+                className={clsx(styles.toolImage)}
+                src={out.image}
+                alt="Tool output"
+              />
+            </RequireMedia>
+          );
+        } else {
+          outputs.push(<MediaReference source={out.image} key={key} />);
+        }
+      } else if (out.type === "reasoning") {
+        if (out.reasoning) {
+          outputs.push(<ToolTextOutput text={out.reasoning} key={key} />);
+        }
+      } else if (out.type === "data") {
+        outputs.push(
+          <ToolTextOutput text={JSON.stringify(out.data)} key={key} />
+        );
+      }
+    });
+  } else {
+    outputs.push(
+      <ToolTextOutput text={String(output)} key={"tool-output-single"} />
+    );
+  }
+  return <div className={clsx(styles.output, className)}>{outputs}</div>;
+};
+
+interface ToolTextOutputProps {
+  text: string;
+}
+
+/**
+ * Renders the ToolTextOutput component.
+ */
+const ToolTextOutput: FC<ToolTextOutputProps> = ({ text }) => {
+  const displayMode = useDisplayMode();
+  const plain = usePlainText();
+
+  if (displayMode === "rendered") {
+    const obj = parseJsonRecord(text);
+    if (obj) {
+      return <JsonMessageContent id={`1-json`} json={obj} />;
+    }
+  }
+
+  // A multi-megabyte tool result becomes a single ~1,000,000px-tall <pre>,
+  // which the browser re-layerizes on every resize (~1.4s each — laggy in
+  // Blink, spinlocks WebKit). Cap it so the giant node never enters the DOM;
+  // a fixed-height scroller does not help because the off-screen content is
+  // still layerized.
+  const { text: capped, notice } = cappedText(text);
+
+  // It could have ANSI codes. Detection is bounded to the capped prefix so
+  // log-authored output can never feed the regex an unbounded string; the
+  // ANSI renderer still receives the full text as before.
+  if (displayMode === "rendered" && isAnsiOutput(capped)) {
+    return (
+      <ANSIDisplay
+        output={text}
+        style={{ fontSize: "clamp(0.4rem, 1.15vw, 0.9rem)" }}
+      />
+    );
+  }
+
+  return (
+    <>
+      <pre className={clsx(styles.textOutput, "tool-output", plain.className)}>
+        <code className={clsx("sourceCode", styles.textCode)}>
+          {!plain.trusted
+            ? plain.present(capped)
+            : displayMode === "raw"
+              ? capped
+              : capped.trim()}
+        </code>
+      </pre>
+      {notice}
+    </>
+  );
+};

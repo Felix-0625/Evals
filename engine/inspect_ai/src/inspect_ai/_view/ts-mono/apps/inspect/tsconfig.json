@@ -1,0 +1,18 @@
+{
+  "extends": "@tsmono/tsconfig/react.json",
+  "compilerOptions": {
+    "types": ["node"],
+    "allowImportingTsExtensions": true,
+    "allowJs": true,
+    "checkJs": true,
+    "declaration": true,
+    "declarationMap": true,
+    "outDir": "./lib"
+  },
+  "include": ["src", "e2e"],
+  "exclude": ["node_modules", "dist", "lib"],
+  "cmkOptions": {
+    "enabled": true,
+    "dtsOutDir": "."
+  }
+}

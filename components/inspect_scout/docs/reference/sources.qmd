@@ -1,0 +1,15 @@
+---
+title: Sources
+description: Built-in transcript sources for ingesting data from external observability platforms.
+reference: "inspect_scout.sources"
+---
+
+### phoenix
+### langsmith
+### logfire
+### weave
+### claude_code
+### atif
+
+
+

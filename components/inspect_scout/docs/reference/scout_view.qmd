@@ -1,0 +1,5 @@
+---
+description: Browse scan results in a web UI.
+reference: scout view
+---
+

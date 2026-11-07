@@ -1,0 +1,189 @@
+import clsx from "clsx";
+import { FC, ReactNode, useEffect, useId, useRef } from "react";
+import { createPortal } from "react-dom";
+
+import { useEventListener } from "../hooks/useEventListener";
+import { Icon } from "../icons";
+
+import styles from "./Modal.module.css";
+
+const TABBABLE_SELECTOR =
+  'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
+
+const tabbableElements = (container: HTMLElement): HTMLElement[] =>
+  Array.from(container.querySelectorAll<HTMLElement>(TABBABLE_SELECTOR)).filter(
+    (el) => el.getAttribute("aria-hidden") !== "true"
+  );
+
+const TEXT_INPUT_SELECTOR =
+  'input:not([type="button"]):not([type="checkbox"]):not([type="color"]):not([type="file"]):not([type="image"]):not([type="radio"]):not([type="range"]):not([type="reset"]):not([type="submit"]),textarea,vscode-textfield';
+
+const shouldSubmitOnEnter = (
+  event: KeyboardEvent,
+  modal: HTMLElement | null
+): boolean => {
+  if (event.defaultPrevented || !modal) return false;
+  const target = event.target;
+  if (!(target instanceof Element)) return true;
+  if (!modal.contains(target)) return false;
+  if (target === modal) return true;
+  return target.matches(TEXT_INPUT_SELECTOR);
+};
+
+const OVERFLOW_CLASS: Record<NonNullable<ModalProps["overflow"]>, string> = {
+  auto: styles.overflowAuto,
+  hidden: styles.overflowHidden,
+  scroll: styles.overflowScroll,
+  visible: styles.overflowVisible,
+};
+
+interface ModalProps {
+  show: boolean;
+  onHide: () => void;
+  onSubmit?: () => void;
+  title: string;
+  children: ReactNode;
+  footer?: ReactNode;
+  className?: string;
+  // Forwarded to the dialog element and used to derive the aria-labelledby id.
+  id?: string;
+  // Overrides the dialog max-width (e.g. "580px" or "min(1000px, 90vw)").
+  width?: string;
+  // Controls the body's overflow; default "auto" preserves prior behavior.
+  overflow?: "auto" | "hidden" | "scroll" | "visible";
+  // When false, removes the body's default padding (for edge-to-edge content).
+  padded?: boolean;
+  // Escape hatch for additional body styling.
+  bodyClassName?: string;
+}
+
+export const Modal: FC<ModalProps> = ({
+  show,
+  onHide,
+  onSubmit,
+  title,
+  children,
+  footer,
+  className,
+  id,
+  width,
+  overflow = "auto",
+  padded = true,
+  bodyClassName,
+}) => {
+  const modalRef = useRef<HTMLDivElement>(null);
+  const fallbackTitleId = useId();
+
+  // Handle escape, enter, and tab (focus trap) keys.
+  useEventListener(
+    typeof document === "undefined" ? null : document,
+    "keydown",
+    (e) => {
+      if (!show) return;
+      if (e.key === "Escape") {
+        onHide();
+      } else if (e.key === "Enter" && onSubmit) {
+        if (!shouldSubmitOnEnter(e, modalRef.current)) return;
+        e.preventDefault();
+        onSubmit();
+      } else if (e.key === "Tab" && modalRef.current) {
+        const tabbables = tabbableElements(modalRef.current);
+        const first = tabbables[0];
+        const last = tabbables[tabbables.length - 1];
+        // No tabbables → leave default behavior untouched (no worse than
+        // a page without a trap).
+        if (!first || !last) return;
+        const active = document.activeElement;
+        if (e.shiftKey && active === first) {
+          e.preventDefault();
+          last.focus();
+        } else if (!e.shiftKey && active === last) {
+          e.preventDefault();
+          first.focus();
+        }
+      }
+    }
+  );
+
+  // Move focus into the dialog on open and restore it to the previously
+  // focused element on close.
+  // eslint-disable-next-line tsmono/no-raw-use-effect -- baselined at rule introduction; migrate to a named hook or derived state
+  useEffect(() => {
+    if (!show || !modalRef.current) return;
+    const previouslyFocused =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    const modal = modalRef.current;
+    // Small delay to ensure web components are ready before focusing.
+    const timer = window.setTimeout(() => {
+      const autofocusEl = modal.querySelector<HTMLElement>(
+        "[autofocus], [data-autofocus]"
+      );
+      if (autofocusEl) {
+        autofocusEl.focus();
+      } else {
+        const tabbables = tabbableElements(modal);
+        (tabbables[0] ?? modal).focus();
+      }
+    }, 0);
+    return () => {
+      window.clearTimeout(timer);
+      previouslyFocused?.focus();
+    };
+  }, [show]);
+
+  if (!show) return null;
+
+  const titleId = id ? `${id}-title` : fallbackTitleId;
+
+  return createPortal(
+    // Dismissal is keyboard-accessible via the Escape handler above and the
+    // close button below; the backdrop is a mouse-only convenience, so it
+    // carries no semantics of its own.
+    <div
+      className={styles.backdrop}
+      role="presentation"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onHide();
+      }}
+    >
+      <div
+        ref={modalRef}
+        id={id}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
+        className={clsx(styles.modal, className)}
+        style={width ? { maxWidth: width } : undefined}
+      >
+        <div className={styles.header}>
+          <h3 id={titleId} className={styles.title}>
+            {title}
+          </h3>
+          <button
+            type="button"
+            className={styles.closeButton}
+            onClick={onHide}
+            aria-label="Close"
+          >
+            <Icon name="close" />
+          </button>
+        </div>
+        <div
+          className={clsx(
+            styles.body,
+            OVERFLOW_CLASS[overflow],
+            !padded && styles.noPadding,
+            bodyClassName
+          )}
+        >
+          {children}
+        </div>
+        {footer && <div className={styles.footer}>{footer}</div>}
+      </div>
+    </div>,
+    document.body
+  );
+};

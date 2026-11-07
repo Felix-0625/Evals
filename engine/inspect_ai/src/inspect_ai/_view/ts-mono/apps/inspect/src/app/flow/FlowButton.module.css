@@ -1,0 +1,14 @@
+.button {
+  border: none;
+  padding: 0;
+  background-color: inherit;
+  /* Renders as <a> outside VS Code; match the <button> box and focus ring. */
+  display: inline-block;
+  color: inherit;
+  text-decoration: none;
+  outline-offset: 0;
+}
+
+.viewerOptions {
+  color: var(--bs-body-color);
+}

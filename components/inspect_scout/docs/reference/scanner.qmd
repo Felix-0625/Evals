@@ -1,0 +1,54 @@
+---
+title: Scanner API
+description: Defining custom scanners and the supporting types, tools, and registration helpers.
+reference: "inspect_scout"
+---
+
+## Scanner
+
+### Scanner
+### ScannerInput
+### Result
+### Error
+### Loader
+
+## Scanners
+
+### llm_scanner
+### grep_scanner
+
+## Scanner Tools
+
+### message_numbering
+### scanner_prompt
+### generate_answer
+### parse_answer
+### extract_references
+### ResultReducer
+### Answer
+### answer_type
+### AnswerSpec
+### AnswerMultiLabel
+### AnswerStructured
+
+## Utils
+
+### message_as_str
+### messages_as_str
+### MessageFormatOptions
+### MessagesPreprocessor
+### tool_callers
+
+## Types
+
+### MessageType
+### EventType
+### TranscriptContent
+### RefusalError
+### Scanners
+
+## Registration
+
+### scanner
+### loader
+### as_scorer

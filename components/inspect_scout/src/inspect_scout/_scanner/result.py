@@ -1,0 +1,308 @@
+import json
+from logging import getLogger
+from typing import Any, Generic, Sequence, cast
+
+from inspect_ai._util.json import jsonable_python
+from inspect_ai.event._event import Event
+from inspect_ai.log import condense_events
+from inspect_ai.model import ModelUsage
+from inspect_ai.scorer import Reference
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic.json_schema import SkipJsonSchema
+from shortuuid import uuid
+from typing_extensions import TypeVar
+
+from inspect_scout._scanner.types import ScannerInput, ScannerInputNames
+from inspect_scout._transcript.types import Transcript
+from inspect_scout._util._json import to_json_bytes_compact, to_json_str_compact
+
+# Reference comes from inspect_ai; __all__ marks it re-exported for strict mypy.
+__all__ = [
+    "Error",
+    "ParsedT",
+    "Reference",
+    "Result",
+    "ResultReport",
+    "ResultValidation",
+    "as_resultset",
+]
+
+logger = getLogger(__name__)
+
+
+ParsedT = TypeVar("ParsedT", default=Any)
+"""Type of `Result.parsed` (defaults to `Any` so bare `Result` annotations remain valid)."""
+
+
+class Result(BaseModel, Generic[ParsedT]):
+    """Scan result."""
+
+    uuid: str | None = Field(default_factory=uuid)
+    """Unique identifer for scan result."""
+
+    value: JsonValue
+    """Scan value."""
+
+    answer: str | None = Field(default=None)
+    """Answer extracted from model output (optional)"""
+
+    explanation: str | None = Field(default=None)
+    """Explanation of result (optional)."""
+
+    metadata: dict[str, Any] | None = Field(default=None)
+    """Additional metadata related to the result (optional)"""
+
+    references: list[Reference] = Field(default_factory=list)
+    """References to relevant messages or events."""
+
+    label: str | None = Field(default=None)
+    """Label for result to indicate its origin."""
+
+    type: str | None = Field(default=None)
+    """Type to designate contents of 'value' (used in `value_type` field in result data frames)."""
+
+    parsed: SkipJsonSchema[ParsedT | None] = Field(default=None, exclude=True)
+    """Typed parsed answer set by `generate_answer()`/`parse_answer()`
+    (unaffected by `value_to_float`; `None` when parsing failed or the result
+    was built elsewhere). In-memory only: excluded from serialization and
+    dropped when pickled, so it survives neither storage nor process boundaries."""
+
+    def __getstate__(self) -> dict[Any, Any]:
+        # parsed is in-memory only and may hold instances of classes that
+        # pickle cannot resolve by reference (e.g. defined in __main__ or in
+        # a function body). Drop it so results always survive pickling —
+        # notably the multiprocess scan queues, whose feeder threads would
+        # otherwise silently discard the whole result.
+        state = super().__getstate__()
+        return {**state, "__dict__": {**state["__dict__"], "parsed": None}}
+
+
+def as_resultset(results: list[Result]) -> Result:
+    return Result(value=jsonable_python(results), type="resultset")
+
+
+class Error(BaseModel):
+    """Scan error (runtime error which occurred during scan)."""
+
+    transcript_id: str
+    """Target transcript id."""
+
+    scanner: str
+    """Scanner name."""
+
+    error: str
+    """Error message."""
+
+    traceback: str
+    """Error traceback."""
+
+    refusal: bool
+    """Was this error a refusal."""
+
+
+class ResultValidation(BaseModel):
+    target: JsonValue
+    valid: bool | dict[str, bool]
+    predicate: str | None = Field(default=None)
+    """The predicate used for validation (e.g., 'eq', 'gte', 'contains')."""
+    split: str | None = Field(default=None)
+    """The split the validation case belongs to (e.g., 'dev', 'test')."""
+
+
+class SerializedTranscript(BaseModel):
+    """Recorder column values for an already-serialized transcript.
+
+    Produced by the spooled pooled-passthrough path, which emits the compact
+    (pool-condensed, attachment-ref) form straight from the transcript spool
+    rather than building a `Transcript` and re-condensing it.
+    `_serialize_input` passes these values through unchanged.
+    """
+
+    # UTF-8 buffers rather than `str`: the values go straight into a parquet
+    # column, which pyarrow encodes as UTF-8 regardless, so decoding would only
+    # allocate a second full copy of the transcript (1, 2, or 4 bytes per
+    # character, per PEP 393's sizing of `str`).
+    #
+    # `bytearray`, and not a `bytes | bytearray` union: pydantic copies the
+    # buffer to satisfy a `bytes` member, which for a union it does while
+    # deciding which one matches. arbitrary_types_allowed because pydantic has
+    # no bytearray schema.
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    input_json: bytearray
+    """Value for the `input` column: transcript JSON, events pool-condensed."""
+
+    input_data_json: bytearray
+    """Value for the `input_data` column: `{messages, calls, attachments}`.
+
+    Always present, empty pools included: the read path only expands an
+    `input` whose row carries an `input_data`."""
+
+
+ReportInput = ScannerInput | SerializedTranscript
+"""What a `ResultReport` may carry: a live scanner input, or -- for spooled
+transcript handles -- pre-serialized column values.
+
+Deliberately NOT part of `ScannerInput`: that alias is public API, bounds
+`Loader[T]` and the `@scanner` type parameter, and drives the OpenAPI schema.
+"""
+
+
+class ResultReport(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
+    input_type: ScannerInputNames
+
+    input_ids: list[str]
+
+    input: ReportInput
+
+    result: Result | None
+
+    validation: ResultValidation | None
+
+    error: Error | None
+
+    events: Sequence[dict[str, Any]]
+
+    model_usage: dict[str, ModelUsage]
+
+    def to_df_columns(
+        self, *, pool_dedup: bool = True
+    ) -> dict[str, str | bytes | bytearray | bool | int | float | None]:
+        # `input`/`input_data` are UTF-8 bytes: see `_serialize_input`.
+        columns: dict[str, str | bytes | bytearray | bool | int | float | None] = {}
+
+        # input (transcript, event, or message)
+        columns["input_type"] = self.input_type
+        columns["input_ids"] = json.dumps(self.input_ids)
+        columns["input"], columns["input_data"] = _serialize_input(
+            self.input, self.input_type, pool_dedup=pool_dedup
+        )
+
+        if self.result is not None:
+            # result
+            columns["uuid"] = self.result.uuid
+            columns["label"] = self.result.label
+            if isinstance(self.result.value, str | bool | int | float | None):
+                columns["value"] = self.result.value
+                if isinstance(self.result.value, str):
+                    columns["value_type"] = "string"
+                elif isinstance(self.result.value, bool):
+                    columns["value_type"] = "boolean"
+                elif isinstance(self.result.value, int | float):
+                    columns["value_type"] = "number"
+                else:
+                    columns["value_type"] = "null"
+
+            else:
+                columns["value"] = to_json_str_compact(self.result.value)
+                if self.result.type is not None:
+                    columns["value_type"] = self.result.type
+                else:
+                    columns["value_type"] = (
+                        "array" if isinstance(self.result.value, list) else "object"
+                    )
+            columns["answer"] = self.result.answer
+            columns["explanation"] = self.result.explanation
+            columns["metadata"] = to_json_str_compact(self.result.metadata or {})
+
+            # references
+            def references_json(type: str) -> str:
+                assert self.result
+                return to_json_str_compact(
+                    [ref for ref in self.result.references if ref.type == type]
+                )
+
+            columns["message_references"] = references_json("message")
+            columns["event_references"] = references_json("event")
+
+            # error/refusal
+            columns["scan_error"] = None
+            columns["scan_error_traceback"] = None
+            columns["scan_error_type"] = None
+        elif self.error is not None:
+            columns["uuid"] = uuid()
+            columns["label"] = None
+            columns["value"] = None
+            columns["value_type"] = "null"
+            columns["answer"] = None
+            columns["explanation"] = None
+            columns["metadata"] = to_json_str_compact({})
+            columns["message_references"] = to_json_str_compact([])
+            columns["event_references"] = to_json_str_compact([])
+            columns["scan_error"] = self.error.error
+            columns["scan_error_traceback"] = self.error.traceback
+            columns["scan_error_type"] = "refusal" if self.error.refusal else None
+        else:
+            raise ValueError(
+                "A scan result must have either a 'result', 'refusal, or 'error' field."
+            )
+
+        # a result can carry its own error too (e.g. the record's transcript
+        # couldn't be read back) -- the scan_error columns above default to
+        # None in the result branch, so surface the error over that default.
+        if self.result is not None and self.error is not None:
+            columns["scan_error"] = self.error.error
+            columns["scan_error_traceback"] = self.error.traceback
+            columns["scan_error_type"] = "refusal" if self.error.refusal else None
+
+        # report validation
+        if self.validation is not None:
+            columns["validation_target"] = to_json_str_compact(self.validation.target)
+            columns["validation_result"] = to_json_str_compact(self.validation.valid)
+            columns["validation_predicate"] = self.validation.predicate
+            columns["validation_split"] = self.validation.split
+            if isinstance(self.validation.valid, dict):
+                for k, v in self.validation.valid.items():
+                    columns[f"validation_result_{k}"] = v
+
+        else:
+            columns["validation_target"] = None
+            columns["validation_result"] = None
+            columns["validation_predicate"] = None
+            columns["validation_split"] = None
+
+        # report tokens
+        total_tokens = 0
+        for usage in self.model_usage.values():
+            total_tokens += usage.total_tokens
+
+        columns["scan_total_tokens"] = total_tokens
+        columns["scan_model_usage"] = to_json_str_compact(self.model_usage)
+        columns["scan_events"] = to_json_str_compact(self.events)
+
+        return columns
+
+
+def _serialize_input(
+    input: ReportInput,
+    input_type: ScannerInputNames,
+    *,
+    pool_dedup: bool,
+) -> tuple[bytes | bytearray, bytes | bytearray | None]:
+    """Serialize scanner input as UTF-8 JSON bytes, optionally condensing events.
+
+    A `SerializedTranscript` is already in column form and is passed through
+    unchanged.
+
+    Returns:
+        (input_json, input_data_json | None)
+    """
+    if isinstance(input, SerializedTranscript):
+        return input.input_json, input.input_data_json
+
+    if not pool_dedup or input_type not in ("transcript", "events"):
+        return to_json_bytes_compact(input), None
+
+    if input_type == "transcript":
+        assert isinstance(input, Transcript)
+        condensed_events, events_data = condense_events(input.events)
+        condensed = input.model_copy(update={"events": condensed_events})
+        return to_json_bytes_compact(condensed), to_json_bytes_compact(events_data)
+
+    # input_type == "events"
+    assert isinstance(input, Sequence)
+    events = cast(Sequence[Event], input)
+    condensed_events, events_data = condense_events(events)
+    return to_json_bytes_compact(condensed_events), to_json_bytes_compact(events_data)

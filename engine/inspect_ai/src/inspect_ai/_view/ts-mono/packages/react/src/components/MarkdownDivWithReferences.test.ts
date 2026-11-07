@@ -1,0 +1,210 @@
+// @vitest-environment jsdom
+import { describe, expect, it } from "vitest";
+
+import {
+  injectReferenceLinks,
+  MarkdownReference,
+} from "@tsmono/react/components";
+
+const CITE_CLASS = "cite";
+
+function makeRef(
+  ordinal: string,
+  id: string,
+  citeUrl?: string
+): MarkdownReference {
+  return { id, cite: `[${ordinal}]`, citeUrl };
+}
+
+function link(ordinal: string, id: string, href?: string): string {
+  return href
+    ? `<a href="${href}" class="${CITE_CLASS}" data-ref-id="${id}">${ordinal}</a>`
+    : `<span class="${CITE_CLASS}" data-ref-id="${id}">${ordinal}</span>`;
+}
+
+describe("injectReferenceLinks", () => {
+  it("replaces a single bracketed reference", () => {
+    const refs = [makeRef("M1", "msg-1")];
+    const result = injectReferenceLinks(
+      "See [M1] for details",
+      refs,
+      CITE_CLASS
+    );
+    expect(result).toBe(`See [${link("M1", "msg-1")}] for details`);
+  });
+
+  it("replaces multiple single references", () => {
+    const refs = [makeRef("M1", "msg-1"), makeRef("M2", "msg-2")];
+    const result = injectReferenceLinks(
+      "Compare [M1] and [M2]",
+      refs,
+      CITE_CLASS
+    );
+    expect(result).toBe(
+      `Compare [${link("M1", "msg-1")}] and [${link("M2", "msg-2")}]`
+    );
+  });
+
+  it("replaces range references like [M1-M3]", () => {
+    const refs = [makeRef("M1", "msg-1"), makeRef("M3", "msg-3")];
+    const result = injectReferenceLinks(
+      "Early responses [M1-M3] are fine",
+      refs,
+      CITE_CLASS
+    );
+    expect(result).toBe(
+      `Early responses [${link("M1", "msg-1")}-${link("M3", "msg-3")}] are fine`
+    );
+  });
+
+  it("replaces comma-separated references like [M2, M4]", () => {
+    const refs = [makeRef("M2", "msg-2"), makeRef("M4", "msg-4")];
+    const result = injectReferenceLinks(
+      "See [M2, M4] for details",
+      refs,
+      CITE_CLASS
+    );
+    expect(result).toBe(
+      `See [${link("M2", "msg-2")}, ${link("M4", "msg-4")}] for details`
+    );
+  });
+
+  it("handles mixed M and E references in brackets", () => {
+    const refs = [makeRef("M1", "msg-1"), makeRef("E2", "evt-2")];
+    const result = injectReferenceLinks(
+      "Related [M1, E2] show the issue",
+      refs,
+      CITE_CLASS
+    );
+    expect(result).toBe(
+      `Related [${link("M1", "msg-1")}, ${link("E2", "evt-2")}] show the issue`
+    );
+  });
+
+  it("does not match bare ordinals outside brackets", () => {
+    const refs = [makeRef("M1", "msg-1")];
+    const result = injectReferenceLinks("See M1 for details", refs, CITE_CLASS);
+    expect(result).toBe("See M1 for details");
+  });
+
+  it("ignores ordinals not in references", () => {
+    const refs = [makeRef("M1", "msg-1")];
+    const result = injectReferenceLinks(
+      "See [M1-M3] for details",
+      refs,
+      CITE_CLASS
+    );
+    expect(result).toBe(`See [${link("M1", "msg-1")}-M3] for details`);
+  });
+
+  it("returns html unchanged when no references provided", () => {
+    const result = injectReferenceLinks("See [M1]", undefined, CITE_CLASS);
+    expect(result).toBe("See [M1]");
+  });
+
+  it("returns html unchanged when references is empty", () => {
+    const result = injectReferenceLinks("See [M1]", [], CITE_CLASS);
+    expect(result).toBe("See [M1]");
+  });
+
+  it("uses citeUrl when provided", () => {
+    const refs = [makeRef("M1", "msg-1", "#/messages/msg-1")];
+    const result = injectReferenceLinks("See [M1]", refs, CITE_CLASS);
+    expect(result).toBe(`See [${link("M1", "msg-1", "#/messages/msg-1")}]`);
+  });
+
+  it("handles multiple bracket groups in the same text", () => {
+    const refs = [
+      makeRef("M1", "m1"),
+      makeRef("M3", "m3"),
+      makeRef("M5", "m5"),
+      makeRef("M7", "m7"),
+    ];
+    const result = injectReferenceLinks(
+      "Concerns [M1-M3] escalate, responses [M5-M7] are problematic",
+      refs,
+      CITE_CLASS
+    );
+    expect(result).toBe(
+      `Concerns [${link("M1", "m1")}-${link("M3", "m3")}] escalate, responses [${link("M5", "m5")}-${link("M7", "m7")}] are problematic`
+    );
+  });
+
+  it("does not match inside non-reference brackets", () => {
+    const refs = [makeRef("M1", "msg-1")];
+    const result = injectReferenceLinks(
+      "An array [1, 2, 3] and [M1]",
+      refs,
+      CITE_CLASS
+    );
+    expect(result).toBe(`An array [1, 2, 3] and [${link("M1", "msg-1")}]`);
+  });
+});
+
+describe("injectReferenceLinks attribute escaping", () => {
+  const parse = (html: string): Element =>
+    new DOMParser().parseFromString(`<div>${html}</div>`, "text/html").body
+      .firstElementChild!;
+
+  it.each([
+    ["closes the attribute and injects markup", '"><style>x</style><a x="'],
+    ["injects a style attribute", 'x" style="position:fixed" x="'],
+    ["injects an event handler", 'x" onmouseover="alert(1)'],
+    ["single quotes and ampersands", "a'b&c"],
+  ])("renders a ref id that %s as a single reference", (_label, id) => {
+    const refs = [makeRef("M1", id)];
+    const html = injectReferenceLinks("See [M1]", refs, CITE_CLASS);
+    const root = parse(html);
+
+    const cites = root.querySelectorAll("[data-ref-id]");
+    expect(cites).toHaveLength(1);
+    expect(root.querySelectorAll("*")).toHaveLength(1);
+    expect(root.querySelectorAll("a")).toHaveLength(0);
+    expect(cites[0]?.getAttribute("data-ref-id")).toBe(id);
+    expect(cites[0]?.attributes).toHaveLength(2);
+    expect(root.textContent).toBe("See [M1]");
+  });
+
+  it("escapes the href so the cite URL round-trips as a single attribute", () => {
+    const citeUrl = '#/messages/m1?a=1&b="2"';
+    const refs = [makeRef("M1", "msg-1", citeUrl)];
+    const root = parse(injectReferenceLinks("See [M1]", refs, CITE_CLASS));
+
+    const anchor = root.querySelector("a");
+    expect(root.querySelectorAll("*")).toHaveLength(1);
+    expect(anchor?.getAttribute("href")).toBe(citeUrl);
+    expect(anchor?.attributes).toHaveLength(3);
+  });
+});
+
+describe("injectReferenceLinks on adversarial input", () => {
+  it("runs in linear time on a long run of unclosed brackets", () => {
+    const refs = [makeRef("M1", "msg-1")];
+    const html = "[".repeat(250_000);
+    const start = performance.now();
+    const result = injectReferenceLinks(html, refs, CITE_CLASS);
+    const ms = performance.now() - start;
+    expect(result).toBe(html);
+    expect(ms).toBeLessThan(1000);
+  });
+
+  it("runs in linear time on a long run of ordinals with no closing bracket", () => {
+    const refs = [makeRef("M1", "msg-1")];
+    const html = "[" + "M1 ".repeat(100_000);
+    const start = performance.now();
+    const result = injectReferenceLinks(html, refs, CITE_CLASS);
+    const ms = performance.now() - start;
+    expect(result).toBe(html);
+    expect(ms).toBeLessThan(1000);
+  });
+
+  it("links every ordinal in a bracket that spans lines and nested brackets", () => {
+    const refs = [makeRef("M1", "msg-1"), makeRef("E2", "evt-2")];
+    expect(injectReferenceLinks("[a\n[M1, E2] tail", refs, CITE_CLASS)).toBe(
+      `[a\n[${link("M1", "msg-1")}, ${link("E2", "evt-2")}] tail`
+    );
+    expect(injectReferenceLinks("[x] [M1]", refs, CITE_CLASS)).toBe(
+      `[x] [${link("M1", "msg-1")}]`
+    );
+  });
+});
