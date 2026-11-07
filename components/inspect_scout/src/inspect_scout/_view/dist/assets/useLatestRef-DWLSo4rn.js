@@ -1,3 +1,2 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:47267d07a38e94742c13f5e5c7fd98dcc77dc6378ce4d5f36b302d5341f4c5c3
-size 332
+import{i as e}from"./rolldown-runtime-Dd_uD5pT.js";import{n as t,t as n}from"./compiler-runtime-C3HLYLZn.js";var r=n(),i=e(t(),1);function a(e){let t=(0,r.c)(2),n=(0,i.useRef)(e),a;return t[0]===e?a=t[1]:(a=()=>{n.current=e},t[0]=e,t[1]=a),(0,i.useLayoutEffect)(a),n}export{a as t};
+//# sourceMappingURL=useLatestRef-DWLSo4rn.js.map

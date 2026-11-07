@@ -17,6 +17,7 @@ from pathlib import Path
 
 import httpx
 import psutil
+from inspect_scout import scan_results_df
 
 from evals_app.calibration import calibrate_business
 from evals_app.logs import load_trials
@@ -34,7 +35,6 @@ from evals_app.models import (
 )
 from evals_app.rescan import rescan
 from evals_app.service import Service
-from inspect_scout import scan_results_df
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGETED_SCENARIOS = ("identity_switch", "data_update", "long_tail_join", "long_tail_multihop")

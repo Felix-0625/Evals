@@ -69,5 +69,9 @@ line-length = 100
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
 
+[tool.ruff.lint.isort]
+known-first-party = ["evals_app"]
+known-third-party = ["inspect_ai", "inspect_scout", "gepa"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/evals_app"]

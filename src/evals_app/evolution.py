@@ -4,6 +4,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 import numpy as np
+from gepa import optimize
 from gepa.core.adapter import EvaluationBatch, GEPAAdapter
 from gepa.core.result import GEPAResult
 
@@ -12,7 +13,6 @@ from evals_app.runtime import Runtime
 from evals_app.scoring import resolve, shareable_paths
 from evals_app.validation import validate_execution
 from evals_app.verification import InsufficientEvidence
-from gepa import optimize
 
 
 class InspectAdapter(GEPAAdapter[Case, dict[str, Any], list[str | None]]):

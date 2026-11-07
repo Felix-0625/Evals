@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import psutil
+from inspect_ai import Epochs, Task, eval
 from inspect_ai.dataset import Sample
 from inspect_ai.model import ChatMessageAssistant, ChatMessageTool, ModelOutput
 from inspect_ai.scorer import Score, Scorer, Target, scorer
@@ -30,7 +31,6 @@ from evals_app.models import (
     fingerprint,
 )
 from evals_app.scoring import judge
-from inspect_ai import Epochs, Task, eval
 
 
 def external_messages(

@@ -20,12 +20,12 @@ from inspect_ai.model import (
     ModelUsage,
     get_model,
 )
+from inspect_scout import Result, Scanner, Transcript, ValidationCase, ValidationSet, llm_scanner
 from inspect_scout._validation.validate import validate
 
 from evals_app.build import build_info
 from evals_app.coordination import CallGate, atomic_json
 from evals_app.models import SemanticAnalyzer, identifier
-from inspect_scout import Result, Scanner, Transcript, ValidationCase, ValidationSet, llm_scanner
 
 
 def actual_cost(output: ModelOutput, definition: SemanticAnalyzer) -> float | None:

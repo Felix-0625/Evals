@@ -2,9 +2,10 @@
 
 from typing import TYPE_CHECKING, Any
 
+from inspect_scout import scan, scan_results_df, transcripts_from
+
 from evals_app.analysis import business_scanner
 from evals_app.models import identifier, now
-from inspect_scout import scan, scan_results_df, transcripts_from
 
 if TYPE_CHECKING:
     from evals_app.service import Service

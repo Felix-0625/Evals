@@ -1,10 +1,10 @@
 import json
 
 import anyio
+from inspect_scout import Transcript
 
 from evals_app.analysis import business_scanner, findings
 from evals_app.calibration import analyzer_calibration
-from inspect_scout import Transcript
 
 
 def test_findings_require_arguments_and_separate_fact_from_cause():

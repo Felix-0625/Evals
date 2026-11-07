@@ -1,10 +1,9 @@
 """Deterministic task for checking the preserved Inspect CLI after installation."""
 
+from inspect_ai import Task, task
 from inspect_ai.dataset import Sample
 from inspect_ai.scorer import match
 from inspect_ai.solver import generate
-
-from inspect_ai import Task, task
 
 
 @task
