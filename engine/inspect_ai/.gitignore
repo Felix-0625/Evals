@@ -170,6 +170,13 @@ cython_debug/
 *.*workspace
 data/datasets/*/hidden
 logs/
+# Keep the pinned upstream Viewer corpus used by the parity tests.
+!src/inspect_ai/_view/ts-mono/apps/inspect/src/log_data/chunked/fixtures/logs/
+src/inspect_ai/_view/ts-mono/apps/inspect/src/log_data/chunked/fixtures/logs/**
+!src/inspect_ai/_view/ts-mono/apps/inspect/src/log_data/chunked/fixtures/logs/original/
+!src/inspect_ai/_view/ts-mono/apps/inspect/src/log_data/chunked/fixtures/logs/chunked/
+!src/inspect_ai/_view/ts-mono/apps/inspect/src/log_data/chunked/fixtures/logs/original/*.eval
+!src/inspect_ai/_view/ts-mono/apps/inspect/src/log_data/chunked/fixtures/logs/chunked/*.eval
 logs-*/
 
 # thumbnails

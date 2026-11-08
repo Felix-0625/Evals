@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 — 2026-11-07
+## 0.1.0 — 2026-11-08
 
 - 基于固定 Inspect AI、Inspect Scout 和 GEPA 源码的本机评测平台，保留来源与许可证。
 - Python、HTTP、CLI 应用接入，八维证据评分、覆盖率与原生逐题日志。

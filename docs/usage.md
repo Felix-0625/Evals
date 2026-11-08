@@ -100,6 +100,18 @@ artifacts/clean-install/Scripts/python.exe -I scripts/verify_semantic_install.py
 
 检查脚本核验所有组件来自安装环境，并运行原 Inspect、八维评分和 Scout 离线重扫。其结果属于确定性安装回归。
 
+## 从 GitHub Release 安装
+
+从 [Release](https://github.com/Felix-0625/Evals/releases) 下载并解压 Windows 发行包。进入解压目录后执行以下命令。`runtime-requirements.txt` 固定第三方运行依赖，`wheels/` 包含 Evals 和同版派生组件。
+
+```powershell
+uv venv .venv --python 3.12
+uv pip install --python .venv/Scripts/python.exe --find-links wheels -r runtime-requirements.txt evals-app==0.1.0
+.venv/Scripts/evals.exe --workspace evals-workspace serve
+```
+
+打开 <http://127.0.0.1:7575/#/evals>。下载文件的 SHA-256 随 Release 提供。
+
 ## 真实应用的本机隔离验收
 
 用户选定 VeraAgent 与 NexRAG。脚本在现有项目的虚拟环境中启动临时适配服务，调用实际应用代码，以临时数据和确定性依赖验证链路，不读取生产业务数据库或用户模型配置：
